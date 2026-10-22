@@ -23,7 +23,7 @@ from dataclasses import asdict, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import torch
 import pandas as pd
@@ -49,22 +49,35 @@ class TestPartialGeneration(unittest.TestCase):
     """Check actual preserved prefixes, raw probabilities and cumulative budgets."""
 
     def test_repeated_interruptions_keep_original_probabilities(self):
-        client = Mock(operation_timeout=30)
-        client.generate_segment.side_effect = [
-            {"token_ids": [7], "log_probs": [-.7], "finish_reason": "abort", "policy_version": 1},
-            {"token_ids": [], "log_probs": [], "finish_reason": "abort", "policy_version": 2},
-            {"token_ids": [8, 9], "log_probs": [-.8, -.9], "finish_reason": "length", "policy_version": 3},
-        ]
-        engine = HTTPGenerationEngine(client, 1)
-        settings = GenerationSettings(3, 1., 1., 0, True, 0, 2, collect_log_probs=True)
-        result = engine.generate(GenerationRequest(torch.tensor([[4, 5]]), torch.ones(1, 2), settings))
-        self.assertEqual(result.sequences.tolist(), [[4, 5, 7, 8, 9]])
-        torch.testing.assert_close(result.rollout_log_probs, torch.tensor([[-.7, -.8, -.9]]))
-        calls = [call.args[0] for call in client.generate_segment.call_args_list]
-        self.assertEqual([call["prompt_token_ids"] for call in calls], [[4, 5], [4, 5, 7], [4, 5, 7]])
-        self.assertEqual([call["max_tokens"] for call in calls], [3, 2, 2])
-        self.assertEqual([segment["policy_version"] for segment in engine.segments], [1, 3])
-        self.assertEqual(engine.interruptions, 2)
+        for prefix_length in (1, 2048):
+            with self.subTest(prefix_length=prefix_length):
+                prefix = list(range(7, 7 + prefix_length))
+                probabilities = [-.1 - index / 10000 for index in range(prefix_length)]
+                client = Mock(operation_timeout=30)
+                client.generate_segment.side_effect = [
+                    {"token_ids": prefix, "log_probs": probabilities,
+                     "finish_reason": "abort", "policy_version": 1},
+                    {"token_ids": [], "log_probs": [], "finish_reason": "abort", "policy_version": 2},
+                    {"token_ids": [8], "log_probs": [-.8], "finish_reason": "abort", "policy_version": 3},
+                    {"token_ids": [9], "log_probs": [-.9], "finish_reason": "abort", "policy_version": 4},
+                ]
+                engine = HTTPGenerationEngine(client, 1)
+                settings = GenerationSettings(prefix_length + 2, 1., 1., 0, True, 0, 2, collect_log_probs=True)
+                result = engine.generate(GenerationRequest(torch.tensor([[4, 5]]), torch.ones(1, 2), settings))
+                self.assertEqual(result.sequences.tolist(), [[4, 5] + prefix + [8, 9]])
+                torch.testing.assert_close(result.rollout_log_probs, torch.tensor([probabilities + [-.8, -.9]]),
+                                           rtol=0., atol=0.)
+                calls = [call.args[0] for call in client.generate_segment.call_args_list]
+                self.assertEqual([call["prompt_token_ids"] for call in calls],
+                                 [[4, 5], [4, 5] + prefix, [4, 5] + prefix, [4, 5] + prefix + [8]])
+                self.assertEqual([call["max_tokens"] for call in calls], [prefix_length + 2, 2, 2, 1])
+                self.assertEqual(engine.segments, [
+                    {"start": 0, "end": prefix_length, "policy_version": 1, "source_update": 0},
+                    {"start": prefix_length, "end": prefix_length + 1, "policy_version": 3, "source_update": 2},
+                    {"start": prefix_length + 1, "end": prefix_length + 2, "policy_version": 4, "source_update": 3},
+                ])
+                self.assertEqual(engine.interruptions, 4)
+                self.assertEqual(result.finish_reasons, ("length",))
 
     def test_late_http_response_keeps_its_server_version_after_resume(self):
         client = AsyncGenerationClient("http://unused", "model", 5, 5)
@@ -244,11 +257,16 @@ class TestPartialService(unittest.IsolatedAsyncioTestCase):
             async def collective_rpc(self, method):
                 return [{"version": self.version}]
 
+            async def add_request(self, request_id, prompt, params):
+                iterator = self.generate(prompt, params, request_id)
+                return SimpleNamespace(request_id=request_id, get_nowait=lambda: None,
+                                       get=iterator.__anext__, close=Mock())
+
             async def generate(self, prompt, params, request_id):
-                yield SimpleNamespace(outputs=[SimpleNamespace(token_ids=[7], logprobs=[
+                yield SimpleNamespace(finished=False, outputs=[SimpleNamespace(token_ids=[7], logprobs=[
                     {7: SimpleNamespace(logprob=-.7)}], finish_reason=None)])
                 await aborted.wait()
-                yield SimpleNamespace(outputs=[SimpleNamespace(token_ids=[7], logprobs=[
+                yield SimpleNamespace(finished=True, outputs=[SimpleNamespace(token_ids=[7], logprobs=[
                     {7: SimpleNamespace(logprob=-.7)}], finish_reason="abort")])
 
             async def pause_generation(self, **kwargs):
@@ -275,6 +293,55 @@ class TestPartialService(unittest.IsolatedAsyncioTestCase):
         # A request delayed across publication receives the actual engine version.
         result = await service.generate({"max_tokens": 4, "prompt_token_ids": [4], "request_id": "late"})
         self.assertEqual(result["policy_version"], 3)
+
+    async def test_pause_before_first_output_and_cancel_cleanup(self):
+        """A registered queued request must not hold admission while waiting for output."""
+        for mode in ("pause", "cancel", "registration"):
+            with self.subTest(mode=mode):
+                entered, aborted = asyncio.Event(), asyncio.Event()
+
+                async def get():
+                    entered.set()
+                    await aborted.wait()
+                    return SimpleNamespace(finished=True, outputs=[SimpleNamespace(
+                        token_ids=[], logprobs=None, finish_reason="abort")])
+
+                async def generate(*args):
+                    yield await get()
+
+                async def add_request(*args):
+                    if mode == "registration":
+                        entered.set()
+                        await aborted.wait()
+                    return collector
+
+                collector = SimpleNamespace(request_id="internal", get_nowait=lambda: None, get=get, close=Mock())
+                engine = SimpleNamespace(
+                    generate=generate, add_request=AsyncMock(side_effect=add_request), abort=AsyncMock(),
+                    collective_rpc=AsyncMock(return_value=[{"version": 1}]),
+                    pause_generation=AsyncMock(side_effect=lambda **kwargs: aborted.set()),
+                )
+                service = PartialRequestService(engine, lambda **kwargs: kwargs)
+                task = asyncio.create_task(service.generate({"request_id": "queued", "max_tokens": 4,
+                                                             "prompt_token_ids": [4]}))
+                await asyncio.wait_for(entered.wait(), 1)
+                if mode != "pause":
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+                    engine.abort.assert_awaited_once_with(
+                        "queued" if mode == "registration" else "internal", internal=mode != "registration",
+                    )
+                else:
+                    self.assertEqual(await asyncio.wait_for(service.pause(), 1), {"status": "paused"})
+                    self.assertEqual((await task)["token_ids"], [])
+                    engine.abort.assert_not_awaited()
+                if mode == "registration":
+                    collector.close.assert_not_called()
+                else:
+                    collector.close.assert_called_once()
+                self.assertEqual(service.active, 0)
+                self.assertTrue(service.idle.is_set())
 
     def test_empty_abort_keeps_already_emitted_prefix(self):
         marker = SimpleNamespace(outputs=[SimpleNamespace(token_ids=[], logprobs=None, finish_reason="abort")])

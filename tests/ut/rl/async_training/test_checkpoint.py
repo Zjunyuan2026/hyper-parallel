@@ -33,6 +33,28 @@ class TestAsyncCheckpoint(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 AsyncCheckpoint.commit(Path(directory), self.state, self.config)
 
+    def test_auto_resume_selects_latest_complete_and_honors_explicit_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.config["train"]["checkpoint"]["output_dir"] = directory
+            self.config["train"]["max_steps"] = 20
+            self.assertIsNone(AsyncCheckpoint.resolve_path(self.config))
+            for step in (2, 10, 11):
+                root = Path(directory) / f"step_{step}"
+                root.mkdir()
+                (root / "checkpoint_complete.json").write_text("{}")
+                state = dict(self.state, learner_update=step, source_update=step, policy_version=step + 1)
+                AsyncCheckpoint.commit(root, state, self.config)
+            AsyncCheckpoint.invalidate(root)
+            selected = AsyncCheckpoint.resolve_path(self.config)
+            self.assertEqual(Path(selected).name, "step_10")
+            self.assertEqual(AsyncCheckpoint.load(selected, self.config)["learner_update"], 10)
+            self.config["train"]["checkpoint"]["load_path"] = str(Path(directory) / "step_2")
+            self.assertEqual(Path(AsyncCheckpoint.resolve_path(self.config)).name, "step_2")
+            (Path(selected) / "async_state.pkl").write_bytes(b"corrupt")
+            self.config["train"]["checkpoint"].pop("load_path")
+            with self.assertRaises(ValueError):
+                AsyncCheckpoint.load(AsyncCheckpoint.resolve_path(self.config), self.config)
+
     def test_roundtrip_and_longer_resume(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

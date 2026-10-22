@@ -461,8 +461,16 @@ groups, consumption/eviction counters, next group identity and policy mapping.
 Only after model completion does it commit `async_complete.json`, linked to
 the async payload checksum and configuration fingerprint.
 
-Resume requires an explicit directory containing both model and async commit
-markers. Increasing max_steps and changing output/logging locations is allowed;
+With no explicit `train.checkpoint.load_path`, asynchronous training selects the
+highest numbered `step_*` directory in `train.checkpoint.output_dir` containing
+both commit markers and the async payload. Incomplete directories are skipped;
+if none are complete, training starts fresh. Keep the same output directory to
+automatically resume, or use a new directory for a fresh run. An explicit load
+path takes precedence. Corrupted or incompatible committed checkpoints fail
+validation rather than silently falling back to an older step. Selection runs
+once on the coordinator and its result is shared by all training ranks; it does
+not load model tensors or change synchronous resume behavior.
+Increasing max_steps and changing output/logging locations is allowed;
 learning, data and capacity changes are rejected. Actor weights are republished
 before new tasks start. Training-rank failure rolls the entire run back to the
 last complete checkpoint. External side effects are not exactly-once.

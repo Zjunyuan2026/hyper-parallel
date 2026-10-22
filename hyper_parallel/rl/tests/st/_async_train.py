@@ -91,8 +91,11 @@ class Checkpoints:
 
     def __init__(self, runtime, config):
         self.runtime, self.config = runtime, config
-        self.load_path = config["load_path"]
         self.root = Path(config["output_dir"])
+
+    @property
+    def load_path(self):
+        return self.config.get("load_path")
 
     def directory(self, step):
         return self.root / f"step_{step}"
@@ -212,7 +215,7 @@ def run(output):
             raise RuntimeError("Actor did not update parameters")
         if trainer.roles.publications != [1, 3, 4]:
             raise RuntimeError(f"Unexpected publication schedule: {trainer.roles.publications}")
-        config["train"]["checkpoint"]["load_path"] = str(Path(output) / "step_3")
+        config["train"]["checkpoint"]["load_path"] = None
         config["train"]["max_steps"] = 5
         resumed = FullyAsyncTrainer(config)
         resumed.train()

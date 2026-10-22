@@ -47,15 +47,15 @@ class PartialRequestService:
         return next(iter(versions))
 
     async def generate(self, payload: dict) -> dict:
-        """Hold admission through the first engine output so pause cannot overtake it."""
+        """Register under admission, then collect output without blocking publication."""
         params = self.sampling_factory(
             n=1, temperature=1.0, top_p=1.0, top_k=-1, logprobs=1,
             max_tokens=payload["max_tokens"], seed=payload.get("seed"),
             ignore_eos=payload.get("ignore_eos", False),
             stop_token_ids=[] if payload.get("ignore_eos") else payload.get("stop_token_ids", []),
         )
-        iterator = None
-        registered = False
+        collector = None
+        registered = finished = False
         try:
             async with self.lock:
                 if self.closed:
@@ -67,19 +67,28 @@ class PartialRequestService:
                 self.active += 1
                 registered = True
                 self.idle.clear()
-                iterator = self.engine.generate(
-                    {"prompt_token_ids": payload["prompt_token_ids"]}, params, payload["request_id"],
+                # Registration must precede pause; waiting for a scheduled token must not.
+                collector = await self.engine.add_request(
+                    payload["request_id"], {"prompt_token_ids": payload["prompt_token_ids"]}, params,
                 )
-                output = await anext(iterator)
-            tokens, scores, reason = self._capture(output, [], [])
-            async for item in iterator:
-                tokens, scores, reason = self._capture(item, tokens, scores)
+            tokens, scores, reason = [], [], None
+            while not finished:
+                output = collector.get_nowait() or await collector.get()
+                finished = output.finished
+                tokens, scores, reason = self._capture(output, tokens, scores)
             return {"token_ids": tokens, "log_probs": scores,
                     "finish_reason": reason, "policy_version": version}
         finally:
             try:
-                if iterator is not None:
-                    await iterator.aclose()
+                try:
+                    if registered and not finished:
+                        await self.engine.abort(
+                            collector.request_id if collector is not None else payload["request_id"],
+                            internal=collector is not None,
+                        )
+                finally:
+                    if collector is not None:
+                        collector.close()
             finally:
                 if registered:
                     self.trace.emit("segment_end", segment_id=payload["request_id"], policy_version=version)

@@ -15,11 +15,15 @@
 """Commit asynchronous source/buffer state only after the model checkpoint is complete."""
 import hashlib
 import json
+import logging
 import os
 import pickle
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Mapping
+
+
+logger = logging.getLogger(__name__)
 
 
 def configuration_fingerprint(config: Mapping[str, Any]) -> str:
@@ -44,6 +48,30 @@ def configuration_fingerprint(config: Mapping[str, Any]) -> str:
 class AsyncCheckpoint:
     """Layer a final RL commit marker over the existing model/optimizer persistence."""
     schema = 1
+
+    @staticmethod
+    def resolve_path(config: Mapping[str, Any]) -> str | None:
+        """Honor an explicit path, otherwise select the latest committed async snapshot.
+
+        Corrupted or incompatible committed snapshots fail during restore rather
+        than silently rewinding training. Missing completion files are skipped.
+        """
+        checkpoint = config["train"]["checkpoint"]
+        if checkpoint.get("load_path") is not None:
+            return str(checkpoint["load_path"])
+        root = Path(checkpoint["output_dir"])
+        candidates = sorted(
+            (path for path in root.glob("step_*") if path.is_dir() and path.name[5:].isdigit()),
+            key=lambda path: int(path.name[5:]), reverse=True,
+        )
+        for directory in candidates:
+            if all((directory / name).is_file() for name in (
+                    "checkpoint_complete.json", "async_complete.json", "async_state.pkl")):
+                logger.info("Automatically resuming asynchronous training from %s", directory)
+                return str(directory)
+            logger.warning("Skipping incomplete asynchronous checkpoint: %s", directory)
+        logger.info("No complete asynchronous checkpoint in %s; starting a fresh run", root)
+        return None
 
     @classmethod
     def load(cls, directory: str | None, config: Mapping[str, Any]) -> dict | None:
@@ -92,3 +120,9 @@ class AsyncCheckpoint:
             handle.flush()
             os.fsync(handle.fileno())
         pending.replace(path)
+        # Persist the rename as well as the contents before reporting a commit.
+        descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)

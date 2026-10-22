@@ -13,7 +13,9 @@
 # limitations under the License.
 # ============================================================================
 """Complete-group asynchronous GRPO over the shared role and publication runtime."""
+import logging
 import os
+import sys
 import time
 import traceback
 from dataclasses import asdict, fields, replace
@@ -32,6 +34,9 @@ from rl.roles.rollout.base import GenerationSettings
 from rl.trainer import RLRoleRuntime
 from rl.utils.monitoring.metrics import build_training_metrics, enforce_learning_gate, summarize_rollout
 from rl.weight_sync.sync import coordinator_call
+
+
+logger = logging.getLogger(__name__)
 
 
 class FullyAsyncTrainer:
@@ -238,8 +243,11 @@ class FullyAsyncTrainer:
         """Execute asynchronous collection, updates, publication and recoverable checkpoints."""
         completed = False
         try:
+            load_path = coordinator_call("select async checkpoint", lambda: AsyncCheckpoint.resolve_path(self.config))
+            self.config["train"]["checkpoint"]["load_path"] = load_path
+            self.roles.checkpoints.config["load_path"] = load_path
             restored = coordinator_call("validate async restore", lambda: AsyncCheckpoint.load(
-                self.config["train"]["checkpoint"].get("load_path"), self.config,
+                load_path, self.config,
             ))
             self.roles.checkpoints.validate_resume()
             self.roles.checkpoints.begin(self.roles.state)
@@ -304,7 +312,21 @@ class FullyAsyncTrainer:
             coordinator_call("final drain", lambda: self.sampler.drain())
             completed = True
         finally:
+            failed = sys.exc_info()[0] is not None
+            cleanup_error = None
+            resources = []
             if self.rank == 0 and self.sampler is not None:
-                self.sampler.close(graceful=completed)
-            self.roles.close()
-            self.trace.emit("run_end", completed=completed, update=self.roles.state.global_step)
+                resources.append(("sampler", lambda: self.sampler.close(graceful=completed)))
+            resources.extend((
+                ("roles", self.roles.close),
+                ("trace", lambda: self.trace.emit("run_end", completed=completed, update=self.roles.state.global_step)),
+            ))
+            for name, close in resources:
+                try:
+                    close()
+                except Exception as error:  # pylint: disable=broad-exception-caught
+                    logger.warning("Async %s cleanup failed", name, exc_info=True)
+                    if cleanup_error is None:
+                        cleanup_error = error
+            if not failed and cleanup_error is not None:
+                raise cleanup_error
