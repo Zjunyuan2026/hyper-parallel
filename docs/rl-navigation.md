@@ -146,3 +146,14 @@ CPU 合同位于 `tests/ut/rl/agentic/swe_smith/`、`agentic/codex/` 和 `agenti
 [实现与验证边界](../hyper_parallel/rl/docs/swe_smith.md)维护模块职责、评分合同和验证范围。
 短预算闭环通过不代表已获得非零学习信号；跨训练 DP 的会话分发、长轨迹训练和全量数据效果
 须分别验收，不能从单次推理结果推导。
+
+## Rayless asynchronous GRPO
+
+| Feature | Configuration | Implementation | Validation |
+| --- | --- | --- | --- |
+| Complete-group asynchronous training | `async_training.groups_per_dp_rank`, `publish_every_updates` | `rl/async_training/fully_async_trainer.py`, `buffer.py` | `tests/ut/rl/async_training/`, `hyper_parallel/rl/tests/st/test_async_training.py` |
+| Interrupted responses and mixed-policy candidates | Default async publication behavior | `rl/roles/rollout/client.py`, `rl/async_training/vllm_server.py`, `fully_async_rollouter.py`, `protocol.py` | `tests/ut/rl/async_training/test_partial_rollout.py`; real NPU/HCCL separately required |
+| Segment staleness and diagnostics | `async_training.max_policy_lag_updates`, `audit_dir` | `rl/async_training/runtime.py`, `rl/utils/async_audit.py`; `async/sample_age_max`, `async/sample_age_token_mean`, `async/behavior_versions` | `hyper_parallel/rl/tests/st/async_reference.py`, `tests/ut/rl/async_training/test_partial_rollout.py` |
+
+See [runtime and validation boundaries](../hyper_parallel/rl/docs/architecture.md#partial-rollout-and-mixed-behavior-policies).
+The async entry point does not change synchronous entry points, defaults or training behavior.

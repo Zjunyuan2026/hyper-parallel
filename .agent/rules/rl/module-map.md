@@ -47,3 +47,17 @@ The runtime supports Qwen3 dense GRPO/PPO/GSPO and Qwen3-MoE GRPO under the
 MoE construction uses the shared `hyper_parallel/models/qwen3_moe/` recipe; RL weight conversion remains under
 `hyper_parallel/rl/rl/weight_sync/`. Shared-project changes follow their own module rules.
 Packaging changes belong to the root `setup.py` and `MANIFEST.in`.
+
+## Rayless asynchronous GRPO
+
+`hyper_parallel/rl/rl/async_training/` owns bounded group collection, publication scheduling,
+staleness, and source/buffer checkpoints. `roles/rollout/client.py` owns async continuation
+and local admission; `async_training/vllm_server.py` owns server admission, policy identity
+and aborted-output routes in the pinned runtime.
+`runtime.py` owns the experience buffer and producer transport; `protocol.py` owns async configuration
+and exact behavior-segment action coverage. Optional numerical evidence stays in
+`rl/utils/async_audit.py`. Synchronous contracts and
+the synchronous training loop remain unchanged. See the
+[partial rollout contract](../../../hyper_parallel/rl/docs/architecture.md#partial-rollout-and-mixed-behavior-policies).
+CPU contracts are in `tests/ut/rl/async_training/test_partial_rollout.py`; real NPU/HCCL
+acceptance and longer learning-quality comparisons are separate requirements.

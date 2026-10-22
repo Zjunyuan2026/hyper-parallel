@@ -13,4 +13,4 @@ hyper_parallel = "rl.roles.rollout.vllm_plugin:register_hyper_models"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["rl", "rl.*"]
+include = ["rl", "rl.*", "examples", "examples.*"]

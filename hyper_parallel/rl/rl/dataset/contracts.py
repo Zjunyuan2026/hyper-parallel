@@ -171,6 +171,7 @@ class ExperienceBatch:
     teacher_keys: Optional[tuple[str, ...]] = None
     rollout_log_probs: Optional[Any] = None
     router_traces: Optional[tuple[Optional[RouterTrace], ...]] = None
+    mixed_policy_versions: bool = False
 
     def __post_init__(self) -> None:
         """Validate the shared token dimensions before algorithm code runs."""
@@ -206,7 +207,10 @@ class ExperienceBatch:
             trajectory_versions = {
                 trajectory.worker_policy_version for trajectory in self.trajectories
             }
-            if trajectory_versions != {self.worker_policy_version}:
+            if self.mixed_policy_versions:
+                if self.worker_policy_version is not None or None in trajectory_versions:
+                    raise ValueError("Mixed batches require explicit per-trajectory versions")
+            elif trajectory_versions != {self.worker_policy_version}:
                 raise ValueError(
                     "experience worker policy version must match every trajectory"
                 )

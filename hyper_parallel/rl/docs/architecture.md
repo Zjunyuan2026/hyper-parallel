@@ -316,3 +316,233 @@ CP/PP、更多 TP/EP 组合及动态专家重分配按实际任务需求推进�
 
 需要定位具体实现时，参阅 [模块导航](../../../docs/rl-navigation.md)、[PPO 配方](../examples/gsm8k/configs/qwen3_4b_gsm8k_ppo.yaml)
 和 [测试入口](../README.md#系统测试)。架构文档不重复维护函数级路径。
+
+## Rayless asynchronous GRPO
+
+The core lives in `rl/async_training/`; the sole example entry is
+`examples/async_training/launch.py`. It composes `RLRoleRuntime` and reuses
+GRPO, Actor, Reference, vLLM and the existing HCCL publisher.
+`SyncTrainer` retains its original synchronous loop.
+
+### Supported scope and launch
+
+The initial scope is single-node Qwen3 dense, disjoint vLLM, internal single-turn
+GRPO. The entry rejects PPO, MoE, multi-turn, model rewards, distillation and
+synchronous consistency gates. Inside the supplied Hyper image, launch directly from
+the mounted checkout; the script preserves CANN paths and adds source import paths:
+
+```bash
+bash hyper_parallel/rl/examples/async_training/scripts/run_async_training.sh \
+  hyper_parallel/rl/examples/async_training/configs/qwen3_4b_gsm8k_grpo.yaml \
+  --model.weights_path=/models/Qwen3-4B \
+  --model.tokenizer_path=/models/Qwen3-4B \
+  --data.train_path=/data/gsm8k/train.parquet \
+  --data.test_path=/data/gsm8k/test.parquet
+```
+
+The example uses trainer devices 0,1 and inference devices 2,3. Adapt physical
+devices, paths, port and parallel sizes to available resources.
+`TRAIN_PROCESSES` must match the training topology.
+YAML and strict CLI overrides are the authoritative configuration.
+
+### Ownership and complete groups
+
+Training rank zero owns `ExperienceBuffer`; a spawned CPU producer owns its
+prompt loader and independent task sessions. It never joins the training
+process group. Generation uses a public HTTP client without training collectives.
+A group contains all candidates for one unique sampling event, final rewards,
+original tokens and raw sampled-token probabilities. Interrupted rollout records the actual
+behavior version of every response segment. Repeated source prompts
+receive different sampling identities.
+
+Admission reserves a group slot and `max_group_bytes` until consumption or whole
+group eviction. Configuration requires
+`max_buffer_bytes >= max_buffer_groups * max_group_bytes`.
+This bounds wire payload accounting, not total RSS: serialization copies,
+HTTP buffers and interpreter overhead require additional host memory.
+An oversized result or infrastructure failure fails the run, rather than becoming
+a normal zero-reward sample. The source recipe bounds prompt/response lengths
+and candidate count.
+
+Mixed versions are explicit on asynchronous batches; the original builder keeps
+its strict same-version default. Every DP shard receives the same fixed number
+of complete groups and candidates. Mini/micro batch divisibility is validated
+before startup. Groups remain local to one DP shard; TP peers receive identical
+inputs and do not repeat environment execution.
+
+### Optimization and publication
+
+The loss uses `old_log_probs = rollout_log_probs` and current Actor probabilities,
+without applying the same importance ratio twice. The first recipe requires
+temperature=1, top_p=1, top_k=0 and raw_logprobs. This is a bounded-staleness
+surrogate objective, not an assertion of on-policy equivalence or unbiased
+convergence.
+
+A learner update consumes one global batch; optimizer steps are counted
+separately. Committed version `v = source_update + 1`; inference version zero
+means the initial service has not received an Actor publication. Startup and
+resume always publish Actor weights. Group age is current learner update minus
+the oldest actual action segment's source update. Groups beyond
+`max_policy_lag_updates` are evicted atomically.
+Periodic and early refresh prevent waiting indefinitely on an obsolete producer.
+
+At publication, admission stops, requests abort, and the producer receives their
+partial output before acknowledging pause. All training ranks then enter the existing HCCL
+transaction. Only a verified committed version permits admission to resume.
+Optimizer mutation stops during transfer: the live model is not an immutable
+background snapshot. Timeouts, producer exits and publication errors fail the run.
+
+#### Partial rollout and mixed behavior policies
+
+Asynchronous training uses interrupted response continuation on the pinned
+vLLM 0.23.0 / vLLM-Ascend 0.23.0.post1 runtime; no additional mode flag is required.
+The async launcher opts its inference subprocess into `/hyper_async/*` service routes;
+ordinary synchronous launchers do not install or call them. No synchronous training
+loop, loss, configuration default or trajectory identity check changes.
+The async service uses one API frontend to own its admission barrier; inference DP remains configurable.
+
+The explicit inference module registers the existing plugin before dispatching to vLLM.
+Spawned workers repeat registration before loading their targets. This needs neither an
+editable installation nor a temporary `sitecustomize.py`; registration failures stop startup.
+
+Every consumed batch writes full responses to `rollouts/step_<step>_rank_<dp_rank>.jsonl`
+beside `train.checkpoint.output_dir`. Only TP rank zero writes each DP shard. Records include
+the environment's extracted and expected answers, scorer identity, reward components,
+per-group rewards, zero reward variance and actual masked nonzero advantages. Old buffered
+responses without scorer information explicitly report diagnostics as unavailable.
+Token budget exhaustion, actual generation finish reason and environment truncation are
+separate fields: an EOS at the token cap is still a normal stop. Uniform group rewards can
+produce zero policy-gradient advantages even when batch-wide reward variance is nonzero.
+These records add IO; keep the checkpoint directory outside the source checkout.
+
+One bounded candidate thread pool serves all in-flight groups. The HTTP client blocks
+continuations during publication; the inference service owns admission, active-engine
+tracking and committed policy identity. Pause closes server admission, aborts generation
+and awaits captured output before acknowledging publication safety. Delayed HTTP responses
+retain their original server-stamped version.
+
+Each candidate is scheduled independently, retaining exact token prefixes and original
+behavior log probabilities from every attempt. A continuation sends the original prompt
+plus retained tokens and only the remaining response budget. Publication invalidates
+caches so prefixes are processed under the new weights. Old probabilities are never
+replaced by recomputations under new weights. EOS/length ends the candidate; abort
+permits continuation, including after a zero-token attempt. Only complete groups train.
+
+`Trajectory.metadata.behavior_segments` contains response-relative half-open `start/end`
+action offsets, `policy_version` and `source_update`. Segments cover every action exactly
+once, have monotonic versions, and end at the trajectory's reported worker version.
+The async wire protocol validates this metadata; shared synchronous contracts remain
+unchanged. Legacy single-version payloads retain their original validation. Actual
+behavior versions determine staleness; groups with any over-age segment are discarded whole.
+
+Mixed-policy GRPO retains the group reward baseline and uses each action's behavior
+probability in the clipped objective. This is a bounded-staleness surrogate, without
+claiming equivalence to on-policy GRPO or convergence. Diagnostics report the oldest
+and token-weighted mean sample age and the number of behavior versions.
+
+Checkpoint/evaluation boundaries still drain complete groups. Half-generated responses
+are not serialized. Ready groups retain their behavior segments in existing buffer
+snapshots. Restart uses the saved source cursor and group identities. A failure returns
+to the last committed checkpoint, without claiming exactly-once external effects.
+
+`tests/ut/rl/async_training/test_partial_rollout.py` covers repeated/empty aborts,
+exact prefixes/budgets/probabilities, mixed groups, stale eviction, buffer restoration,
+independent scalar gradients and a real spawned producer against a deterministic HTTP
+server. CPU tests do not establish real NPU/HCCL behavior, learning quality or speed.
+Hardware acceptance must capture a response crossing publication and a mixed-version group.
+Use `async_reference.py --require-partial-rollout --require-generation-progress` to
+reject runs that complete without consuming those cases or proving real inference progress.
+
+### Checkpoint and recovery
+
+The existing model/optimizer/RNG checkpoint is reused. After draining and
+committing the current update, the runtime also saves the source cursor, ready
+groups, consumption/eviction counters, next group identity and policy mapping.
+Only after model completion does it commit `async_complete.json`, linked to
+the async payload checksum and configuration fingerprint.
+
+Resume requires an explicit directory containing both model and async commit
+markers. Increasing max_steps and changing output/logging locations is allowed;
+learning, data and capacity changes are rejected. Actor weights are republished
+before new tasks start. Training-rank failure rolls the entire run back to the
+last complete checkpoint. External side effects are not exactly-once.
+Evaluation runs against a committed version while sampling is drained.
+
+### Validation boundary
+
+CPU contracts live in `tests/ut/rl/async_training/`. The local HTTP test uses
+the production producer, DataLoader, AgentRunner and token/logprob parser.
+The two-rank Gloo integration uses actual GRPO, Actor and DDP to check the
+production trainer's updates, publication schedule, spawn transport,
+checkpoint/resume and DP agreement. Its producer is scripted: this does not
+validate real vLLM/HCCL execution or NPU learning.
+
+Hardware acceptance must run the example on free devices, confirm concurrent
+sampling/update progress, version correctness and memory bounds, then compare
+time to the same evaluation quality against a synchronous run with the same
+device budget.
+
+### Auditable asynchronous execution
+
+Set `async_training.audit_dir` to a fresh output directory to collect diagnostic
+JSONL events and CPU snapshots of actual Actor targets, loss inputs, and backward
+hooks. The default is null; synchronous training does not use this collector.
+Each process writes its own file. Host boot identity and CLOCK_MONOTONIC must
+match before cross-process intervals can be compared. Sampling intervals span
+complete group generation; Actor update intervals exclude target preparation.
+The producer also polls vLLM token counters with request start/end timestamps.
+Two counter observations entirely inside an Actor interval establish actual
+inference progress during that update. Parameter publication must intersect no
+engine-attempt interval (`segment_start/end`, recorded by the inference service). A response's full
+lifecycle may span publication. The existing overlap metric is a lower bound based on results
+already received; it can be zero when concurrent groups finish after the update.
+
+The observer delegates to the existing algorithm and returns no replacement
+backward gradient. Its snapshots and device-to-host copies add overhead, so these
+runs are correctness evidence, not throughput benchmarks. Evidence contains
+sample identities, rewards and probabilities; keep it under the same access
+policy as training artifacts. Changing only the audit directory does not change
+checkpoint learning identity.
+
+Run the independent offline checker after a completed diagnostic run:
+
+```bash
+python hyper_parallel/rl/tests/st/async_reference.py \
+  /results/audit /results/base_config.yaml --require-generation-progress
+```
+
+The supplied config must describe the algorithm actually used by the run.
+The checker uses scalar formulas for group advantages, importance ratios and
+loss derivatives, spot-checks derivatives by central differences, and reconstructs
+DP token normalization from all rank snapshots. Frozen behavior probabilities
+must equal the retained rollout probabilities at every action position. Reference
+KL is evaluated in FP32 by the production algorithm; native exponential values
+and raw KL identify the actual clamp branch near zero. Their values and FP32
+operation order are checked independently before gradient comparison. Historical
+evidence without live KL primitives can be supplemented by a separately labelled
+native primitive replay on its immutable forward inputs.
+
+`test_async_numerics.py` separately checks every parameter of a tiny categorical
+Actor against a whole-batch scalar finite difference, including unequal DP token
+counts and micro-batch accumulation. It defaults to CPU/Gloo; explicitly set
+`ASYNC_NUMERIC_BACKEND=hccl` with two free visible NPUs for hardware execution.
+This does not constitute an independent backward pass through every parameter of
+a large Qwen3 model.
+
+For restoration acceptance, stop after a completed checkpoint and launch a new
+training process with an increased max_steps and explicit load_path. Compare
+`checkpoint_state` with the new `restore_complete` event on each rank: model,
+optimizer, scheduler, CPU RNG and device RNG digests must match. Also verify
+that the next batch consumes the saved ready groups and that newly admitted
+identities continue from the saved source cursor. Checksums alone do not verify
+that these states were actually loaded into live training.
+
+```bash
+python hyper_parallel/rl/tests/st/async_restore_reference.py \
+  /results/previous_run /results/resumed_run --output=/results/restoration.json
+```
+
+Both run directories must include the diagnostic events, base_config.yaml and
+one completed checkpoint. This small acceptance helper checks continuation
+within one dataset epoch; it rejects epoch transitions instead of claiming they
+were validated.

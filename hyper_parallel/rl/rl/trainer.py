@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Synchronous requirements-driven Hyper-Parallel RL trainer."""
+"""Shared role construction and the original synchronous RL orchestration."""
 import functools
 import logging
 import os
@@ -200,8 +200,8 @@ def _validate_shared_vllm_metadata(
         )
 
 
-class SyncTrainer:
-    """Synchronous RL orchestrator composed from HyperAutoModel role runtimes.
+class RLRoleRuntime:
+    """Shared role resources composed from HyperAutoModel runtimes.
 
     Args:
         resolved_config: Fully merged Hyper-RL YAML configuration.
@@ -239,6 +239,29 @@ class SyncTrainer:
         except Exception:
             self._cleanup()
             raise
+
+    @staticmethod
+    def run_synchronized(operation: str, callback: Any) -> Any:
+        """Run rank-local preparation and propagate errors before collective computation."""
+        return RLRoleRuntime._run_rank_synchronized(operation, callback)
+
+    def close(self) -> None:
+        """Close owned role services and distributed resources."""
+        self._cleanup()
+
+    def prepare_experience(self, rollout: ExperienceBatch) -> ExperienceBatch:
+        """Build fixed targets through the existing role and algorithm pipeline."""
+        experience, _ = self._prepare_experience(rollout, False, {})
+        return experience
+
+    def publish_policy(self, version: int) -> None:
+        """Publish stable Actor parameters; every training rank must participate."""
+        self._publish_policy(version)
+
+    @property
+    def tracker(self) -> TrainingTracker:
+        """Expose the configured training metrics sink."""
+        return self._tracker
 
     def _cleanup(self) -> None:
         """Close owned services and reset lifecycle state even when cleanup raises."""
@@ -295,64 +318,6 @@ class SyncTrainer:
         seed = int(self.runtime_config.training.seed)
         random.seed(seed)
         torch.manual_seed(seed)
-
-    def train(self) -> None:
-        """Run synchronous rollout, learning, publication, and checkpointing."""
-        completed = False
-        try:
-            completed = self._train_and_checkpoint()
-        finally:
-            if completed:
-                dist.barrier()
-            self._cleanup()
-
-    def _train_and_checkpoint(self) -> bool:
-        """Run training and final checkpointing, returning only after success."""
-        self.checkpoints.validate_resume()
-        self.checkpoints.begin(self.state)
-        if self.state.global_step > self.rollout_engine.policy_version:
-            self._release_training_state_for_rollout()
-            self.rollout_engine.prepare_for_training()
-            self.rollout_engine.update_weights(
-                PolicySnapshot(
-                    version=self.state.global_step,
-                    model_name=self.model_registration.name,
-                    payload=self.actor.actor_model,
-                )
-            )
-            self._release_training_state_for_rollout()
-            self.rollout_engine.prepare_for_rollout()
-        else:
-            self._release_training_state_for_rollout()
-        if hasattr(self, "sampler"):
-            self.sampler.set_epoch(self.state.epoch)
-        data_iterator = iter(self.train_dataloader)
-        while self.state.global_step < self.state.max_steps:
-            batch, data_iterator = self._next_batch(data_iterator)
-            self._train_step(batch)
-        save_final = bool(
-            required_mapping(
-                required_mapping(self.resolved_config, "train"),
-                "checkpoint",
-            ).get("save_final", True)
-        )
-        if (
-            save_final
-            and self.evaluator is not None
-            and self.evaluator.last_step != self.state.global_step
-        ):
-            validation_metrics, validation_samples = self.evaluator.run(
-                self.state.global_step
-            )
-            self._tracker.log(
-                validation_metrics,
-                step=self.state.global_step,
-                sample_tables={"validation/samples": validation_samples},
-            )
-        if save_final and uses_colocated_vllm(self.resolved_config):
-            self._close_rollout_for_final_checkpoint()
-        self.checkpoints.finalize(self.state)
-        return True
 
     def _prepare_experience(
         self,
@@ -448,103 +413,6 @@ class SyncTrainer:
         )
         self.rollout_engine.prepare_for_rollout()
 
-    def _train_step(self, batch: Mapping[str, Any]) -> None:
-        """Run one explicit RL2-style role pipeline."""
-        step_started = time.perf_counter()
-        timings: dict[str, float] = {}
-        next_step = self.state.global_step + 1
-        logger.info(
-            "rank=%d step=%d sample_index=%d",
-            dist.get_rank(),
-            next_step,
-            int(batch["sample_indices"][0]),
-        )
-        input_ids = batch["input_ids"].to(self.device, non_blocking=True)
-        attention_mask = batch["attention_mask"].to(self.device, non_blocking=True)
-        stage_started = time.perf_counter()
-        prompt_records = self._run_rank_synchronized(
-            "prompt record construction",
-            lambda: build_prompt_records(batch, input_ids, attention_mask),
-        )
-        if prompt_records is None:
-            raise RuntimeError("Prompt record construction failed without a synchronized error")
-        rollout = self.rollout_manager.generate(
-            prompt_records=prompt_records,
-            policy_version=self.state.global_step,
-        )
-        timings["gen"] = time.perf_counter() - stage_started
-        stage_started = time.perf_counter()
-        if getattr(self, "reward_model_client", None) is None:
-            self.rollout_engine.prepare_for_training()
-        else:
-            rollout = self._score_model_rollout(prompt_records, rollout)
-            timings["reward"] = float(rollout.metadata["reward_seconds"])
-            timings["reward_wake"] = float(rollout.metadata["reward_wake_seconds"])
-            timings["reward_sleep"] = float(rollout.metadata["reward_sleep_seconds"])
-        timings["prepare_training"] = time.perf_counter() - stage_started
-        if rollout.old_log_probs is None:
-            raise RuntimeError("Training rollout did not produce old_log_probs")
-        rollout = pad_agent_call_batch_for_dp(rollout, self._dp_group_info)
-        if getattr(self, 'teacher_manager', None) is not None:
-            stage_started = time.perf_counter()
-            rollout = self._score_teacher_rollout(prompt_records, rollout)
-            timings['teacher'] = time.perf_counter() - stage_started
-        collect_diagnostics = next_step % self._log_steps == 0 or (
-            self.evaluator is not None and self.checkpoints.will_save(next_step)
-        )
-        experience, diagnostic_metrics = self._prepare_experience(
-            rollout,
-            collect_diagnostics,
-            timings,
-        )
-        if getattr(self, "teacher_manager", None) is not None:
-            diagnostic_metrics.update(self._run_rank_synchronized(
-                "OPD pre-update probability gate",
-                lambda: validate_probability_gate(experience, self.distillation_config,
-                                                  group=self._dp_group_info.group,
-                                                  size=self.parallel_dims.dp_size),
-            ))
-        # Detached inference targets no longer need the full role parameters.
-        self._release_training_state_for_rollout()
-        stage_started = time.perf_counter()
-        actor_update = self.actor.update(experience)
-        timings["update_actor"] = time.perf_counter() - stage_started
-        if getattr(self, 'teacher_manager', None) is not None:
-            diagnostic_metrics.update(self.actor.distillation_metrics())
-            counts = torch.tensor([
-                sum(key == teacher_key for key in experience.teacher_keys)
-                for teacher_key, _ in self.distillation_config.teachers
-            ], device=self.device, dtype=torch.int64)
-            if self.parallel_dims.dp_size > 1:
-                dist.all_reduce(counts, group=self._dp_group_info.group)
-            diagnostic_metrics.update({
-                f'distillation/teacher_samples/{key}': float(count)
-                for (key, _), count in zip(self.distillation_config.teachers, counts.tolist())
-            })
-        if self._consistency_profile != CONSISTENCY_PROFILE_OFF:
-            stage_started = time.perf_counter()
-            diagnostic_metrics.update(self._post_update_mismatch(experience))
-            timings["post_update_old_log_prob"] = time.perf_counter() - stage_started
-        critic_update = None
-        if self.critic is not None:
-            stage_started = time.perf_counter()
-            critic_update = self.critic.update(experience)
-            timings["update_critic"] = time.perf_counter() - stage_started
-        stage_started = time.perf_counter()
-        self._publish_policy(next_step)
-        timings["weight_sync"] = time.perf_counter() - stage_started
-        timings["step"] = time.perf_counter() - step_started
-        if collect_diagnostics:
-            self._add_step_timing_metrics(diagnostic_metrics, timings)
-        self._complete_step(
-            step=next_step,
-            batch=batch,
-            rollout=rollout,
-            actor_update=actor_update,
-            critic_update=critic_update,
-            diagnostic_metrics=diagnostic_metrics,
-        )
-
     def _score_teacher_rollout(self, prompt_records: Any, rollout: ExperienceBatch) -> ExperienceBatch:
         """Only TP owners score; synchronize errors before sharing results with siblings."""
         owner = self.parallel_dims.tp_size == 1 or self.parallel_dims.tp_rank == 0
@@ -589,81 +457,6 @@ class SyncTrainer:
         diagnostic_metrics["perf/tokens_per_second_per_device"] = total_tokens / max(
             timings["step"] * dist.get_world_size(), 1.0e-9,
         )
-
-    def _complete_step(
-        self,
-        *,
-        step: int,
-        batch: Mapping[str, Any],
-        rollout: ExperienceBatch,
-        actor_update: Any,
-        critic_update: Optional[Any],
-        diagnostic_metrics: Mapping[str, float],
-    ) -> None:
-        """Record, evaluate, and checkpoint one successfully published policy."""
-        self.state.global_step = step
-        rollout_metrics, samples = summarize_rollout(
-            rollout,
-            batch,
-            step=step,
-            sample_limit=self._log_samples,
-            is_request_owner=bool(getattr(self.rollout_engine, "is_request_owner", True)),
-        )
-        metrics = build_training_metrics(
-            step=step,
-            actor_update=actor_update,
-            rollout_metrics=rollout_metrics,
-            critic_update=critic_update,
-            policy=self.rollout_engine,
-            diagnostic_metrics=diagnostic_metrics,
-        )
-        train_config = required_mapping(self.resolved_config, "train")
-        enforce_learning_gate(
-            metrics,
-            step=step,
-            config=train_config.get("learning_gate", {}),
-            run_synchronized=self._run_rank_synchronized,
-        )
-        checkpoint_will_save = self.checkpoints.will_save(step)
-        validation_samples: list[dict[str, Any]] = []
-        if checkpoint_will_save and self.evaluator is not None:
-            validation_metrics, validation_samples = self.evaluator.run(step)
-            metrics.update(validation_metrics)
-        if step % self._log_steps == 0 or (
-            checkpoint_will_save and self.evaluator is not None
-        ):
-            self._tracker.log(
-                metrics,
-                step=step,
-                samples=samples,
-                sample_tables={"validation/samples": validation_samples},
-            )
-        if checkpoint_will_save and uses_colocated_vllm(self.resolved_config):
-            if step == self.state.max_steps:
-                self._close_rollout_for_final_checkpoint()
-            else:
-                self.rollout_engine.prepare_for_training()
-                self._release_training_state_for_rollout()
-        self.checkpoints.complete_step(
-            self.state,
-            loss=actor_update.total_loss,
-            grad_norm=actor_update.gradient_norm,
-        )
-        if (
-            checkpoint_will_save
-            and uses_colocated_vllm(self.resolved_config)
-            and step < self.state.max_steps
-        ):
-            self._release_training_state_for_rollout()
-            self.rollout_engine.prepare_for_rollout()
-
-    def _close_rollout_for_final_checkpoint(self) -> None:
-        """Release inference processes and IPC consumers before the final save."""
-        if getattr(self, "_rollout_closed_for_final_checkpoint", False):
-            return
-        self.rollout_engine.close()
-        self._rollout_closed_for_final_checkpoint = True
-        self._release_training_state_for_rollout()
 
     def _validate_runtime_topology(self) -> None:
         """Validate torchrun world size against the resolved Trainer mesh."""
@@ -1208,3 +1001,237 @@ class SyncTrainer:
         if any(error is not None for error in errors):
             raise RuntimeError(f"{operation} failed on at least one rank: {errors}")
         return result
+
+
+class SyncTrainer(RLRoleRuntime):
+    """Original synchronous orchestration over the shared role runtime."""
+
+    def train(self) -> None:
+        """Run synchronous rollout, learning, publication, and checkpointing."""
+        completed = False
+        try:
+            completed = self._train_and_checkpoint()
+        finally:
+            if completed:
+                dist.barrier()
+            self._cleanup()
+
+    def _train_and_checkpoint(self) -> bool:
+        """Run training and final checkpointing, returning only after success."""
+        self.checkpoints.validate_resume()
+        self.checkpoints.begin(self.state)
+        if self.state.global_step > self.rollout_engine.policy_version:
+            self._release_training_state_for_rollout()
+            self.rollout_engine.prepare_for_training()
+            self.rollout_engine.update_weights(
+                PolicySnapshot(
+                    version=self.state.global_step,
+                    model_name=self.model_registration.name,
+                    payload=self.actor.actor_model,
+                )
+            )
+            self._release_training_state_for_rollout()
+            self.rollout_engine.prepare_for_rollout()
+        else:
+            self._release_training_state_for_rollout()
+        if hasattr(self, "sampler"):
+            self.sampler.set_epoch(self.state.epoch)
+        data_iterator = iter(self.train_dataloader)
+        while self.state.global_step < self.state.max_steps:
+            batch, data_iterator = self._next_batch(data_iterator)
+            self._train_step(batch)
+        save_final = bool(
+            required_mapping(
+                required_mapping(self.resolved_config, "train"),
+                "checkpoint",
+            ).get("save_final", True)
+        )
+        if (
+            save_final
+            and self.evaluator is not None
+            and self.evaluator.last_step != self.state.global_step
+        ):
+            validation_metrics, validation_samples = self.evaluator.run(
+                self.state.global_step
+            )
+            self._tracker.log(
+                validation_metrics,
+                step=self.state.global_step,
+                sample_tables={"validation/samples": validation_samples},
+            )
+        if save_final and uses_colocated_vllm(self.resolved_config):
+            self._close_rollout_for_final_checkpoint()
+        self.checkpoints.finalize(self.state)
+        return True
+
+    def _train_step(self, batch: Mapping[str, Any]) -> None:
+        """Run one explicit RL2-style role pipeline."""
+        step_started = time.perf_counter()
+        timings: dict[str, float] = {}
+        next_step = self.state.global_step + 1
+        logger.info(
+            "rank=%d step=%d sample_index=%d",
+            dist.get_rank(),
+            next_step,
+            int(batch["sample_indices"][0]),
+        )
+        input_ids = batch["input_ids"].to(self.device, non_blocking=True)
+        attention_mask = batch["attention_mask"].to(self.device, non_blocking=True)
+        stage_started = time.perf_counter()
+        prompt_records = self._run_rank_synchronized(
+            "prompt record construction",
+            lambda: build_prompt_records(batch, input_ids, attention_mask),
+        )
+        if prompt_records is None:
+            raise RuntimeError("Prompt record construction failed without a synchronized error")
+        rollout = self.rollout_manager.generate(
+            prompt_records=prompt_records,
+            policy_version=self.state.global_step,
+        )
+        timings["gen"] = time.perf_counter() - stage_started
+        stage_started = time.perf_counter()
+        if getattr(self, "reward_model_client", None) is None:
+            self.rollout_engine.prepare_for_training()
+        else:
+            rollout = self._score_model_rollout(prompt_records, rollout)
+            timings["reward"] = float(rollout.metadata["reward_seconds"])
+            timings["reward_wake"] = float(rollout.metadata["reward_wake_seconds"])
+            timings["reward_sleep"] = float(rollout.metadata["reward_sleep_seconds"])
+        timings["prepare_training"] = time.perf_counter() - stage_started
+        if rollout.old_log_probs is None:
+            raise RuntimeError("Training rollout did not produce old_log_probs")
+        rollout = pad_agent_call_batch_for_dp(rollout, self._dp_group_info)
+        if getattr(self, 'teacher_manager', None) is not None:
+            stage_started = time.perf_counter()
+            rollout = self._score_teacher_rollout(prompt_records, rollout)
+            timings['teacher'] = time.perf_counter() - stage_started
+        collect_diagnostics = next_step % self._log_steps == 0 or (
+            self.evaluator is not None and self.checkpoints.will_save(next_step)
+        )
+        experience, diagnostic_metrics = self._prepare_experience(
+            rollout,
+            collect_diagnostics,
+            timings,
+        )
+        if getattr(self, "teacher_manager", None) is not None:
+            diagnostic_metrics.update(self._run_rank_synchronized(
+                "OPD pre-update probability gate",
+                lambda: validate_probability_gate(experience, self.distillation_config,
+                                                  group=self._dp_group_info.group,
+                                                  size=self.parallel_dims.dp_size),
+            ))
+        # Detached inference targets no longer need the full role parameters.
+        self._release_training_state_for_rollout()
+        stage_started = time.perf_counter()
+        actor_update = self.actor.update(experience)
+        timings["update_actor"] = time.perf_counter() - stage_started
+        if getattr(self, 'teacher_manager', None) is not None:
+            diagnostic_metrics.update(self.actor.distillation_metrics())
+            counts = torch.tensor([
+                sum(key == teacher_key for key in experience.teacher_keys)
+                for teacher_key, _ in self.distillation_config.teachers
+            ], device=self.device, dtype=torch.int64)
+            if self.parallel_dims.dp_size > 1:
+                dist.all_reduce(counts, group=self._dp_group_info.group)
+            diagnostic_metrics.update({
+                f'distillation/teacher_samples/{key}': float(count)
+                for (key, _), count in zip(self.distillation_config.teachers, counts.tolist())
+            })
+        if self._consistency_profile != CONSISTENCY_PROFILE_OFF:
+            stage_started = time.perf_counter()
+            diagnostic_metrics.update(self._post_update_mismatch(experience))
+            timings["post_update_old_log_prob"] = time.perf_counter() - stage_started
+        critic_update = None
+        if self.critic is not None:
+            stage_started = time.perf_counter()
+            critic_update = self.critic.update(experience)
+            timings["update_critic"] = time.perf_counter() - stage_started
+        stage_started = time.perf_counter()
+        self._publish_policy(next_step)
+        timings["weight_sync"] = time.perf_counter() - stage_started
+        timings["step"] = time.perf_counter() - step_started
+        if collect_diagnostics:
+            self._add_step_timing_metrics(diagnostic_metrics, timings)
+        self._complete_step(
+            step=next_step,
+            batch=batch,
+            rollout=rollout,
+            actor_update=actor_update,
+            critic_update=critic_update,
+            diagnostic_metrics=diagnostic_metrics,
+        )
+
+    def _complete_step(
+        self,
+        *,
+        step: int,
+        batch: Mapping[str, Any],
+        rollout: ExperienceBatch,
+        actor_update: Any,
+        critic_update: Optional[Any],
+        diagnostic_metrics: Mapping[str, float],
+    ) -> None:
+        """Record, evaluate, and checkpoint one successfully published policy."""
+        self.state.global_step = step
+        rollout_metrics, samples = summarize_rollout(
+            rollout,
+            batch,
+            step=step,
+            sample_limit=self._log_samples,
+            is_request_owner=bool(getattr(self.rollout_engine, "is_request_owner", True)),
+        )
+        metrics = build_training_metrics(
+            step=step,
+            actor_update=actor_update,
+            rollout_metrics=rollout_metrics,
+            critic_update=critic_update,
+            policy=self.rollout_engine,
+            diagnostic_metrics=diagnostic_metrics,
+        )
+        train_config = required_mapping(self.resolved_config, "train")
+        enforce_learning_gate(
+            metrics,
+            step=step,
+            config=train_config.get("learning_gate", {}),
+            run_synchronized=self._run_rank_synchronized,
+        )
+        checkpoint_will_save = self.checkpoints.will_save(step)
+        validation_samples: list[dict[str, Any]] = []
+        if checkpoint_will_save and self.evaluator is not None:
+            validation_metrics, validation_samples = self.evaluator.run(step)
+            metrics.update(validation_metrics)
+        if step % self._log_steps == 0 or (
+            checkpoint_will_save and self.evaluator is not None
+        ):
+            self._tracker.log(
+                metrics,
+                step=step,
+                samples=samples,
+                sample_tables={"validation/samples": validation_samples},
+            )
+        if checkpoint_will_save and uses_colocated_vllm(self.resolved_config):
+            if step == self.state.max_steps:
+                self._close_rollout_for_final_checkpoint()
+            else:
+                self.rollout_engine.prepare_for_training()
+                self._release_training_state_for_rollout()
+        self.checkpoints.complete_step(
+            self.state,
+            loss=actor_update.total_loss,
+            grad_norm=actor_update.gradient_norm,
+        )
+        if (
+            checkpoint_will_save
+            and uses_colocated_vllm(self.resolved_config)
+            and step < self.state.max_steps
+        ):
+            self._release_training_state_for_rollout()
+            self.rollout_engine.prepare_for_rollout()
+
+    def _close_rollout_for_final_checkpoint(self) -> None:
+        """Release inference processes and IPC consumers before the final save."""
+        if getattr(self, "_rollout_closed_for_final_checkpoint", False):
+            return
+        self.rollout_engine.close()
+        self._rollout_closed_for_final_checkpoint = True
+        self._release_training_state_for_rollout()

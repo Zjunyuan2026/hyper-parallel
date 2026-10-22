@@ -407,3 +407,22 @@ python -m pytest -vv -s hyper_parallel/rl/tests/st/test_rl_st.py
   note  = {HyperParallel-RL module in the HyperParallel repository}
 }
 ```
+
+## Rayless asynchronous GRPO
+
+See [runtime architecture](docs/architecture.md#rayless-asynchronous-grpo)
+for the entry, scope, state and recovery contracts.
+The synchronous entry remains unchanged. Real NPU/HCCL acceptance is separate from CPU tests.
+
+The async shell launcher imports the checkout directly and preserves the image's CANN
+`PYTHONPATH`; no extra installation, virtual environment or Hyper-RL distribution metadata
+is required. The inference entry registers existing hooks in its frontend and spawned workers.
+The supplied recipe explicitly disables thinking and allows 1024 response tokens.
+Consumed responses and scoring diagnostics are saved beside the checkpoint directory under
+`rollouts/step_<step>_rank_<dp_rank>.jsonl`, including group rewards and actual advantage signals.
+
+Use `--async_training.audit_dir=/results/audit` for optional execution and numerical
+evidence. The [audit contract](docs/architecture.md#auditable-asynchronous-execution)
+describes host-clock timelines, independent loss/gradient checks and real-process
+checkpoint restoration acceptance. Diagnostic runs include additional IO and
+must not be used as throughput benchmarks.
