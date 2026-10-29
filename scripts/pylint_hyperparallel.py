@@ -30,7 +30,8 @@ APACHE_HEADER_SNIPPETS: Tuple[str, ...] = (
 )
 BACKEND_IMPORTS = {"torch"}
 PLATFORM_ALLOWED_PARTS = ("tests/", "scripts/", ".agent/")
-TORCH_ONLY_CORE_PARTS = (
+TORCH_ONLY_PARTS = (
+    "hyper_parallel/rl/rl/",
     "hyper_parallel/core/distributed_checkpoint/",
     "hyper_parallel/core/dtensor/",
     "hyper_parallel/core/fully_shard/",
@@ -113,10 +114,10 @@ def _is_platform_agnostic_module(path: str) -> bool:
 
 
 def _is_forbidden_backend(path: str, module_name: str) -> bool:
-    """Allow Torch in explicitly Torch-only core components."""
+    """Allow Torch in explicitly Torch-only components."""
     backend = module_name.split(".", maxsplit=1)[0]
     normalized = _normalize_path(path)
-    if backend == "torch" and any(part in normalized for part in TORCH_ONLY_CORE_PARTS):
+    if backend == "torch" and any(part in normalized for part in TORCH_ONLY_PARTS):
         return False
     return backend in BACKEND_IMPORTS
 

@@ -57,14 +57,11 @@ def test_optim_state_dict_group3():
     """
     Feature: get/set_optim_state_dict for HSDP
     Description:
-        1.test_o5_optim_state_dict_strict_false
-        2.test_o9_hsdp_local_shape_correctness
-        3.test_o10_full_cpu_restore_to_device
+        test_o10_full_cpu_restore_to_device covers local shard shapes,
+        strict=False, full CPU state restoration, broadcast and optimizer steps.
     Expectation: Run success.
     """
     parallel_run([
-        TorchCase(_TEST_OPTIM_SD, "test_o5_optim_state_dict_strict_false", 12414, 4),
-        TorchCase(_TEST_OPTIM_SD, "test_o9_hsdp_local_shape_correctness", 12415, 4),
         TorchCase(_TEST_OPTIM_SD, "test_o10_full_cpu_restore_to_device", 12416, 4),
     ])
 

@@ -21,6 +21,8 @@ import logging
 from rl.cli import load_config, _apply_override, _parse_override_value
 from rl.trainer import SyncTrainer
 
+__all__ = ["load_config", "_apply_override", "_parse_override_value", "main"]
+
 
 def main() -> None:
     """Parse configuration and execute the Hyper-RL trainer."""

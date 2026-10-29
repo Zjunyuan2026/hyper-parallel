@@ -14,28 +14,22 @@
 # ============================================================================
 """Independent CPU producer; only complete, behavior-versioned GRPO groups cross IPC."""
 import concurrent.futures
-import functools
 import os
+import multiprocessing as mp
 import queue
 import time
-import threading
 import traceback
 from dataclasses import replace
 from typing import Any, Mapping
 
-from transformers import AutoTokenizer
-
 from rl.agentic.envs.environment import load_agentic_module
 from rl.utils.async_audit import EventTrace
 from rl.async_training.protocol import AsyncTrainingConfig
-from rl.async_training.protocol import SampleGroup, SamplingTask
-from rl.config import tokenizer_trust_remote_code
-from rl.dataset.data_source import (
-    PromptDataset, build_prompt_records, build_train_dataloader, collate_prompt_samples,
-)
-from rl.roles.rollout.client import AsyncGenerationClient, HTTPGenerationEngine
-from rl.roles.rollout.worker import RolloutManager
-from rl.weight_sync.vllm_client import committed_policy_version
+from rl.async_training.protocol import SampleGroup, SamplingTask, ExperienceBuffer
+from rl.roles.model_setup import load_tokenizer
+from rl.dataset.data_source import StatefulPromptSource
+from rl.roles.rollout.client import AsyncGenerationClient
+from rl.roles.rollout.collection import CandidateCollector
 
 
 class FullyAsyncRollouter:
@@ -47,127 +41,68 @@ class FullyAsyncRollouter:
         self.trace = EventTrace(self.settings.audit_dir, "rollouter")
         self.connection, self.results = connection, results
         self.candidates = config["rollout"]["num_return_sequences"]
-        model, data = config["model"], config["data"]
-        self.tokenizer = self._load_tokenizer()
-        self.task_local = threading.local()
-        dataset = PromptDataset(
-            parquet_path=data["train_path"], tokenizer=self.tokenizer,
-            max_prompt_length=data["max_prompt_length"],
-            max_samples=data.get("max_train_samples"),
-            **{key: data[key] for key in (
-                "row_adapter", "metadata_columns", "chat_template_kwargs", "prompt_column",
-                "answer_column", "prompt_instruction",
-            ) if key in data},
-        )
-        self.collate = functools.partial(collate_prompt_samples, pad_token_id=self.tokenizer.pad_token_id)
-        self.loader, self.sampler = build_train_dataloader(
-            dataset, self.collate, batch_size=1, rank=0, world_size=1,
-            seed=config["train"]["seed"], shuffle=data.get("shuffle", True),
-            num_workers=0, pin_memory=False,
-        )
-        if len(self.loader) == 0:
-            raise ValueError("Async prompt dataset is empty")
-        self.epoch = 0 if source is None else source["epoch"]
-        self.sampler.set_epoch(self.epoch)
-        if source is not None:
-            self.loader.load_state_dict(source["loader"])
-        self.iterator = iter(self.loader)
-        load_agentic_module(config["agentic"]["module_path"])
-        vllm = config["rollout"]["vllm"]
-        self.client = AsyncGenerationClient(
-            f"http://{vllm.get('host', '127.0.0.1')}:{vllm['port']}", model["registry_name"],
-            request_timeout=vllm.get("request_timeout", 600), operation_timeout=self.settings.operation_timeout,
-        )
-        self.pending: dict[concurrent.futures.Future, tuple[int, int]] = {}
+        self.source = StatefulPromptSource(config["data"], load_tokenizer(config["model"]),
+                                           config["train"]["seed"], source)
+        if config["agentic"].get("runner", "internal") == "internal":
+            load_agentic_module(config["agentic"]["module_path"])
+        self.client = AsyncGenerationClient.from_config(config, self.settings.operation_timeout)
         self.groups: dict[int, tuple[SamplingTask, float, list]] = {}
-        self.policy_version = committed_policy_version(self.client)
+        self.collector = CandidateCollector(config, self.client)
         self.next_probe = 0.0
-        self.draining = False
-        self.drain_acknowledged = False
-
-    def _load_tokenizer(self) -> Any:
-        """Keep source encoding and concurrent task tokenization on independent instances."""
-        model = self.config["model"]
-        tokenizer = AutoTokenizer.from_pretrained(
-            model["tokenizer_path"], local_files_only=True,
-            trust_remote_code=tokenizer_trust_remote_code(model),
-        )
-        if tokenizer.pad_token_id is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.padding_side = "left"
-        return tokenizer
 
     def _next_prompt(self, task: SamplingTask) -> Any:
-        try:
-            batch = next(self.iterator)
-        except StopIteration:
-            self.epoch += 1
-            self.sampler.set_epoch(self.epoch)
-            self.iterator = iter(self.loader)
-            batch = next(self.iterator)
-        record = build_prompt_records(batch, batch["input_ids"], batch["attention_mask"])[0]
+        record = self.source.next_record()
         self.trace.emit("source_read", identity=task.identity, source_prompt_id=str(record.prompt_id),
-                        epoch=self.epoch)
+                        epoch=self.source.epoch)
         return replace(record, prompt_id=str(task.identity),
                        metadata={**record.metadata, "source_prompt_id": record.prompt_id})
 
-    def _generate_candidate(self, task: SamplingTask, prompt: Any, candidate: int) -> Any:
-        rollout, agent = self.config["rollout"], self.config["agentic"]
-        if not hasattr(self.task_local, "tokenizer"):
-            self.task_local.tokenizer = self._load_tokenizer()
-        tokenizer = self.task_local.tokenizer
-        engine = HTTPGenerationEngine(self.client, task.policy_version)
-        manager = RolloutManager(
-            engine=engine, tokenizer=tokenizer, environment_name=agent["environment"],
-            num_return_sequences=1, max_turns=1,
-            max_observation_tokens=agent.get("max_observation_tokens", 0),
-            max_new_tokens=rollout["max_new_tokens"], temperature=1.0, top_p=1.0, top_k=0,
-            pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id,
-            collect_old_log_probs=True,
-            seed=(int(rollout.get("seed") or self.config["train"]["seed"])
-                  + task.identity * self.candidates + candidate),
-            ignore_eos=rollout.get("ignore_eos", False),
-            max_episode_tokens=agent.get("max_episode_tokens"),
-            environment_settings=dict(agent), interaction_mode="single_turn",
-        )
-        result = manager.generate([prompt], policy_version=task.policy_version)
-        if len(result.trajectories) != 1 or not engine.segments:
-            raise ValueError("Async candidate must contain sampled actions")
-        row = result.trajectories[0]
-        version = engine.segments[-1]["policy_version"]
-        return replace(
-            row, trajectory_id=f"{task.identity}:{candidate}",
-            policy_version=version, worker_policy_version=version,
-            metadata={**row.metadata, "source_prompt_id": prompt.metadata["source_prompt_id"],
-                      "behavior_segments": tuple(engine.segments), "partial_interruptions": engine.interruptions},
-        )
-
-    def _accept_candidate(self, future: concurrent.futures.Future) -> None:
-        """Publish one group only after all its candidate futures have succeeded."""
-        identity, candidate = self.pending.pop(future)
-        task, started, rows = self.groups[identity]
-        rows[candidate] = future.result()
-        if any(row is None for row in rows):
-            return
-        finished = time.monotonic()
-        self.trace.emit("sampling_end", identity=identity, policy_version=task.policy_version,
-                        source_update=task.source_update, candidates=len(rows))
-        payload = SampleGroup(task, tuple(rows), finished - started, started, finished).encode(
-            self.candidates, self.settings.max_group_bytes,
-        )
-        deadline = time.monotonic() + self.settings.operation_timeout
-        while True:
+    def _generate_candidate(self, task: SamplingTask, prompt: Any, candidate: int) -> tuple:
+        """Retry infrastructure failures while preserving the candidate's episode identity."""
+        self.trace.emit("episode_start", identity=task.identity, candidate=candidate,
+                        episode_id=f"{task.identity}:{candidate}")
+        for attempt in range(self.settings.max_candidate_retries + 1):
             try:
-                self.results.put(payload, timeout=0.1)
+                rows = self.collector.generate(task, prompt, candidate)
                 break
-            except queue.Full:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("Result transport blocked during group completion")
+            except (RuntimeError, OSError) as error:
+                self.trace.emit("episode_failure", identity=task.identity, candidate=candidate,
+                                attempt=attempt, error=str(error))
+                if self.client.closed or attempt == self.settings.max_candidate_retries:
+                    self.trace.emit("episode_end", identity=task.identity, candidate=candidate,
+                                    episode_id=f"{task.identity}:{candidate}", failed=True, calls=0)
+                    raise
+        self.trace.emit("episode_end", identity=task.identity, candidate=candidate,
+                        episode_id=f"{task.identity}:{candidate}", calls=len(rows),
+                        policy_versions=[row.policy_version for row in rows])
+        return rows
+
+    def _accept_group(self, identity: int) -> None:
+        """Complete all candidate cleanup before transferring or rejecting one group."""
+        task, started, futures = self.groups[identity]
+        if not all(future.done() for future in futures):
+            return
+        failures = [future.exception() for future in futures if future.exception() is not None]
+        for error in failures:
+            if not isinstance(error, (RuntimeError, OSError)):
+                raise error
+        self.trace.emit("sampling_end", identity=identity, policy_version=task.policy_version,
+                        source_update=task.source_update, candidates=self.candidates, discarded=bool(failures))
+        if failures:
+            self.trace.emit("group_discarded", identity=identity, reason="infrastructure",
+                            errors=[str(error) for error in failures])
+            self.connection.send(("discarded", task))
+        else:
+            finished = time.monotonic()
+            rows = tuple(row for future in futures for row in future.result())
+            payload = SampleGroup(task, rows, finished - started, started, finished).encode(
+                self.candidates, self.settings.max_group_bytes)
+            self.results.put(payload, timeout=self.settings.operation_timeout)
         del self.groups[identity]
 
     def run(self) -> None:
         """Run task admission and completion handling, keeping control separate from data."""
-        self.connection.send(("ready", self.policy_version))
+        self.connection.send(("ready", None))
         executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=self.settings.max_inflight_groups * self.candidates,
         )
@@ -175,52 +110,38 @@ class FullyAsyncRollouter:
             while True:
                 if self.connection.poll(0.02):
                     command, value = self.connection.recv()
+                    if command == "cancel":
+                        break
                     if command == "stop":
                         if self.groups:
                             raise RuntimeError("Cannot stop with in-flight groups")
                         break
                     if command == "task":
-                        if (self.draining or len(self.groups) >= self.settings.max_inflight_groups
-                                or value.policy_version != self.policy_version):
+                        if len(self.groups) >= self.settings.max_inflight_groups:
                             raise RuntimeError("Invalid sampling admission")
                         prompt = self._next_prompt(value)
-                        self.groups[value.identity] = (value, time.monotonic(), [None] * self.candidates)
+                        started = time.monotonic()
                         self.trace.emit("sampling_start", identity=value.identity, policy_version=value.policy_version,
                                         source_update=value.source_update)
-                        for index in range(self.candidates):
-                            future = executor.submit(self._generate_candidate, value, prompt, index)
-                            self.pending[future] = (value.identity, index)
-                    elif command == "drain":
-                        self.draining, self.drain_acknowledged = True, False
-                    elif command == "pause":
-                        self.draining, self.drain_acknowledged = True, True
-                        self.client.pause()
-                        self.connection.send(("paused", None))
-                    elif command == "resume":
-                        self.client.resume(value)
-                        self.policy_version = value
-                        self.draining, self.drain_acknowledged = False, False
-                        self.connection.send(("resumed", value))
+                        self.groups[value.identity] = (value, started, [
+                            executor.submit(self._generate_candidate, value, prompt, index)
+                            for index in range(self.candidates)])
                     elif command == "snapshot":
-                        if not self.draining or self.groups:
+                        if self.groups:
                             raise RuntimeError("Source snapshot requires quiescence")
-                        self.connection.send(("snapshot", {"epoch": self.epoch, "loader": self.loader.state_dict()}))
+                        self.connection.send(("snapshot", self.source.state_dict()))
                     elif command != "task":
                         raise ValueError(f"Unknown sampler command: {command}")
-                for future in list(self.pending):
-                    if not future.done():
-                        continue
-                    self._accept_candidate(future)
+                for identity in list(self.groups):
+                    self._accept_group(identity)
                 if self.trace.path is not None and time.monotonic() >= self.next_probe:
                     vllm = self.config["rollout"]["vllm"]
                     self.trace.probe_generation(f"http://{vllm.get('host', '127.0.0.1')}:{vllm['port']}")
                     self.next_probe = time.monotonic() + 2.
-                if self.draining and not self.groups and not self.drain_acknowledged:
-                    self.connection.send(("drained", None))
-                    self.drain_acknowledged = True
         finally:
             self.client.close()
-            executor.shutdown(wait=False, cancel_futures=True)
+            executor.shutdown(wait=True, cancel_futures=True)
+            self.collector.close()
 
 
 def run_rollouter(config: Mapping[str, Any], connection: Any, results: Any, source: dict | None) -> None:
@@ -234,3 +155,116 @@ def run_rollouter(config: Mapping[str, Any], connection: Any, results: Any, sour
         raise
     finally:
         connection.close()
+
+
+class AsyncRuntime:
+    """Connect a single buffer owner to a CPU-only generation producer."""
+
+    def __init__(
+        self, config: Mapping[str, Any], buffer: ExperienceBuffer, source: dict | None = None,
+        target: Any = run_rollouter, control_client: Any = None,
+    ) -> None:
+        self.settings = buffer.settings
+        self.buffer = buffer
+        self.trace = EventTrace(self.settings.audit_dir, "coordinator")
+        self.client = control_client
+        self.codex = config.get("agentic", {}).get("runner") == "codex"
+        if self.client is None:
+            self.client = AsyncGenerationClient.from_config(config, self.settings.operation_timeout)
+        context = mp.get_context("spawn")
+        self.connection, child = context.Pipe()
+        self.results = context.Queue(maxsize=self.settings.max_buffer_groups)
+        self.process = context.Process(target=target, args=(config, child, self.results, source),
+                                       name="HyperRL-Rollouter")
+        self.messages: dict[str, Any] = {}
+        self.closed = False
+        self.process.start()
+        child.close()
+        try:
+            self.wait("ready")
+        except BaseException:
+            self.close()
+            raise
+
+    def pump(self) -> None:
+        """Receive data and control without queue-size or empty polling assumptions."""
+        while True:
+            try:
+                self.buffer.accept(self.results.get_nowait())
+            except queue.Empty:
+                break
+        while self.connection.poll():
+            try:
+                message = self.connection.recv()
+            except EOFError as error:
+                raise RuntimeError("Sampler control channel closed unexpectedly") from error
+            if message[0] == "discarded":
+                self.buffer.discard(message[1])
+                self.trace.emit("group_discarded", identity=message[1].identity, reason="infrastructure")
+                continue
+            if message[0] == "error":
+                raise RuntimeError(f"Sampler failed:\n{message[1]}")
+            self.messages[message[0]] = message[1]
+        if not self.process.is_alive():
+            raise RuntimeError(f"Sampler exited unexpectedly: {self.process.exitcode}")
+
+    def wait(self, kind: str | None = None) -> Any:
+        """Pump until an acknowledgement arrives, or all result credits return."""
+        deadline = time.monotonic() + self.settings.operation_timeout
+        while True:
+            self.pump()
+            if kind is None and not self.buffer.reserved:
+                return None
+            if kind in self.messages:
+                return self.messages.pop(kind)
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Sampler did not acknowledge {kind}")
+            time.sleep(0.01)
+
+    def fill(self, version: int, source_update: int) -> None:
+        """Grant only pre-reserved tasks; one owner allocates monotonic identities."""
+        self.pump()
+        while True:
+            task = self.buffer.reserve(version, source_update)
+            if task is None:
+                break
+            self.trace.emit("admit", identity=task.identity, policy_version=version, source_update=source_update)
+            self.connection.send(("task", task))
+
+    def drain(self) -> None:
+        """Stop admission and collect all accepted results before returning."""
+        self.wait()
+
+    def pause(self) -> None:
+        """Close server admission at model-call boundaries; tool programs keep running."""
+        self.client.pause(drain=self.codex)
+
+    def resume(self, version: int) -> None:
+        """Reopen inference only after the server verifies every worker's version."""
+        self.client.resume_sampling(version)
+
+    def snapshot(self) -> dict:
+        """Request a source cursor only after every reserved result was delivered."""
+        self.connection.send(("snapshot", None))
+        return self.wait("snapshot")
+
+    def close(self, graceful: bool = False) -> None:
+        """Stop normally after drain, or terminate a failed job with bounded joins."""
+        if self.closed:
+            return
+        self.closed = True
+        if self.process.is_alive():
+            try:
+                self.connection.send(("stop" if graceful else "cancel", None))
+            except (BrokenPipeError, EOFError, OSError):
+                # The child may exit after reporting the primary error.
+                pass
+            self.process.join(timeout=5 if graceful else min(30., self.settings.operation_timeout))
+        for stop in (self.process.terminate, self.process.kill):
+            if self.process.is_alive():
+                stop()
+                self.process.join(timeout=5)
+        self.connection.close()
+        self.results.cancel_join_thread()
+        self.results.close()
+        self.client.close()

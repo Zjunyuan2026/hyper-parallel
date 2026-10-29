@@ -12,21 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Build a configurable DeepSeek-V4.1 validation crop from local assets."""
+"""Build configurable DeepSeek-V4.1 validation crops, with optional HF weight loading."""
 
 from __future__ import annotations
 
 import json
+import math
+import tempfile
 from pathlib import Path
 from typing import Any
 
+from safetensors import safe_open
 from transformers import PreTrainedModel
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import (
     DeepseekV4Config,
 )
 
 from hyper_parallel.distributed.mesh import DistributedSetup
-from hyper_parallel.models._transformers import HyperAutoModelForCausalLM
+from hyper_parallel.models._transformers import HyperAutoModelForCausalLM, HyperAutoModelForImageTextToText
 from hyper_parallel.models.build_options import CompileConfig
 
 
@@ -609,4 +612,160 @@ def _run_validation_model_builder(
     )
 
 
-__all__ = ["build_cropped_deepseek_v41", "build_deepseek_v41_validation_config"]
+def build_layer_cropped_config(
+        source: dict[str, Any], destination: Path, *, text_layers: int = 1, vision_layers: int = 2,
+) -> Any:
+    """Translate a released config, retaining a dependency-closed layer prefix.
+
+    All parameter dimensions, expert counts, routing top-k, and modality widths
+    retain their released values. Prefixes containing Engram require released
+    hashing assets and are deliberately rejected by this initial smoke builder.
+
+    Args:
+        source: Official composite DeepSeek-V4.1 configuration.
+        destination: Directory for the translated config and empty Engram assets.
+        text_layers: Number of original decoder prefix layers to retain.
+        vision_layers: Number of original vision prefix layers; zero disables vision.
+
+    Returns:
+        Translated configuration accepted by the production model class.
+
+    Raises:
+        ValueError: A crop is out of range or requires unavailable Engram assets.
+    """
+    text = source["text_config"]
+    vision = source["vision_config"]
+    if not 1 <= text_layers <= text["num_hidden_layers"]:
+        raise ValueError("text_layers must select a nonempty prefix of the released decoder")
+    if not 0 <= vision_layers <= vision["num_hidden_layers"]:
+        raise ValueError("vision_layers must select a prefix of the released vision tower")
+    retained_engram = [layer for layer in text["engram_layer_ids"] if layer < text_layers]
+    if retained_engram:
+        raise ValueError(f"Retained Engram layers require released hashing assets: {retained_engram}")
+    destination.mkdir(parents=True, exist_ok=True)
+    assets = {"source_model_type": source["model_type"], "num_hidden_layers": text_layers,
+              "layer_ids": [], "num_embeddings": [], "head_dim": text["engram_head_dim"],
+              "bucket_base": text["engram_vocab_size"], "table_pad_multiple": 1}
+    assets_path = (destination / "engram_assets.json").resolve()
+    assets_path.write_text(json.dumps(assets, indent=2), encoding="utf-8")
+    # Share the model-owned translation while selecting divisor one; independent
+    # crop math here could silently change checkpoint projection shapes.
+    dimensions = _scale_text_dimensions(text, 1, assets)
+    config = _build_text_config(source, text, dimensions, text_layers, text["n_routed_experts"])
+    _apply_v41_extension_fields(config, source, text, assets, assets_path, text_layers, False, 0.001)
+    config.v41_kv_source_layer_ids = [layer for layer in text["kv_source_layer_ids"] if layer < text_layers]
+    config.v41_index_source_layer_ids = [layer for layer in text["index_source_layer_ids"] if layer < text_layers]
+    if config.v41_candidate_source_layer_id >= text_layers:
+        config.v41_candidate_source_layer_id = -1
+        config.v41_candidate_topk_blocks = 0
+    config.v41_dspark_depth = 0
+    config.v41_dspark_target_layer_ids = []
+    _apply_v41_vision_fields(
+        config, source, enable_vision=vision_layers > 0,
+        vision_num_hidden_layers=vision_layers if vision_layers > 0 else None, vision_parameter_divisor=1,
+    )
+    config.v41_vision_num_hidden_layers = vision_layers
+    config.v41_original_layer_ids = list(range(text_layers))
+    config.v41_original_vision_layer_ids = list(range(vision_layers))
+    config.save_pretrained(destination)
+    return config
+
+
+def select_layer_crop_parameters(
+        names: list[str], *, text_layers: int = 1, vision_layers: int = 2,
+) -> list[str]:
+    """Select native HF parameter names for the same prefix and global modules.
+
+    Args:
+        names: Parameter names from the source HF checkpoint index.
+        text_layers: Number of decoder prefix layers to retain.
+        vision_layers: Number of visual prefix layers to retain.
+
+    Returns:
+        Source names belonging to retained layers and required global modules.
+    """
+    selected = []
+    global_names = {"embed.weight", "head.weight", "norm.weight"}
+    for name in names:
+        if name.endswith((".scale", ".weight_scale_inv")):
+            continue
+        parts = name.split(".")
+        if name in global_names:
+            selected.append(name)
+        elif len(parts) > 2 and parts[0] == "layers" and int(parts[1]) < text_layers:
+            selected.append(name)
+        elif vision_layers > 0:
+            if name.startswith(("aligner.", "image_")):
+                selected.append(name)
+            elif name.startswith("vision.blocks."):
+                if int(parts[2]) < vision_layers:
+                    selected.append(name)
+            elif name.startswith("vision."):
+                selected.append(name)
+    return selected
+
+
+def build_hf_layer_cropped_deepseek_v41(
+        pretrained_model_name_or_path: str, *, text_layers: int = 1, vision_layers: int = 2,
+        **kwargs: Any,
+) -> Any:
+    """Build a prefix crop at runtime and load its weights from a local BF16 HF directory.
+
+    Args:
+        pretrained_model_name_or_path: Full BF16 weights with the official composite config.
+        text_layers: Number of decoder prefix layers to retain, without resizing parameters.
+        vision_layers: Number of visual prefix layers to retain.
+        **kwargs: Forwarded HyperAutoModel build and parallelization options.
+
+    Returns:
+        Parallelized model loaded through the HF checkpointer.
+
+    Raises:
+        ValueError: The input is quantized or incompatible with this prefix crop.
+    """
+    source = Path(pretrained_model_name_or_path).expanduser().resolve()
+    official = json.loads((source / "config.json").read_text(encoding="utf-8"))
+    if official.get("model_type") != "deepseek_v41" or "text_config" not in official:
+        raise ValueError("Expected full HF weights with the official composite DeepSeek-V4.1 config")
+    if official.get("quantization_config"):
+        raise ValueError("Convert the input weights to BF16 before runtime layer cropping")
+    index = json.loads((source / "model.safetensors.index.json").read_text(encoding="utf-8"))
+    names = select_layer_crop_parameters(list(index["weight_map"]),
+                                         text_layers=text_layers, vision_layers=vision_layers)
+    if not names:
+        raise ValueError("No checkpoint parameters match the requested crop")
+    # Each rank owns a tiny temporary view; weight files remain in the original directory.
+    with tempfile.TemporaryDirectory(prefix="deepseek_v41_hf_crop_") as temporary:
+        view = Path(temporary)
+        build_layer_cropped_config(official, view, text_layers=text_layers, vision_layers=vision_layers)
+        selected = {name: index["weight_map"][name] for name in names}
+        by_shard: dict[str, list[str]] = {}
+        for name, shard in selected.items():
+            by_shard.setdefault(shard, []).append(name)
+        total_size = 0
+        for number, (shard, shard_names) in enumerate(by_shard.items()):
+            path = (source / shard).resolve()
+            with safe_open(str(path), framework="pt", device="cpu") as reader:
+                for name in shard_names:
+                    tensor_slice = reader.get_slice(name)
+                    dtype = tensor_slice.get_dtype()
+                    if dtype not in ("BF16", "F32"):
+                        raise ValueError(f"Expected BF16/FP32 source parameter: {name}")
+                    total_size += math.prod(tensor_slice.get_shape()) * (2 if dtype == "BF16" else 4)
+            link = view / f"source-{number:05d}.safetensors"
+            link.symlink_to(path)
+            for name in shard_names:
+                selected[name] = link.name
+        (view / "model.safetensors.index.json").write_text(
+            json.dumps({"metadata": {"total_size": total_size}, "weight_map": selected}), encoding="utf-8")
+        kwargs.setdefault("attn_implementation", "eager")
+        return HyperAutoModelForImageTextToText.from_pretrained(str(view), **kwargs)
+
+
+__all__ = [
+    "build_cropped_deepseek_v41",
+    "build_deepseek_v41_validation_config",
+    "build_hf_layer_cropped_deepseek_v41",
+    "build_layer_cropped_config",
+    "select_layer_crop_parameters",
+]

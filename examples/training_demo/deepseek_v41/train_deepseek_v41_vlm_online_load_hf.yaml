@@ -1,0 +1,252 @@
+# Validated eight-rank baseline; other training settings follow train_deepseek_v41_vlm_online.yaml.
+# Runtime layer crop: original widths, selected weights read directly from a full local BF16 HF directory.
+# Engram-specific overrides are omitted because the selected layer prefix has no Engram.
+# Run with run_deepseek_v41_vlm_online_load_hf.sh; baseline saves checkpoints, without resume.
+model:
+  _target_: hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model.build_hf_layer_cropped_deepseek_v41
+  pretrained_model_name_or_path: /path/to/DeepSeek-V4.1-Flash-BF16
+  text_layers: 1
+  vision_layers: 2
+  load_base_model: true
+  torch_dtype: bfloat16
+  validate_placement: false
+  local_files_only: true
+model_init_dtype: float32
+training:
+  train_iters: 10
+  train_samples: null
+  eval_iters: 0
+  global_batch_size: 8
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+  enable_full_determinism: true
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 8
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+  encoder_parallel:
+    enabled: false
+fsdp_config:
+  dp_shard_size: 8
+  edp_shard_size: 1
+  replicate_params: []
+  mix_precision:
+    param_dtype: bfloat16
+    reduce_dtype: float32
+    cast_forward_inputs: false
+  reshard_after_forward: true
+  reshard_after_backward: true
+  requires_grad_sync: true
+  forward_prefetch_depth: 1
+  backward_prefetch_depth: 1
+  comm_fusion: false
+plan_overrides:
+- match: model.vision.blocks.*.attn
+  module_type: hyper_parallel.models.deepseek_v41.vision.DeepseekV41VisionAttention
+  replace_module:
+    _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.encoder_parallel.replace_vision_attention
+- match:
+  - model.layers.*.attn_hc
+  - model.layers.*.ffn_hc
+  module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41PipelinedHyperConnection
+  replace_module:
+    _target_: hyper_parallel.components.modules.mhc.PipelinedMhcModule
+- match: model.layers.*.self_attn
+  module_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41Attention
+  replace_module:
+    _target_: hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention
+- match: '*.self_attn'
+  tp_divide_attrs:
+  - num_groups
+- match: '*.self_attn'
+  region_dispatch: false
+  inner_target: self
+  inner_wrapper:
+    _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.shared_attention_context_parallel.deepseek_v41_shared_attention_parallel_wrapper
+- match: model
+  params:
+    image_start:
+      tp: replicate
+    image_end:
+      tp: replicate
+    image_newline:
+      tp: replicate
+- match: model.layers.*.*_hc
+  region_dispatch: false
+  params:
+    fn:
+      tp: replicate
+    base:
+      tp: replicate
+    scale:
+      tp: replicate
+  in_src:
+    hidden_streams:
+      tp: replicate
+      cp: shard(1)
+      ep: replicate
+  in_dst:
+    hidden_streams:
+      tp: replicate
+      cp: shard(1)
+      ep: replicate
+  out_src:
+    pre:
+      tp: replicate
+      cp: shard(1)
+      ep: replicate
+    post:
+      tp: replicate
+      cp: shard(1)
+      ep: replicate
+    residual:
+      tp: replicate
+      cp: shard(1)
+      ep: replicate
+  out_dst:
+    pre:
+      tp: replicate
+      cp: shard(1)
+      ep: replicate
+    post:
+      tp: replicate
+      cp: shard(1)
+      ep: replicate
+    residual:
+      tp: replicate
+      cp: shard(1)
+      ep: replicate
+- match: model.layers.*.*_hc
+  when: sequence_parallel
+  in_src:
+    hidden_streams:
+      tp: shard(1)
+      cp: shard(1)
+      ep: replicate
+  in_dst:
+    hidden_streams:
+      tp: shard(1)
+      cp: shard(1)
+      ep: replicate
+  out_src:
+    pre:
+      tp: shard(1)
+      cp: shard(1)
+      ep: replicate
+    post:
+      tp: shard(1)
+      cp: shard(1)
+      ep: replicate
+    residual:
+      tp: shard(1)
+      cp: shard(1)
+      ep: replicate
+  out_dst:
+    pre:
+      tp: shard(1)
+      cp: shard(1)
+      ep: replicate
+    post:
+      tp: shard(1)
+      cp: shard(1)
+      ep: replicate
+    residual:
+      tp: shard(1)
+      cp: shard(1)
+      ep: replicate
+- match: model.layers.*.mlp
+  when: ep
+  region_dispatch: false
+  local_compute_fn:
+    _target_: hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_ep_compute_fn
+    use_grouped_gemm: true
+mixed_precision:
+  enabled: false
+activation_checkpoint:
+  mode: 'off'
+activation_swap: none
+compile:
+  enabled: false
+  mode: default
+  fullgraph: false
+  dynamic: false
+  backend: null
+  options: {}
+  dynamo_cache_size_limit: 256
+dataset:
+  model_assets:
+    _target_: hyper_parallel.models.deepseek_v41.adapter.data.processor.build_deepseek_v41_processor
+    config_path: /path/to/DeepSeek-V4.1-Flash-BF16
+  data_transform:
+    _target_: hyper_parallel.models.deepseek_v41.adapter.data.transform_fn.build_deepseek_v41_omni_transform
+    max_seq_len: 4096
+    sequence_alignment: 4
+  _target_: hyper_parallel.data.omni.build_dataset.build_online_omni_mapping_dataset
+  data_path: /path/to/train.jsonl
+  data_config: {}
+dataloader:
+  _target_: hyper_parallel.data.batching.OmniPackingLoader
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_omni_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.OmniParallelBatch
+    runtime_input_adapter:
+      _target_: hyper_parallel.models.deepseek_v41.adapter.data.runtime.DeepseekV41Runtime
+  sampler_type: single
+  token_budget: 128
+  min_buffered_samples: 1
+  drop_last: true
+  num_workers: 0
+  pin_memory: false
+  prefetch_factor: null
+optimizer:
+  _target_: hyper_parallel.components.optim.Muon
+  fp32_main_params: true
+  no_decay_params:
+  - bias
+  - norm
+  - ln_
+  muon_config:
+    muon_lr: 3.0e-05
+    muon_weight_decay: 0.0
+    muon_momentum: 0.95
+    muon_nesterov: true
+    muon_ns_steps: 5
+    muon_ns_variant: asym5
+  adamw_config:
+    adamw_lr: 1.0e-05
+    adamw_weight_decay: 0.01
+    adamw_betas:
+    - 0.9
+    - 0.999
+    adamw_eps: 1.0e-08
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr: 3.0e-05
+    lr_warmup_steps: 1
+    min_lr: 0.0
+checkpoint:
+  save_ckpt: true
+  checkpoint_dir: runs/deepseek_v41/vlm_load_hf/checkpoints
+  save_steps: 10
+  save_epochs: 1
+  is_async: true
+  save_optimizer: true
+  save_train_state: true
+  save_extra_state_per_rank: true
+  restore_from: null
+  restore_optimizer: true
+  restore_train_state: true
+  restore_dataloader_state: true
+debug:
+  check_nan_inf: false
+  check_dataset: debug

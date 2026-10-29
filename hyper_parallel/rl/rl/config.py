@@ -15,6 +15,9 @@
 """Validate Hyper-RL configuration and adapt it to Hyper-Parallel."""
 
 __all__ = [
+    "AsyncTrainingConfig",
+    "ColocateAsyncConfig",
+    "RolloutCorrectionConfig",
     "build_model_registration",
     "build_runtime_config",
     "optional_mapping",
@@ -27,6 +30,8 @@ __all__ = [
     "trainer_attention_implementation",
     "uses_colocated_vllm",
     "validate_config",
+    "validate_async_config",
+    "validate_colocate_async_config",
     "validate_rollout_and_agentic",
 ]
 
@@ -34,6 +39,7 @@ import json
 import math
 import os
 from copy import deepcopy
+from dataclasses import dataclass, field as dataclass_field, fields
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -1583,3 +1589,234 @@ def _validate_codex_mcp_servers(codex: Mapping[str, Any]) -> None:
             isinstance(item, str) and item for item in inherited_names
         ):
             raise ValueError("agentic.codex.mcp_servers inherit_env must be a list of non-empty names")
+
+
+def _require_async(condition: bool, message: str) -> None:
+    if not condition:
+        raise ValueError(message)
+
+
+def _async_integer(value: Any, minimum: int = 1) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= minimum
+
+
+@dataclass(frozen=True)
+class AsyncTrainingConfig:
+    """Explicit fixed-topology capacities; timeouts are seconds."""
+    groups_per_dp_rank: int = 2
+    max_inflight_groups: int = 4
+    max_buffer_groups: int = 16
+    max_group_bytes: int = 64 * 1024 * 1024
+    max_buffer_bytes: int = 1024 * 1024 * 1024
+    publish_every_updates: int = 2
+    max_policy_lag_updates: int = 4
+    operation_timeout: float = 900.0
+    max_candidate_retries: int = 1
+    audit_dir: str | None = None
+
+    @classmethod
+    def from_mapping(cls, config: Mapping[str, Any]) -> "AsyncTrainingConfig":
+        """Reject unknown settings, booleans, invalid paths and unreserved capacity."""
+        _require_async(isinstance(config, Mapping), "async_training must be a mapping")
+        _require_async(not set(config) - {item.name for item in fields(cls)}, "Unknown async_training fields")
+        result = cls(**config)
+        for name, value in vars(result).items():
+            if name == "audit_dir":
+                valid = value is None or isinstance(value, str) and bool(value.strip())
+            elif name == "operation_timeout":
+                valid = (not isinstance(value, bool) and isinstance(value, (int, float))
+                         and math.isfinite(value) and value > 0)
+            else:
+                valid = _async_integer(value, 0 if name == "max_candidate_retries" else 1)
+            _require_async(valid, f"Invalid async_training.{name}")
+        _require_async(result.max_inflight_groups <= result.max_buffer_groups,
+                       "In-flight capacity exceeds total capacity")
+        _require_async(result.max_buffer_bytes >= result.max_buffer_groups * result.max_group_bytes,
+                 "Reserve max_group_bytes for every admitted group")
+        return result
+
+
+def validate_async_config(config: Mapping[str, Any]) -> AsyncTrainingConfig:
+    """Admit only validated GRPO/topology/task combinations before creating models."""
+    settings = AsyncTrainingConfig.from_mapping(config.get("async_training", {}))
+    data, rollout, agent = (config.get(key, {}) for key in ("data", "rollout", "agentic"))
+    train = config.get("train", {})
+    vllm, accelerator = rollout.get("vllm", {}), train.get("accelerator", {})
+    runner, turns = agent.get("runner", "internal"), agent.get("max_turns", 1)
+    candidates, dp_size = rollout.get("num_return_sequences", 0), accelerator.get("dp_shard", 1)
+    _require_async(data.get("num_workers", 0) == 0 and not data.get("pin_memory", False),
+             "Async CPU source requires num_workers=0 and pin_memory=false")
+    _require_async(config.get("algorithm", {}).get("name") == "grpo", "Asynchronous training supports GRPO only")
+    _require_async(rollout.get("engine") == "vllm" and vllm.get("deployment") == "disjoint",
+             "Asynchronous training requires disjoint vLLM inference devices")
+    _require_async(vllm.get("logprobs_mode", "raw_logprobs") == "raw_logprobs", "Async GRPO requires raw_logprobs")
+    _require_async(tuple(rollout.get(key, default) for key, default in
+                         (("temperature", 1.), ("top_p", 1.), ("top_k", 0)))
+             == (1., 1., 0), "Async recipe requires temperature=1, top_p=1, top_k=0")
+    _require_async(_async_integer(candidates, 2), "GRPO requires at least two candidates")
+    _require_async(runner in ("internal", "codex") and _async_integer(turns), "Invalid async runner or max_turns")
+    _require_async(runner != "internal" or turns == 1 and agent.get("interaction_mode", "single_turn") == "single_turn",
+             "Async internal sampling requires single_turn")
+    _require_async(runner != "codex" or isinstance(agent.get("codex"), Mapping), "Async Codex requires codex settings")
+    _require_async(runner != "codex" or not config.get("evaluation", {}).get("enabled", False),
+             "Async Codex evaluation must run separately from the producer gateway")
+    _require_async(not config.get("consistency", {}).get("enabled", False),
+                   "Same-version consistency rejects stale policies")
+    _require_async("reward_model" not in config and not config.get("distillation", {}).get("enabled", False),
+             "Model rewards and distillation are not validated for asynchronous training")
+    _require_async(config.get("model", {}).get("name") == "qwen3", "Async recipe supports Qwen3 dense only")
+    _require_async(all(accelerator.get(key, 1) == 1 for key in ("cp", "pp", "dp_replicate", "ep", "edp_shard")),
+             "Unsupported async parallel topology")
+    _require_async(_async_integer(dp_size), "dp_shard must be an explicit positive size")
+    _require_async(settings.max_buffer_groups >= dp_size * settings.groups_per_dp_rank,
+                   "Buffer must hold a global batch")
+    mini, micro = train["response_mini_batch_size"], train["micro_batch_size"]
+    _require_async(_async_integer(mini) and _async_integer(micro),
+                   "Training mini/micro batch sizes must be positive integers")
+    _require_async(not mini % micro and (runner == "codex" or not settings.groups_per_dp_rank * candidates % mini),
+             "Local candidate rows must divide into equal mini/micro batches")
+    return settings
+
+
+@dataclass(frozen=True)
+class RolloutCorrectionConfig:
+    """Explicit opt-in to conditional-action correction at a frozen Actor anchor."""
+    mode: str = "off"
+    importance_sampling: str = "token"
+    max_importance_weight: float = 2.0
+    rejection: str = "disabled"
+    max_abs_log_ratio: Optional[float] = None
+    max_refill_rounds: int = 3
+
+    @classmethod
+    def from_mapping(cls, config: Mapping[str, Any]) -> "RolloutCorrectionConfig":
+        """Validate controls independently from sampling capacity and transport."""
+        _require_async(isinstance(config, Mapping), "off_policy must be a mapping")
+        _require_async(not set(config) - {item.name for item in fields(cls)}, "Unknown off_policy fields")
+        result = cls(**config)
+        _require_async(result.mode in ("off", "metrics_only", "decoupled"), "Invalid off_policy mode")
+        _require_async(result.importance_sampling == "token", "Only token importance sampling is supported")
+        cap = result.max_importance_weight
+        _require_async(isinstance(cap, (int, float)) and not isinstance(cap, bool)
+                       and math.isfinite(cap) and 1 <= cap <= math.exp(20),
+                       "max_importance_weight must be in [1, exp(20)]")
+        _require_async(result.rejection in ("disabled", "group"), "Invalid off_policy rejection")
+        _require_async(_async_integer(result.max_refill_rounds, 0), "max_refill_rounds must be nonnegative")
+        threshold = result.max_abs_log_ratio
+        if threshold is not None:
+            _require_async(isinstance(threshold, (int, float)) and not isinstance(threshold, bool)
+                           and math.isfinite(threshold) and threshold > 0, "max_abs_log_ratio must be positive")
+        _require_async(result.rejection != "group" or result.mode == "decoupled" and threshold is not None,
+                       "Group rejection requires decoupled mode and max_abs_log_ratio")
+        return result
+
+
+@dataclass(frozen=True)
+class ColocateAsyncConfig:
+    """Bounded complete-group prefetch for alternating training and generation."""
+    groups_per_dp_rank: int = 2
+    warmup_batches: int = 1
+    max_group_bytes: int = 64 * 1024 * 1024
+    max_buffer_bytes: int = 1024 * 1024 * 1024
+    max_policy_lag_updates: int = 4
+    operation_timeout: float = 900.0
+    max_candidate_retries: int = 1
+    audit_dir: Optional[str] = None
+    off_policy: RolloutCorrectionConfig = dataclass_field(default_factory=RolloutCorrectionConfig)
+
+    def sampling_config(self, dp_size: int) -> AsyncTrainingConfig:
+        """Adapt to the existing producer without exposing a second capacity policy."""
+        _require_async(_async_integer(dp_size), "Colocated sampling requires a positive DP size")
+        capacity = (self.warmup_batches + 1) * dp_size * self.groups_per_dp_rank
+        values = {key: value for key, value in vars(self).items() if key not in ("warmup_batches", "off_policy")}
+        values.update(max_inflight_groups=capacity, max_buffer_groups=capacity, publish_every_updates=1)
+        return AsyncTrainingConfig.from_mapping(values)
+
+    @classmethod
+    def from_mapping(cls, config: Mapping[str, Any]) -> "ColocateAsyncConfig":
+        """Validate explicit controls before allocating models or launching a producer."""
+        _require_async(isinstance(config, Mapping), "colocate_async must be a mapping")
+        _require_async(not set(config) - {item.name for item in fields(cls)}, "Unknown colocate_async fields")
+        values = dict(config)
+        values["off_policy"] = RolloutCorrectionConfig.from_mapping(values.get("off_policy", {}))
+        result = cls(**values)
+        _require_async(_async_integer(result.warmup_batches, 0), "warmup_batches must be a nonnegative integer")
+        _require_async(_async_integer(result.groups_per_dp_rank), "groups_per_dp_rank must be a positive integer")
+        result.sampling_config(1)
+        return result
+
+
+def _validate_colocate_topology(config: Mapping[str, Any]) -> int:
+    """Require one FSDP world sharing its devices with a single rollout TP replica."""
+    rollout, train = required_mapping(config, "rollout"), required_mapping(config, "train")
+    vllm, accelerator = required_mapping(rollout, "vllm"), required_mapping(train, "accelerator")
+    dp_size = accelerator.get("dp_shard")
+    _require_async(_async_integer(dp_size, 2), "Colocate async requires at least two FSDP ranks")
+    _require_async(all(_async_integer(accelerator.get(key, 1)) and accelerator.get(key, 1) == 1
+                       for key in ("tp", "cp", "pp", "dp_replicate", "ep", "edp_shard")),
+                   "Colocate async supports FSDP with training TP/CP/PP/EP equal to one")
+    _require_async(config.get("model", {}).get("name") == "qwen3", "Colocate async requires Qwen3 dense")
+    _require_async(config.get("algorithm", {}).get("name") == "grpo", "Colocate async supports GRPO only")
+    _require_async(rollout.get("engine") == "vllm" and vllm.get("deployment") == "colocated",
+                   "Colocate async requires colocated vLLM")
+    _require_async(_async_integer(vllm.get("data_parallel_size")) and vllm.get("data_parallel_size") == 1
+                   and _async_integer(vllm.get("tensor_parallel_size"))
+                   and vllm.get("tensor_parallel_size") == dp_size,
+                   "Colocate async requires rollout DP=1 and TP=training world size")
+    _require_async(accelerator.get("cpu_offload") is True
+                   and accelerator.get("reshard_after_forward", True) is True,
+                   "Colocate async requires CPU offload and reshard_after_forward")
+    _require_async("visible_devices" not in vllm, "Colocated rollout inherits training devices")
+    if "WORLD_SIZE" in os.environ:
+        _require_async(int(os.environ["WORLD_SIZE"]) == dp_size
+                       and int(os.environ.get("LOCAL_WORLD_SIZE", str(dp_size))) == dp_size,
+                       "Colocate async requires a single-node torchrun world matching dp_shard")
+    return dp_size
+
+
+def _validate_colocate_generation(config: Mapping[str, Any]) -> None:
+    """Require the supported partial-generation, residency and probability contracts."""
+    rollout, agent = required_mapping(config, "rollout"), required_mapping(config, "agentic")
+    vllm = required_mapping(rollout, "vllm")
+    _require_async(_async_integer(vllm.get("sleep_level", 1)) and vllm.get("sleep_level", 1) == 1
+                   and vllm.get("enforce_eager") is True,
+                   "Colocate async requires sleep_level=1 and eager execution")
+    _require_async(vllm.get("weight_sync", {}).get("strategy", "full_gather") == "full_gather",
+                   "Colocate async requires full_gather IPC publication")
+    runner, turns = agent.get("runner", "internal"), agent.get("max_turns", 1)
+    _require_async(runner in ("internal", "codex") and _async_integer(turns),
+                   "Colocate async requires internal or Codex sampling and positive max_turns")
+    _require_async(runner != "internal" or turns == 1 and agent.get("interaction_mode", "single_turn") == "single_turn",
+                   "Colocate async internal sampling requires single_turn")
+    if runner == "codex":
+        required_mapping(agent, "codex")
+    _require_async(consistency_profile(config) == CONSISTENCY_PROFILE_OFF
+                   and not vllm.get("batch_invariant", False), "Colocate async requires consistency off")
+    _require_async(vllm.get("logprobs_mode", "raw_logprobs") == "raw_logprobs"
+                   and tuple(rollout.get(key, default) for key, default in
+                             (("temperature", 1.), ("top_p", 1.), ("top_k", 0))) == (1., 1., 0),
+                   "Colocate async requires raw probabilities and unfiltered temperature-one sampling")
+
+
+def validate_colocate_async_config(config: Mapping[str, Any]) -> ColocateAsyncConfig:
+    """Admit single-node Qwen3 dense GRPO with internal or existing Codex sampling."""
+    _require_async("async_training" not in config, "Choose either async_training or colocate_async")
+    settings = ColocateAsyncConfig.from_mapping(required_mapping(config, "colocate_async"))
+    dp_size = _validate_colocate_topology(config)
+    _validate_colocate_generation(config)
+    rollout, train = required_mapping(config, "rollout"), required_mapping(config, "train")
+    data = required_mapping(config, "data")
+    _require_async(data.get("num_workers", 0) == 0 and not data.get("pin_memory", False),
+                   "Colocate async CPU source requires num_workers=0 and pin_memory=false")
+    _require_async(router_replay_mode(config) == "disabled" and "reward_model" not in config
+                   and not config.get("distillation", {}).get("enabled", False),
+                   "Colocate async does not support replay, model rewards or distillation")
+    candidates = rollout.get("num_return_sequences")
+    mini, micro = train.get("response_mini_batch_size"), train.get("micro_batch_size")
+    _require_async(_async_integer(candidates, 2) and _async_integer(mini) and _async_integer(micro),
+                   "Candidate and mini/micro batch sizes must be positive integers; candidates >= 2")
+    _require_async(not mini % micro and (config["agentic"].get("runner") == "codex"
+                                       or not settings.groups_per_dp_rank * candidates % mini),
+                   "Local candidate rows must divide into equal mini/micro batches")
+    settings.sampling_config(dp_size)
+    return settings

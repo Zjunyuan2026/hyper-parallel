@@ -32,6 +32,7 @@ from transformers import (
     PreTrainedModel,
 )
 
+from hyper_parallel.components.checkpoint.huggingface_checkpointer import resolve_hf_loader
 from hyper_parallel.models._transformers.model_builder import (
     _init_model,
     apply_model_infrastructure,
@@ -58,6 +59,7 @@ _CONFIG_ONLY_KWARGS = {
     "cache_dir",
     "config_path",
     "force_download",
+    "ignore_mismatched_sizes",
     "local_files_only",
     "proxies",
     "resume_download",
@@ -240,6 +242,17 @@ class _BaseHyperAutoModelClass:
         **kwargs: Any,
     ) -> PreTrainedModel:
         """HF-compatible from_pretrained entry point.
+
+        Unquantized models are constructed from configuration on meta, then
+        the selected HF loader loads their finalized parameters once.
+
+        Args:
+            pretrained_model_name_or_path: HF checkpoint path or model identifier.
+            *model_args: Positional arguments for model construction.
+            **kwargs: Additional model construction and HF configuration arguments.
+
+        Returns:
+            Constructed and parallelized pretrained model.
 
         Following design doc 01 §6.2:
         ① resolve distributed_setup → MeshContext
@@ -448,9 +461,13 @@ class _BaseHyperAutoModelClass:
         # Step 1: Determine meta device (inline world-size probe: auto_models
         # must not import the trainer runtime).
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        quantized_init = kwargs.get("quantization_config") is not None
+        defer_hf_load = load_base_model and not quantized_init
+        if load_base_model and quantized_init and resolve_hf_loader() == "dcp":
+            raise ValueError("DCP pretrained loading does not support quantized initialization")
         is_meta_device = (
-            world_size > 1 or not is_hf_model
-        ) and kwargs.get("quantization_config") is None
+            world_size > 1 or not is_hf_model or defer_hf_load
+        ) and not quantized_init
 
         init_ctx = (
             ContextManagers([no_init_weights(), init_empty_weights()])
@@ -458,13 +475,13 @@ class _BaseHyperAutoModelClass:
             else nullcontext()
         )
 
-        # Step 2: Build model
+        # Step 2: Config-first construction defers pretrained I/O until after sharding.
         init_pretrained_path = (
-            pretrained_model_name_or_path if load_base_model else None
+            pretrained_model_name_or_path if load_base_model and not defer_hf_load else None
         )
         init_kwargs = _model_init_kwargs(
             dict(kwargs),
-            load_base_model=load_base_model,
+            load_base_model=init_pretrained_path is not None,
         )
         with init_ctx:
             _, model = _init_model(

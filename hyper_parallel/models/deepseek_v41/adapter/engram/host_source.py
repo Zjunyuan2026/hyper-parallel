@@ -30,10 +30,10 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
     WeightRenaming,
     rename_source_key,
 )
-from hyper_parallel.models._transformers.checkpoint_loader import (
-    _base_weight_mapping,
-    _build_load_targets,
-    _resolve_checkpoint_index,
+from hyper_parallel.components.checkpoint.load_groups import (
+    base_weights_mapping,
+    build_load_targets,
+    resolve_checkpoint_index,
 )
 from hyper_parallel.models.deepseek_v41.adapter.engram.host_table import HostEngramTable
 from hyper_parallel.models.external_state import ExternalLoadContext
@@ -93,10 +93,10 @@ def _host_source_keys(model: nn.Module, checkpoint_index: Any,
                       targets: frozenset[str]) -> dict[str, str]:
     """Resolve one sliceable source tensor for each Host target FQN."""
     replacement_mapping = getattr(model, "_hp_replacement_weight_conversions", None)
-    mapping = _base_weight_mapping(weights_mapping or [], replacement_mapping or [])
+    mapping = base_weights_mapping(weights_mapping or [], replacement_mapping or [])
     renamings = [item for item in mapping if isinstance(item, WeightRenaming)]
     converters = [item for item in mapping if isinstance(item, WeightConverter)]
-    all_targets = _build_load_targets(model)
+    all_targets = build_load_targets(model)
     found: dict[str, str] = {}
     for source_key in sorted(set(checkpoint_index.keys()) | manifest.keys()):
         target, source_pattern = rename_source_key(
@@ -150,7 +150,7 @@ def materialize_owner_rows(model: nn.Module, tables: Mapping[str, HostEngramTabl
     manifest_root = None
     manifest = {}
     if context.load_base_model and tables:
-        index = _resolve_checkpoint_index(context.pretrained_path)
+        index = resolve_checkpoint_index(context.pretrained_path)
         manifest_root, manifest = _row_manifest(index)
         targets = frozenset(f"{fqn}.weight" for fqn in tables)
         source_by_target = _host_source_keys(

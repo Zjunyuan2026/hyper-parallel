@@ -260,6 +260,7 @@ def _actor_loss(
     reference_log_probs: Optional[Any],
     advantages: Any,
     action_mask: Any,
+    policy_loss_weights: Optional[Any] = None,
 ) -> LossOutput:
     """Assemble the shared clipped-policy and reference-KL Actor output."""
     if action_mask.ndim != 2:
@@ -283,6 +284,14 @@ def _actor_loss(
     old = old_log_probs.detach().masked_fill(~mask, 0.0)
     advantage = advantages.detach().masked_fill(~mask, 0.0)
     policy = objective.compute(current, old, advantage, action_mask=mask)
+    policy_loss = policy.loss
+    if policy_loss_weights is not None:
+        if (tuple(policy_loss_weights.shape) != tuple(mask.shape) or policy_loss_weights.requires_grad
+                or policy_loss_weights.dtype != torch.float32):
+            raise ValueError("Policy correction weights must be detached and token aligned")
+        if not bool(policy_loss_weights.isfinite().all()) or bool((policy_loss_weights < 0).any()):
+            raise ValueError("Policy correction weights must be finite and nonnegative")
+        policy_loss = policy_loss * policy_loss_weights
     reference_kl = torch.zeros_like(policy.loss)
     if requirements.data.reference_log_probs:
         reference = reference_log_probs.detach().masked_fill(~mask, 0.0)
@@ -294,8 +303,8 @@ def _actor_loss(
     if aggregation == "seq-mean-token-mean":
         clipped_sequences = (policy.clipped.bool() & mask).any(dim=-1).float().sum(dim=0).detach()
     return LossOutput(
-        total_loss_sum=_loss_sum(policy.loss + regularization, mask, aggregation),
-        policy_loss_sum=_loss_sum(policy.loss, mask, aggregation),
+        total_loss_sum=_loss_sum(policy_loss + regularization, mask, aggregation),
+        policy_loss_sum=_loss_sum(policy_loss, mask, aggregation),
         regularization_loss_sum=_loss_sum(reference_kl, mask, aggregation),
         valid_token_count=mask.float().flatten().sum(dim=0).detach(),
         old_policy_kl_sum=_masked_sum(old_policy_kl, mask).detach(),
@@ -428,6 +437,7 @@ class GRPOAlgorithm:
         reference_log_probs: Optional[Any],
         advantages: Any,
         action_mask: Any,
+        policy_loss_weights: Optional[Any] = None,
     ) -> LossOutput:
         """Compute clipped policy and reference-KL loss sums."""
         return _actor_loss(
@@ -440,6 +450,7 @@ class GRPOAlgorithm:
             reference_log_probs=reference_log_probs,
             advantages=advantages,
             action_mask=action_mask,
+            policy_loss_weights=policy_loss_weights,
         )
 
     @staticmethod

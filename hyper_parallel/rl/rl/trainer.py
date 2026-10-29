@@ -24,7 +24,6 @@ from typing import Any, Mapping, Optional
 
 import torch
 import torch.distributed as dist
-from transformers import AutoTokenizer
 
 from rl.agentic.codex import CodexRuntime
 from rl.agentic.ds_harness import DeepSeekRuntime
@@ -41,7 +40,6 @@ from rl.config import (
     resolve_router_replay_config,
     resolve_vllm_automatic_limits,
     router_replay_mode,
-    tokenizer_trust_remote_code,
     uses_colocated_vllm,
     validate_config,
 )
@@ -68,6 +66,7 @@ from rl.reward_model import RewardModelClient, load_reward_function, score_model
 from rl.roles.rollout.topology import resolve_vllm_rollout_topology
 from rl.weight_sync.sync import coordinator_call
 from rl.roles.model_setup import (
+    load_tokenizer,
     build_role_model,
     build_role_optimizer,
     iter_hsdp_roots,
@@ -132,15 +131,6 @@ def _resolve_eos_token_ids(model: Any, tokenizer: Any) -> tuple[int, ...]:
     if not normalized_ids:
         raise ValueError("Model or tokenizer must define at least one EOS token ID")
     return normalized_ids
-
-
-def _load_tokenizer(model_config: Mapping[str, Any]) -> Any:
-    """Load the tokenizer with its model-independent remote-code selection."""
-    return AutoTokenizer.from_pretrained(
-        str(model_config["tokenizer_path"]),
-        trust_remote_code=tokenizer_trust_remote_code(model_config),
-        local_files_only=True,
-    )
 
 
 @dataclass
@@ -533,51 +523,10 @@ class RLRoleRuntime:
         evaluation_config = required_mapping(self.resolved_config, "evaluation")
         train_config = required_mapping(self.resolved_config, "train")
         self._evaluation_enabled = bool(evaluation_config.get("enabled", True))
-        self.tokenizer = _load_tokenizer(model_config)
-        if self.tokenizer.pad_token_id is None:
-            if self.tokenizer.eos_token_id is None:
-                raise ValueError("Tokenizer must define pad_token_id or eos_token_id")
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-        if self.tokenizer.eos_token_id is None:
-            raise ValueError("Tokenizer must define eos_token_id for response truncation")
-        self.tokenizer.padding_side = "left"
-        dataset_kwargs = {
-            "row_adapter": data_config.get("row_adapter"),
-            "metadata_columns": data_config.get("metadata_columns"),
-            "chat_template_kwargs": data_config.get("chat_template_kwargs"),
-            "tokenizer": self.tokenizer,
-            "max_prompt_length": int(data_config["max_prompt_length"]),
-            "prompt_column": (
-                None
-                if data_config.get("prompt_column") is None
-                else str(data_config["prompt_column"])
-            ),
-            "answer_column": (
-                None
-                if data_config.get("answer_column") is None
-                else str(data_config["answer_column"])
-            ),
-            "prompt_instruction": (
-                None
-                if data_config.get("prompt_instruction") is None
-                else str(data_config["prompt_instruction"])
-            ),
-        }
-        self.train_dataset = PromptDataset(
-            parquet_path=str(data_config["train_path"]),
-            max_samples=(
-                None
-                if data_config.get("max_train_samples") is None
-                else int(data_config["max_train_samples"])
-            ),
-            **dataset_kwargs,
-        )
-        self.test_dataset: Optional[PromptDataset] = None
-        if self._evaluation_enabled:
-            self.test_dataset = PromptDataset(
-                parquet_path=str(data_config["test_path"]),
-                **dataset_kwargs,
-            )
+        self.tokenizer = load_tokenizer(model_config)
+        self.train_dataset = PromptDataset.from_config(data_config, self.tokenizer)
+        self.test_dataset = (PromptDataset.from_config(data_config, self.tokenizer, split="test")
+                             if self._evaluation_enabled else None)
         self.collate_fn = functools.partial(
             collate_prompt_samples,
             pad_token_id=int(self.tokenizer.pad_token_id),
@@ -696,6 +645,10 @@ class RLRoleRuntime:
             request_rank=int(self.parallel_dims.dp_rank),
             request_size=int(self.parallel_dims.dp_size),
         )
+
+    def align_rollout(self, rollout: Any) -> Any:
+        """Align per-call batches before any distributed role forward pass."""
+        return pad_agent_call_batch_for_dp(rollout, self._dp_group_info)
 
     def _new_rollout_manager(
         self,
@@ -1100,7 +1053,7 @@ class SyncTrainer(RLRoleRuntime):
         timings["prepare_training"] = time.perf_counter() - stage_started
         if rollout.old_log_probs is None:
             raise RuntimeError("Training rollout did not produce old_log_probs")
-        rollout = pad_agent_call_batch_for_dp(rollout, self._dp_group_info)
+        rollout = self.align_rollout(rollout)
         if getattr(self, 'teacher_manager', None) is not None:
             stage_started = time.perf_counter()
             rollout = self._score_teacher_rollout(prompt_records, rollout)

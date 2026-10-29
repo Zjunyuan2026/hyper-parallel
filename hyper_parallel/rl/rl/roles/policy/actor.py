@@ -218,9 +218,11 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
 
     def _loss_is_finite(
         self, scaled_loss: torch.Tensor, current_log_probs: torch.Tensor, action_mask: torch.Tensor,
+        *, synchronize: bool = False,
     ) -> bool:
-        """Synchronize the finite-loss decision before distillation or GSPO backward."""
-        if self.algorithm.name == "gspo" or (self.distillation is not None and self.distillation.enabled):
+        """Synchronize finite-loss decisions for corrected, distillation or GSPO batches."""
+        if (synchronize or self.algorithm.name == "gspo"
+                or (self.distillation is not None and self.distillation.enabled)):
             finite = scaled_loss.detach().isfinite() & current_log_probs.detach().masked_fill(
                 ~action_mask.bool(), 0.0,
             ).isfinite().all()
@@ -229,6 +231,21 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
                 dist.all_reduce(finite, op=dist.ReduceOp.MIN, group=self._dp_group_info.group)
             return bool(finite.item())
         return bool(scaled_loss.isfinite().item())
+
+    def _micro_batch_loss(
+        self, experience: ExperienceBatch, current: torch.Tensor, old: torch.Tensor, start: int, end: int,
+    ) -> Any:
+        """Select algorithm inputs together, passing correction weights only when present."""
+        reference = experience.reference_log_probs
+        optional = {}
+        if experience.rollout_is_weights is not None:
+            optional["policy_loss_weights"] = experience.rollout_is_weights[start:end]
+        return self.algorithm.compute_actor_loss(
+            current_log_probs=current, old_log_probs=old,
+            reference_log_probs=None if reference is None else reference[start:end],
+            advantages=experience.advantages[start:end], action_mask=experience.loss_action_mask[start:end],
+            **optional,
+        )
 
     def forward_backward(
         self,
@@ -261,16 +278,7 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
                 anchor_log_probs = experience.rollout_log_probs
             old_log_probs = anchor_log_probs[start:end].detach()
             action_mask = experience.loss_action_mask[start:end]
-            reference_log_probs = experience.reference_log_probs
-            output = self.algorithm.compute_actor_loss(
-                current_log_probs=current_log_probs,
-                old_log_probs=old_log_probs,
-                reference_log_probs=(
-                    None if reference_log_probs is None else reference_log_probs[start:end]
-                ),
-                advantages=experience.advantages[start:end],
-                action_mask=action_mask,
-            )
+            output = self._micro_batch_loss(experience, current_log_probs, old_log_probs, start, end)
             total_loss_sum = output.total_loss_sum
             scaled_loss = total_loss_sum / normalizer * self._dp_size
             if self.distillation is not None and self.distillation.enabled:
@@ -282,7 +290,8 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
                     self._opd_metrics = DistillationMetricAccumulator(opd_loss, self.distillation)
                 self._opd_metrics.add(current_log_probs, old_log_probs, experience.teacher_log_probs[start:end],
                                       action_mask, experience.teacher_keys[start:end])
-            is_finite = self._loss_is_finite(scaled_loss, current_log_probs, action_mask)
+            is_finite = self._loss_is_finite(scaled_loss, current_log_probs, action_mask,
+                                            synchronize="off_policy_anchor_version" in experience.metadata)
             if not is_finite:
                 raise RuntimeError(
                     f"Non-finite {self.algorithm.name} loss detected on response slice "
@@ -309,6 +318,7 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
         self._validate_router_experience(experience)
         response_count = (self._validate_update_experience(experience)
                           if self.algorithm.name == 'gspo' or self.distillation is not None
+                          or "off_policy_anchor_version" in experience.metadata
                           else self._validate_experience(experience))
         accumulator = ActorMetricAccumulator.create(
             experience.sequences.new_zeros(()),
@@ -378,6 +388,7 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
         self._validate_distillation_fields(experience)
         sequences = experience.sequences
         old_log_probs = experience.old_log_probs
+        experience._validate_correction_weights(tuple(experience.loss_action_mask.shape))
         advantages = experience.advantages
         reference_log_probs = experience.reference_log_probs
         if old_log_probs is None:
@@ -435,6 +446,8 @@ class Actor(torch.nn.Module):  # pylint: disable=abstract-method
             response_count = self._validate_experience(experience)
             mask = experience.loss_action_mask.bool()
             fields = [experience.old_log_probs, experience.advantages]
+            if experience.rollout_is_weights is not None:
+                fields.append(experience.rollout_is_weights)
             if self.distillation is not None and self.distillation.enabled:
                 fields.append(experience.teacher_log_probs)
             if self.algorithm.requirements.data.reference_log_probs:

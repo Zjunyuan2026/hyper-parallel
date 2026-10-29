@@ -33,6 +33,7 @@ def state_digest(value: Any) -> str:
     digest = hashlib.sha256()
 
     def visit(item: Any) -> None:
+        """Hash one nested value in deterministic traversal order."""
         if isinstance(item, torch.Tensor):
             tensor = getattr(item, "_local_tensor", item).detach().cpu().contiguous()
             digest.update(str((str(tensor.dtype), tuple(tensor.shape))).encode())
@@ -65,7 +66,7 @@ class EventTrace:
             self.path = self.directory / f"{role}_rank_{rank}.jsonl"
             boot = Path("/proc/sys/kernel/random/boot_id")
             self.emit("clock", hostname=socket.gethostname(),
-                      boot_id=boot.read_text().strip() if boot.is_file() else None,
+                      boot_id=boot.read_text(encoding="utf-8").strip() if boot.is_file() else None,
                       clock="CLOCK_MONOTONIC", schema=1)
 
     def emit(self, event: str, **values: Any) -> None:
@@ -135,6 +136,9 @@ class ActorLossAudit:
             rollout_log_probs=self.rollout_log_probs,
             groups=[row.group_id for row in experience.trajectories], dp_size=dp_size, plan=self.plan,
             trajectory_ids=[row.trajectory_id for row in experience.trajectories],
+            episode_ids=[getattr(row, "metadata", {}).get("episode_id", row.trajectory_id)
+                         for row in experience.trajectories],
+            dp_padding=[getattr(row, "metadata", {}).get("dp_padding", False) for row in experience.trajectories],
             policy_versions=[row.policy_version for row in experience.trajectories],
             behavior_segments=[getattr(row, "metadata", {}).get("behavior_segments")
                                for row in experience.trajectories],
@@ -168,6 +172,7 @@ class ActorLossAudit:
         destination = self.trace.directory / f"loss_step_{self.step}_rank_{self.trace.rank}_call_{index}.pt"
 
         def capture(gradient: torch.Tensor) -> None:
+            """Save the gradient delivered by the real backward pass."""
             record["log_prob_gradient"] = gradient.detach().cpu()
             torch.save(record, destination)
             self.completed += 1
@@ -202,10 +207,14 @@ def write_rollout_diagnostics(experience: Any, directory: str, step: int, dp_ran
     nonzero = ((experience.advantages != 0) & experience.loss_action_mask.bool()).any(dim=-1).cpu().tolist()
     groups = {}
     for index, row in enumerate(experience.trajectories):
-        groups.setdefault(row.group_id, []).append(index)
+        if not row.metadata.get("dp_padding", False):
+            groups.setdefault(row.group_id, []).append(index)
     records = []
     for identity, indices in groups.items():
-        rewards = [experience.trajectories[index].reward for index in indices]
+        candidates = {experience.trajectories[index].metadata.get(
+            "episode_id", experience.trajectories[index].trajectory_id): experience.trajectories[index].reward
+                      for index in indices}
+        rewards = list(candidates.values())
         constant = min(rewards) == max(rewards)
         group_signal = any(nonzero[index] for index in indices)
         for index in indices:
@@ -216,6 +225,8 @@ def write_rollout_diagnostics(experience: Any, directory: str, step: int, dp_ran
             tokens = int(row.action_mask.sum())
             records.append({
                 "step": step, "dp_rank": dp_rank, "group_id": identity, "trajectory_id": row.trajectory_id,
+                "episode_id": row.metadata.get("episode_id", row.trajectory_id),
+                "call_index": row.metadata.get("call_index", 0), "call_count": row.metadata.get("call_count", 1),
                 "source_prompt_id": row.metadata.get("source_prompt_id", row.prompt_id),
                 "prompt": "\n".join(turn.content for turn in row.turns if not turn.trainable),
                 "response": "\n".join(turn.content for turn in row.turns if turn.trainable),
@@ -237,3 +248,75 @@ def write_rollout_diagnostics(experience: Any, directory: str, step: int, dp_ran
     pending.write_text("".join(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n" for record in records),
                        encoding="utf-8")
     pending.replace(path)
+
+
+def record_async_state(trainer: Any, event: str, **metadata: Any) -> None:
+    """Capture model/optimizer/RNG evidence only when the existing audit option is enabled."""
+    if trainer.settings.audit_dir is not None:
+        state = trainer.roles.run_synchronized("audit " + event, lambda: capture_runtime_state(trainer.roles))
+        trainer.trace.emit(event, update=trainer.roles.state.global_step, digests=state, **metadata)
+
+
+def record_async_rollout(trainer: Any, experience: Any, step: int) -> None:
+    """Persist the same consumed calls on TP owners and synchronize any diagnostic IO failure."""
+    def write_samples() -> None:
+        """Keep one diagnostics file per DP owner."""
+        if trainer.roles.parallel_dims.tp_rank == 0:
+            root = trainer.settings.audit_dir or trainer.config["train"]["checkpoint"]["output_dir"]
+            write_rollout_diagnostics(experience, str(Path(root).parent / "rollouts"), step,
+                                      trainer.roles.parallel_dims.dp_rank, trainer.config["rollout"]["max_new_tokens"])
+
+    trainer.roles.run_synchronized("async rollout diagnostics", write_samples)
+
+
+def record_async_checkpoint(trace: EventTrace, directory: Path, snapshot: dict) -> None:
+    """Report the durable commit; this helper does not save or mutate checkpoint state."""
+    trace.emit("checkpoint_complete", update=snapshot["learner_update"], directory=str(directory), async_state={
+        **{key: snapshot[key] for key in ("learner_update", "policy_version", "source_update", "optimizer_steps")},
+        **{key: snapshot["buffer"][key] for key in ("next_identity", "consumed_groups")},
+        "buffered_groups": len(snapshot["buffer"]["ready"]),
+    })
+
+
+def install_async_audit(roles: Any, trace: EventTrace, enabled: bool) -> ActorLossAudit | None:
+    """Attach the existing opt-in backward observer without changing the Actor math."""
+    if not enabled:
+        return None
+    observer = ActorLossAudit(roles.actor.algorithm, trace)
+    roles.actor.algorithm = observer
+    return observer
+
+
+def begin_async_update(trainer: Any, step: int, experience: Any) -> None:
+    """Record fixed targets and exact optimizer start after synchronized preparation."""
+    if trainer.loss_audit is not None:
+        trainer.roles.run_synchronized("async audit targets", lambda: trainer.loss_audit.begin(
+            step, experience, trainer.config["train"], trainer.roles.parallel_dims.dp_size))
+    trainer.trace.emit("update_start", update=step,
+                       groups=sorted({row.group_id for row in experience.trajectories}),
+                       behavior_versions=sorted({segment["policy_version"]
+                           for row in experience.trajectories
+                           for segment in row.metadata.get("behavior_segments", (
+                               {"policy_version": row.policy_version},))}))
+
+
+def finish_async_update(trainer: Any) -> None:
+    """Check every observed backward before reporting a successful optimizer update."""
+    if trainer.loss_audit is not None:
+        trainer.roles.run_synchronized("async audit completion", trainer.loss_audit.finish)
+
+
+def record_async_selection(trace: EventTrace, groups: tuple[Any, ...], update: int) -> None:
+    """Expose selected identities and actual behavior ages without changing the selection."""
+    trace.emit("batch_selected", update=update,
+               groups=[{"identity": group.task.identity, "policy_version": group.task.policy_version,
+                        "source_update": group.task.source_update,
+                        "behavior_source_updates": list(group.source_updates)} for group in groups])
+
+
+def record_publication_timing(trainer: Any, started: float, admitted_at: float) -> None:
+    """Keep publication timing metrics separate from the commit/admission transaction."""
+    trainer.roles.tracker.log({"async/publication_seconds": time.monotonic() - started,
+                              "async/publication_wait_seconds": admitted_at - started,
+                              "async/publication_transfer_seconds": time.monotonic() - admitted_at},
+                             step=trainer.roles.state.global_step)

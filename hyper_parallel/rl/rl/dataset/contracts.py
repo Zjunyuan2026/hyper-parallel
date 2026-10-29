@@ -172,6 +172,7 @@ class ExperienceBatch:
     rollout_log_probs: Optional[Any] = None
     router_traces: Optional[tuple[Optional[RouterTrace], ...]] = None
     mixed_policy_versions: bool = False
+    rollout_is_weights: Optional[Any] = None
 
     def __post_init__(self) -> None:
         """Validate the shared token dimensions before algorithm code runs."""
@@ -194,6 +195,7 @@ class ExperienceBatch:
                 "experience old_log_probs must align with next-token positions"
             )
         self._validate_rollout_scores(log_prob_shape)
+        self._validate_correction_weights(log_prob_shape)
         for field_name in ("advantages", "returns", "values", "reference_log_probs"):
             value = getattr(self, field_name)
             if value is not None and tuple(value.shape) != log_prob_shape:
@@ -203,6 +205,22 @@ class ExperienceBatch:
         self._validate_teacher_scores(log_prob_shape)
         if bool(self.action_mask[:, 0].any().item()):
             raise ValueError("the first sequence token cannot be a trainable action")
+        self._validate_policy_versions()
+
+    def _validate_correction_weights(self, shape: tuple[int, int]) -> None:
+        """Keep frozen correction weights aligned with sampled action coordinates."""
+        weights = self.rollout_is_weights
+        if weights is None:
+            return
+        if tuple(weights.shape) != shape or weights.requires_grad or weights.dtype != torch.float32:
+            raise ValueError("Correction weights must be detached FP32 and align with next-token positions")
+        if not bool(weights.isfinite().all().item()) or bool((weights < 0).any().item()):
+            raise ValueError("Correction weights must be finite and nonnegative")
+        if bool(weights.masked_select(~self.loss_action_mask.bool()).any().item()):
+            raise ValueError("Correction weights must be zero outside sampled actions")
+
+    def _validate_policy_versions(self) -> None:
+        """Keep synchronous batches uniform and require explicit mixed-version evidence."""
         if self.trajectories:
             trajectory_versions = {
                 trajectory.worker_policy_version for trajectory in self.trajectories

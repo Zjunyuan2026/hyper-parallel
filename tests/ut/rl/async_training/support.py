@@ -12,16 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Small real trajectory fixtures shared by asynchronous CPU tests."""
-import time
-
+"""Canonical real trajectory fixture shared by asynchronous contracts."""
 import torch
 
-from rl.async_training.protocol import SampleGroup
+from rl.async_training.protocol import SampleGroup, SamplingTask
 from rl.dataset.contracts import Trajectory, Turn
 
 
-def group(task, candidates=2):
+def group(task: SamplingTask, candidates: int = 2) -> SampleGroup:
     """Build complete candidates with distinct rewards and valid sampled tokens."""
     rows = tuple(Trajectory(
         trajectory_id=f"{task.identity}:{index}", prompt_id=str(task.identity), group_id=str(task.identity),
@@ -33,33 +31,3 @@ def group(task, candidates=2):
         terminal_reason="completed",
     ) for index in range(candidates))
     return SampleGroup(task, rows, 0.1)
-
-
-def fake_rollouter(config, connection, results, source):
-    """Exercise the production process protocol without an accelerator or model server."""
-    connection.send(("ready", 1))
-    cursor = 0 if source is None else source["cursor"]
-    while True:
-        command, value = connection.recv()
-        if command == "task":
-            time.sleep(0.01)
-            results.put(group(value).encode(2, 65536))
-            cursor += 1
-        elif command == "pause":
-            connection.send(("paused", None))
-        elif command == "drain":
-            connection.send(("drained", None))
-        elif command == "resume":
-            connection.send(("resumed", value))
-        elif command == "snapshot":
-            connection.send(("snapshot", {"cursor": cursor}))
-        elif command == "stop":
-            break
-    connection.close()
-
-
-def broken_rollouter(config, connection, results, source):
-    """Report startup failure using the real failure channel."""
-    del config, results, source
-    connection.send(("error", "injected startup failure"))
-    connection.close()

@@ -11,6 +11,9 @@ Interface semantics live in product docs. Feature-to-config/code/metric/test tra
 | Roadmap | — | [Development directions](../../../hyper_parallel/rl/README.md#规划方向) |
 | Config and CLI | `hyper_parallel/rl/rl/config.py`, `hyper_parallel/rl/train_rl.py` | [Runtime architecture](../../../hyper_parallel/rl/docs/architecture.md), [feature navigation](../../../docs/rl-navigation.md) |
 | Synchronous orchestration | `hyper_parallel/rl/rl/trainer.py` | [Runtime architecture](../../../hyper_parallel/rl/docs/architecture.md) |
+| Fully async orchestration | `hyper_parallel/rl/examples/fully_async/launch.py`, `hyper_parallel/rl/rl/async_training/` | [Runtime architecture](../../../hyper_parallel/rl/docs/architecture.md); independent full-async entry |
+| Colocated async orchestration | `hyper_parallel/rl/rl/colocate_async/colocate_async_trainer.py`, `colocate_async_rollouter.py`, `hyper_parallel/rl/rl/utils/monitoring/colocate_async_metrics.py` | [Colocated contract](../../../hyper_parallel/rl/docs/architecture.md#共卡异步-grpo); independent entry, reused producer/protocol/partial service; eight-card GSM8K/Search execution verified; quality/long-run acceptance pending |
+| Rollout correction | `hyper_parallel/rl/rl/algorithm/rollout_correction.py`, optional Actor/loss/experience fields | [Colocated off-policy contract](../../../hyper_parallel/rl/docs/architecture.md#共卡-off-policy-校正); disabled by default |
 | Persistence and evaluation | `hyper_parallel/rl/rl/checkpoint.py`, `hyper_parallel/rl/rl/evaluation.py` | [Checkpoint and resume](../../../hyper_parallel/rl/docs/architecture.md#checkpoint-与恢复) |
 | Prompt and experience data | `hyper_parallel/rl/rl/dataset/data_source.py`, `hyper_parallel/rl/rl/dataset/contracts.py`, `hyper_parallel/rl/rl/dataset/batch_builder.py`, `hyper_parallel/rl/rl/dataset/episodes.py` | [Runtime architecture](../../../hyper_parallel/rl/docs/architecture.md) |
 | Colocated reward service | `hyper_parallel/rl/rl/reward_model/`; GSM8K rule and model scorers in `hyper_parallel/rl/examples/gsm8k/agent.py` | [Reward model contract](../../../hyper_parallel/rl/docs/reward_model.md); NPU acceptance pending |
@@ -47,17 +50,3 @@ The runtime supports Qwen3 dense GRPO/PPO/GSPO and Qwen3-MoE GRPO under the
 MoE construction uses the shared `hyper_parallel/models/qwen3_moe/` recipe; RL weight conversion remains under
 `hyper_parallel/rl/rl/weight_sync/`. Shared-project changes follow their own module rules.
 Packaging changes belong to the root `setup.py` and `MANIFEST.in`.
-
-## Rayless asynchronous GRPO
-
-`hyper_parallel/rl/rl/async_training/` owns bounded group collection, publication scheduling,
-staleness, and source/buffer checkpoints. `roles/rollout/client.py` owns async continuation
-and local admission; `async_training/vllm_server.py` owns server admission, policy identity
-and aborted-output routes in the pinned runtime.
-`runtime.py` owns the experience buffer and producer transport; `protocol.py` owns async configuration
-and exact behavior-segment action coverage. Optional numerical evidence stays in
-`rl/utils/async_audit.py`. Synchronous contracts and
-the synchronous training loop remain unchanged. See the
-[partial rollout contract](../../../hyper_parallel/rl/docs/architecture.md#partial-rollout-and-mixed-behavior-policies).
-CPU contracts are in `tests/ut/rl/async_training/test_partial_rollout.py`; real NPU/HCCL
-acceptance and longer learning-quality comparisons are separate requirements.

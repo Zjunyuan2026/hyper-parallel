@@ -27,7 +27,6 @@ Verified scenarios:
   O10 (4-card): full_state_dict + cpu_offload restore to correct device
 """
 import math
-import os
 import shutil
 
 
@@ -38,14 +37,14 @@ from torch.distributed.checkpoint.state_dict import StateDictOptions  # noqa: E4
 
 from hyper_parallel import (  # noqa: E402
     SkipDTensorDispatch,
-    get_optim_state_dict,
     init_device_mesh,
-    set_optim_state_dict,
 )
 from hyper_parallel.core.distributed_checkpoint import (  # noqa: E402
     FileSystemReader,
+    get_optim_state_dict,
     save,
     load,
+    set_optim_state_dict,
 )
 from hyper_parallel.core.dtensor.dtensor import DTensor  # noqa: E402
 from hyper_parallel.core.fully_shard.api import fully_shard  # noqa: E402
@@ -299,7 +298,7 @@ def test_o4_optim_state_dict_flatten():
     opts = StateDictOptions(flatten_optimizer_state_dict=True)
     sd = get_optim_state_dict(model, optimizer, options=opts)
 
-    for key in sd.keys():
+    for key in sd:
         assert key.startswith("state.") or key.startswith("param_group."), (
             f"flat key '{key}' should start with 'state.' or 'param_group.'"
         )
@@ -433,7 +432,7 @@ def test_o7_dcp_save_load_flatten():
         model2, optimizer2, storage_reader, options=opts,
     )
 
-    for key in template.keys():
+    for key in template:
         assert key.startswith("state.") or key.startswith("param_group."), (
             f"flat template key '{key}' should start with 'state.' or 'param_group.'"
         )
@@ -536,7 +535,7 @@ def test_o9_hsdp_local_shape_correctness():
 # O10: full_state_dict restore to correct device
 # =====================================================================
 def test_o10_full_cpu_restore_to_device():
-    """After set_optim_state_dict with full+cpu, states are on correct device."""
+    """Verify HSDP local shards, strict=False and full CPU restore before resuming."""
     init_dist()
     torch.manual_seed(42 + _rank())
     model, _ = _make_hsdp_model()
@@ -546,12 +545,33 @@ def test_o10_full_cpu_restore_to_device():
     for _ in range(2):
         _train_step_with_optim(model, optimizer, x)
 
+    local_sd = get_optim_state_dict(model, optimizer)
+    for fqn, state in local_sd["state"].items():
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor) and key != "step":
+                assert not isinstance(value, DTensor), (
+                    f"state.{fqn}.{key}: expected plain Tensor, got {type(value)}"
+                )
+                assert value.shape[0] == HIDDEN // 2, (
+                    f"state.{fqn}.{key}: expected local dim0={HIDDEN // 2}, got {value.shape[0]}"
+                )
+
     opts_get = StateDictOptions(full_state_dict=True, cpu_offload=True)
     sd = get_optim_state_dict(model, optimizer, options=opts_get)
 
     model2, _ = _make_hsdp_model()
     optimizer2 = torch.optim.AdamW(model2.parameters(), lr=0.01)
     _train_step_with_optim(model2, optimizer2, x)
+
+    local_sd["state"]["nonexistent.param"] = {"step": torch.tensor(1)}
+    group_sizes = [len(group["params"]) for group in optimizer2.param_groups]
+    set_optim_state_dict(model2, optimizer2, local_sd, options=StateDictOptions(strict=False))
+    restored_group_sizes = [len(group["params"]) for group in optimizer2.param_groups]
+    assert restored_group_sizes == group_sizes, (
+        f"strict=False changed parameter groups: expected={group_sizes}, got={restored_group_sizes}"
+    )
+    loss_after_local = _train_step_with_optim(model2, optimizer2, x)
+    assert not math.isnan(loss_after_local), f"loss is NaN after strict=False step: {loss_after_local}"
 
     opts_set = StateDictOptions(
         full_state_dict=True, cpu_offload=True, broadcast_from_rank0=True
@@ -568,6 +588,9 @@ def test_o10_full_cpu_restore_to_device():
             assert value.device.type == "npu", (
                 f"state[{param_id}].{key} should be on NPU, got {value.device}"
             )
+
+    loss_after_full = _train_step_with_optim(model2, optimizer2, x)
+    assert not math.isnan(loss_after_full), f"loss is NaN after full+cpu restore: {loss_after_full}"
 
     print(f"[rank{_rank()}] O10 PASS: full+cpu restore to correct device")
 

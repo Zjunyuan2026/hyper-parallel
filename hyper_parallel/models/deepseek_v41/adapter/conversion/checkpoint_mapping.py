@@ -19,47 +19,71 @@ from __future__ import annotations
 from typing import Any
 
 
-_V4_INCOMPATIBLE_SOURCE_PATTERNS = {
-    r"^layers\.(\d+)\.self_attn\.indexer\.compressor\.norm\.",
-    r"^layers\.(\d+)\.self_attn\.indexer\.compressor\.ape$",
-    r"^layers\.(\d+)\.self_attn\.indexer\.compressor\.",
-    r"^layers\.(\d+)\.self_attn\.indexer\.",
-    r"^layers\.(\d+)\.self_attn\.compressor\.indexer\.weights_proj\.",
-    r"^layers\.(\d+)\.self_attn\.compressor\.norm\.",
-    r"^layers\.(\d+)\.self_attn\.compressor\.ape$",
-    r"^layers\.(\d+)\.self_attn\.(.*?)\.wq_a\.",
-    r"^layers\.(\d+)\.self_attn\.(.*?)\.wkv\.",
-    r"^layers\.(\d+)\.self_attn\.(.*?)\.wgate\.",
-    r"^layers\.(\d+)\.self_attn\.(.*?)\.wo_a\.",
-    r"^layers\.(\d+)\.self_attn\.(.*?)\.wo_b\.",
-}
+# Keep decoder renames scoped to text layers: vision and Engram retain native names.
+_V41_RENAMES = (
+    ('^embed\\.weight$', 'embed_tokens.weight'),
+    ('^head\\.weight$', 'lm_head.weight'),
+    ('^norm\\.weight$', 'norm.weight'),
+    ('^hc_head_fn$', 'hc_head.hc_fn'),
+    ('^hc_head_base$', 'hc_head.hc_base'),
+    ('^hc_head_scale$', 'hc_head.hc_scale'),
+    ('^layers\\.(\\d+)\\.attn_norm\\.', 'layers.\\1.input_layernorm.'),
+    ('^layers\\.(\\d+)\\.ffn_norm\\.', 'layers.\\1.post_attention_layernorm.'),
+    ('^layers\\.(\\d+)\\.hc_attn_fn$', 'layers.\\1.attn_hc.fn'),
+    ('^layers\\.(\\d+)\\.hc_attn_base$', 'layers.\\1.attn_hc.base'),
+    ('^layers\\.(\\d+)\\.hc_attn_scale$', 'layers.\\1.attn_hc.scale'),
+    ('^layers\\.(\\d+)\\.hc_ffn_fn$', 'layers.\\1.ffn_hc.fn'),
+    ('^layers\\.(\\d+)\\.hc_ffn_base$', 'layers.\\1.ffn_hc.base'),
+    ('^layers\\.(\\d+)\\.hc_ffn_scale$', 'layers.\\1.ffn_hc.scale'),
+    ('^layers\\.(\\d+)\\.attn\\.', 'layers.\\1.self_attn.'),
+    ('^layers\\.(\\d+)\\.ffn\\.', 'layers.\\1.mlp.'),
+    ('^layers\\.(\\d+)\\.self_attn\\.attn_sink$', 'layers.\\1.self_attn.sinks'),
+    ('^layers\\.(\\d+)\\.self_attn\\.(.*?)\\.wq_b\\.', 'layers.\\1.self_attn.\\2.q_b_proj.'),
+    ('^layers\\.(\\d+)\\.self_attn\\.wq_a\\.', 'layers.\\1.self_attn.q_a_proj.'),
+    ('^layers\\.(\\d+)\\.self_attn\\.wq_b\\.', 'layers.\\1.self_attn.q_b_proj.'),
+    ('^layers\\.(\\d+)\\.self_attn\\.wkv\\.', 'layers.\\1.self_attn.kv_proj.'),
+    ('^layers\\.(\\d+)\\.self_attn\\.wo_a\\.', 'layers.\\1.self_attn.o_a_proj.'),
+    ('^layers\\.(\\d+)\\.self_attn\\.wo_b\\.', 'layers.\\1.self_attn.o_b_proj.'),
+    ('^layers\\.(\\d+)\\.self_attn\\.q_norm\\.', 'layers.\\1.self_attn.q_a_norm.'),
+    ('^layers\\.(\\d+)\\.mlp\\.shared_experts\\.w1\\.', 'layers.\\1.mlp.shared_experts.gate_proj.'),
+    ('^layers\\.(\\d+)\\.mlp\\.shared_experts\\.w2\\.', 'layers.\\1.mlp.shared_experts.down_proj.'),
+    ('^layers\\.(\\d+)\\.mlp\\.shared_experts\\.w3\\.', 'layers.\\1.mlp.shared_experts.up_proj.'),
+)
 
 
 def build_deepseek_v41_checkpoint_mapping() -> list[Any]:
-    """Build V4.1 transforms while reusing common V4/HF conversions.
+    """Build model-owned V4.1 names using Transformers conversion operators.
 
-    V4.1 shares the outer decoder, mHC, attention-projection, and MoE
-    namespaces with the upstream V4 mapping. Its compressor and Indexer do
-    not share V4's nested ``compressor.indexer`` structure, so those V4-only
-    transforms are removed. V4.1-native ``compressor.{wkv,wgate,norm}`` names
-    pass through unchanged; only ``indexer.wq_b`` uses the retained standard
-    ``q_b_proj`` mapping.
+    Upstream V4 rules may rename arbitrary ``.attn.``, ``.norm.`` and router
+    biases. V4.1 retains those native names in vision, compressors and gates,
+    so its mapping must not depend on upstream V4 pattern spelling or scope.
+
+    Returns:
+        Fresh name transforms and expert merge operations for the native model.
     """
     try:
-        from transformers.conversion_mapping import (  # pylint: disable=C0415
-            get_checkpoint_conversion_mapping,
+        # Family registration is lazy and remains usable without Transformers installed.
+        from transformers.core_model_loading import (  # pylint: disable=import-outside-toplevel
+            Concatenate, MergeModulelist, WeightConverter, WeightRenaming,
         )
     except ImportError:
         return []
 
-    v4_mapping = get_checkpoint_conversion_mapping("deepseek_v4") or []
-    return [
-        transform
-        for transform in v4_mapping
-        if not set(transform.source_patterns).intersection(
-            _V4_INCOMPATIBLE_SOURCE_PATTERNS
-        )
-    ]
+    mapping = [WeightRenaming(source, target) for source, target in _V41_RENAMES]
+    mapping.extend([
+        WeightConverter(
+            source_patterns=["mlp.experts.*.w1.weight", "mlp.experts.*.w3.weight"],
+            target_patterns="mlp.experts.gate_up_proj",
+            operations=[MergeModulelist(dim=0), Concatenate(dim=1)],
+        ),
+        WeightConverter(
+            source_patterns="mlp.experts.*.w2.weight",
+            target_patterns="mlp.experts.down_proj",
+            operations=[MergeModulelist(dim=0)],
+        ),
+    ])
+    return mapping
+
 
 
 def register_deepseek_v41_checkpoint_mapping() -> bool:

@@ -47,18 +47,7 @@ def _apply_override(config: dict[str, Any], override: str) -> None:
 
 
 def load_config(config_path: str, overrides: list[str]) -> dict[str, Any]:
-    """Load YAML and apply strict dot-path command-line overrides.
-
-    Args:
-        config_path: YAML configuration path.
-        overrides: ``--section.field=value`` items.
-
-    Returns:
-        Fully merged configuration dictionary.
-
-    Raises:
-        ValueError: If the file or an override is invalid.
-    """
+    """Load a YAML mapping and apply strict overrides, rejecting missing files or unknown keys."""
     path = Path(config_path)
     if not path.is_file():
         raise ValueError(f"Configuration file does not exist: {path}")

@@ -710,7 +710,7 @@ class VLLMHTTPClient(VLLMWeightSyncClientMixin):
                 os.killpg(process_group_id, 0)
             except ProcessLookupError:
                 return
-            if not _VLLMHTTPClient._has_live_process_group_members(process_group_id):
+            if not VLLMHTTPClient._has_live_process_group_members(process_group_id):
                 return
             if time.monotonic() >= deadline:
                 raise RuntimeError(
@@ -874,7 +874,7 @@ class VLLMGenerationEngine:
     def _server_command(self, host: str, port: int) -> list[str]:
         """Build the vLLM server command for this rollout configuration."""
         weight_transfer_backend = "ipc" if self._deployment == "colocated" else "nccl"
-        frontend = ("rl.async_training.vllm_server" if os.environ.get("HYPER_RL_ASYNC_TRAINING") == "1"
+        frontend = ("rl.roles.rollout.vllm_plugin" if os.environ.get("HYPER_RL_ASYNC_TRAINING") == "1"
                     else "vllm.entrypoints.cli.main")
         command = [
             sys.executable,

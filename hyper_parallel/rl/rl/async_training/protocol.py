@@ -12,24 +12,66 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Configuration and CPU wire contracts for complete, versioned GRPO groups."""
+"""Versioned CPU wire data, configuration and durable asynchronous snapshots."""
+import hashlib
+import json
+import logging
 import math
+import os
 import pickle
-from dataclasses import dataclass, fields
+from collections import deque
+from copy import deepcopy
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping
+
+from rl.config import AsyncTrainingConfig, validate_async_config, _require_async as _require, _async_integer as _integer
+from rl.dataset.episodes import episode_rows
+
+__all__ = ["AsyncTrainingConfig", "validate_async_config", "SamplingTask", "SampleGroup", "ExperienceBuffer",
+           "AsyncCheckpoint", "behavior_segments", "validate_behavior", "decode_group", "configuration_fingerprint"]
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class SamplingTask:
-    """One admitted sampling event; version identifies committed inference weights."""
+    """An admitted identity bound to committed inference weights."""
     identity: int
     policy_version: int
     source_update: int
 
 
+def behavior_segments(row: Any, task: SamplingTask) -> tuple[dict, ...]:
+    """Retain exact segments, including the legacy single-version representation."""
+    segments = row.metadata.get("behavior_segments")
+    if segments is None:
+        return ({"start": 0, "end": int(row.action_mask.sum()),
+                 "policy_version": task.policy_version, "source_update": task.source_update},)
+    _require(isinstance(segments, (list, tuple)), "Behavior segments must be a sequence")
+    return tuple(segments)
+
+
+def validate_behavior(row: Any, task: SamplingTask) -> None:
+    """Require complete, monotonic action coverage and committed worker identity."""
+    end, previous = 0, task.policy_version
+    segments = behavior_segments(row, task)
+    for segment in segments:
+        _require(isinstance(segment, Mapping), "Behavior segment must be a mapping")
+        _require(all(_integer(segment.get(key), 0) for key in ("start", "end", "policy_version", "source_update")),
+                 "Behavior segments must contain integer boundaries and versions")
+        _require(segment["start"] == end and segment["end"] > end and segment["policy_version"] >= previous
+                 and segment["policy_version"] == segment["source_update"] + 1,
+                 "Behavior segments have gaps, overlaps or invalid policy identities")
+        end, previous = segment["end"], segment["policy_version"]
+    _require(bool(segments) and end == int(row.action_mask.sum())
+             and row.policy_version == row.worker_policy_version == previous,
+             "Trajectory behavior segments do not cover actions or match the worker policy")
+
+
 @dataclass(frozen=True)
 class SampleGroup:
-    """An indivisible set of candidates, with their original token probabilities."""
+    """Complete candidate episodes with immutable behavior probabilities."""
     task: SamplingTask
     trajectories: tuple[Any, ...]
     generation_seconds: float
@@ -38,177 +80,244 @@ class SampleGroup:
 
     @property
     def source_updates(self) -> tuple[int, ...]:
-        """Return actual behavior ages, retaining legacy single-version payload support."""
-        return tuple(segment["source_update"] for row in self.trajectories
-                     for segment in behavior_segments(row, self.task))
+        """Return every actual behavior age rather than the admission age."""
+        return tuple(part["source_update"] for row in self.trajectories for part in behavior_segments(row, self.task))
 
     def validate(self, candidates: int) -> None:
-        """Reject partial groups, inconsistent identities and non-CPU payloads."""
-        if (not all(math.isfinite(value) for value in (self.generation_seconds, self.started_at, self.finished_at))
-                or self.generation_seconds < 0 or self.started_at < 0 or self.finished_at < self.started_at):
-            raise ValueError("Invalid generation timing")
-        if self.task.identity < 0 or self.task.source_update < 0 or self.task.policy_version < 1:
-            raise ValueError("Invalid sample identity or policy version")
-        if self.task.policy_version != self.task.source_update + 1:
-            raise ValueError("Policy version must identify its source update plus one")
-        if len(self.trajectories) != candidates:
-            raise ValueError("Incomplete GRPO candidate group")
-        identities = {row.trajectory_id for row in self.trajectories}
-        groups = {row.group_id for row in self.trajectories}
-        if len(identities) != candidates or groups != {str(self.task.identity)}:
-            raise ValueError("Duplicate candidates or inconsistent group identity")
+        """Validate complete identities, rewards, detached CPU storage and action scores."""
+        _require(all(math.isfinite(v) for v in (self.generation_seconds, self.started_at, self.finished_at))
+                 and self.generation_seconds >= 0 and 0 <= self.started_at <= self.finished_at,
+                 "Invalid generation timing")
+        _require(self.task.identity >= 0 and self.task.source_update >= 0
+                 and self.task.policy_version == self.task.source_update + 1,
+                 "Invalid sample identity or policy version")
+        _require(len(episode_rows(self.trajectories)) == candidates
+                 and not any(row.metadata.get("dp_padding", False) for row in self.trajectories),
+                 "Incomplete GRPO candidate group")
+        _require(len({row.trajectory_id for row in self.trajectories}) == len(self.trajectories)
+                 and {row.group_id for row in self.trajectories} == {str(self.task.identity)},
+                 "Duplicate candidates or inconsistent group identity")
         for row in self.trajectories:
             validate_behavior(row, self.task)
-            if not math.isfinite(row.reward) or row.metadata.get("reward_status") == "pending":
-                raise ValueError("Group rewards must be complete and finite")
-            if row.rollout_log_probs is None:
-                raise ValueError("Sampling probabilities are required")
-            for value in (row.token_ids, row.attention_mask, row.action_mask, row.rollout_log_probs):
-                if value.device.type != "cpu" or value.requires_grad:
-                    raise ValueError("Wire tensors must be detached CPU tensors")
+            _require(math.isfinite(row.reward) and row.metadata.get("reward_status") != "pending",
+                     "Group rewards must be complete and finite")
+            _require(row.rollout_log_probs is not None, "Sampling probabilities are required")
+            _require(all(v.device.type == "cpu" and not v.requires_grad
+                         for v in (row.token_ids, row.attention_mask, row.action_mask, row.rollout_log_probs)),
+                     "Wire tensors must be detached CPU tensors")
             scores = row.rollout_log_probs[row.action_mask[1:].bool()]
-            if not bool(scores.isfinite().all()) or bool((scores > 1e-5).any()):
-                raise ValueError("Invalid sampled action probabilities")
+            _require(bool(scores.isfinite().all()) and not bool((scores > 1e-5).any()),
+                     "Invalid sampled action probabilities")
 
     def encode(self, candidates: int, max_bytes: int) -> bytes:
-        """Serialize owned CPU storage, avoiding multiprocessing tensor-handle lifetimes."""
+        """Own serialized CPU storage independently of multiprocessing tensor handles."""
         self.validate(candidates)
         payload = pickle.dumps(self, protocol=pickle.HIGHEST_PROTOCOL)
-        if len(payload) > max_bytes:
-            raise ValueError("Sample group exceeds max_group_bytes")
+        _require(len(payload) <= max_bytes, "Sample group exceeds max_group_bytes")
         return payload
 
 
-def behavior_segments(row: Any, task: SamplingTask) -> tuple[dict, ...]:
-    """Normalize legacy trajectory identity into a single behavior segment."""
-    segments = row.metadata.get("behavior_segments")
-    if segments is not None:
-        if not isinstance(segments, (list, tuple)):
-            raise ValueError("Behavior segments must be a sequence")
-        return tuple(segments)
-    return ({"start": 0, "end": int(row.action_mask.sum()),
-             "policy_version": task.policy_version, "source_update": task.source_update},)
-
-
-def validate_behavior(row: Any, task: SamplingTask) -> None:
-    """Require exact action coverage and monotonic committed behavior identities."""
-    segments = behavior_segments(row, task)
-    end, previous = 0, task.policy_version
-    for segment in segments:
-        if not isinstance(segment, Mapping):
-            raise ValueError("Behavior segment must be a mapping")
-        if any(isinstance(segment.get(key), bool) or not isinstance(segment.get(key), int)
-               for key in ("start", "end", "policy_version", "source_update")):
-            raise ValueError("Behavior segments must contain integer boundaries and versions")
-        if (segment["start"] != end or segment["end"] <= end
-                or segment["policy_version"] < previous
-                or segment["policy_version"] != segment["source_update"] + 1):
-            raise ValueError("Behavior segments have gaps, overlaps or invalid policy identities")
-        end, previous = segment["end"], segment["policy_version"]
-    if (not segments or end != int(row.action_mask.sum()) or row.policy_version != previous
-            or row.worker_policy_version != previous):
-        raise ValueError("Trajectory behavior segments do not cover actions or match the worker policy")
-
-
 def decode_group(payload: bytes, candidates: int, max_bytes: int) -> SampleGroup:
-    """Decode trusted local-process data and revalidate it at the receiving boundary."""
-    if not isinstance(payload, bytes) or len(payload) > max_bytes:
-        raise ValueError("Invalid or oversized group payload")
+    """Revalidate trusted local-process data at the receiving boundary."""
+    _require(isinstance(payload, bytes) and len(payload) <= max_bytes, "Invalid or oversized group payload")
     group = pickle.loads(payload)
-    if not isinstance(group, SampleGroup):
-        raise ValueError("Unexpected group payload")
+    _require(isinstance(group, SampleGroup), "Unexpected group payload")
     group.validate(candidates)
     return group
 
 
-@dataclass(frozen=True)
-class AsyncTrainingConfig:
-    """Bounded fixed-topology runtime settings; all timeouts are in seconds."""
-    groups_per_dp_rank: int = 2
-    max_inflight_groups: int = 4
-    max_buffer_groups: int = 16
-    max_group_bytes: int = 64 * 1024 * 1024
-    max_buffer_bytes: int = 1024 * 1024 * 1024
-    publish_every_updates: int = 2
-    max_policy_lag_updates: int = 4
-    operation_timeout: float = 900.0
-    audit_dir: str | None = None
+def configuration_fingerprint(config: Mapping[str, Any]) -> str:
+    """Keep learning/data identity while allowing relocation and longer resumed runs."""
+    value = deepcopy(dict(config))
+    asynchronous = value.get("async_training", {})
+    asynchronous.pop("audit_dir", None)
+    if asynchronous.get("max_candidate_retries", 1) == 1:
+        asynchronous.pop("max_candidate_retries", None)
+    for key in ("logging", "evaluation"):
+        value.pop(key, None)
+    for key in ("train_path", "test_path"):
+        path = value.get("data", {}).get(key)
+        if path and Path(path).is_file():
+            with Path(path).open("rb") as handle:
+                digest = hashlib.sha256()
+                while chunk := handle.read(1024 * 1024):
+                    digest.update(chunk)
+            value["data"][key + "_sha256"] = digest.hexdigest()
+    for key in ("checkpoint", "max_steps"):
+        value["train"].pop(key, None)
+    return hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()
+
+
+class AsyncCheckpoint:
+    """Checksum-linked RL state committed after existing model/optimizer persistence."""
+    schema = 1
+
+    @staticmethod
+    def resolve_path(config: Mapping[str, Any]) -> str | None:
+        """Honor explicit restore; otherwise skip incomplete, but not corrupt, snapshots."""
+        checkpoint = config["train"]["checkpoint"]
+        if checkpoint.get("load_path") is not None:
+            return str(checkpoint["load_path"])
+        paths = (p for p in Path(checkpoint["output_dir"]).glob("step_*") if p.is_dir() and p.name[5:].isdigit())
+        for path in sorted(paths, key=lambda p: int(p.name[5:]), reverse=True):
+            if all((path / name).is_file() for name in
+                   ("checkpoint_complete.json", "async_complete.json", "async_state.pkl")):
+                logger.info("Automatically resuming asynchronous training from %s", path)
+                return str(path)
+            logger.warning("Skipping incomplete asynchronous checkpoint: %s", path)
+        logger.info("No complete asynchronous checkpoint in %s", checkpoint["output_dir"])
+        return None
 
     @classmethod
-    def from_mapping(cls, config: Mapping[str, Any]) -> "AsyncTrainingConfig":
-        """Parse settings without accepting unknown keys or boolean integers."""
-        if not isinstance(config, Mapping):
-            raise ValueError("async_training must be a mapping")
-        names = {item.name for item in fields(cls)}
-        if set(config) - names:
-            raise ValueError(f"Unknown async_training fields: {sorted(set(config) - names)}")
-        result = cls(**config)
-        for item in fields(cls):
-            value = getattr(result, item.name)
-            if item.name == "audit_dir":
-                if value is not None and (not isinstance(value, str) or not value.strip()):
-                    raise ValueError("audit_dir must be a non-empty path or null")
-                continue
-            if item.name == "operation_timeout":
-                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-                    raise ValueError("operation_timeout must be finite")
-            elif isinstance(value, bool) or not isinstance(value, int):
-                raise ValueError(f"{item.name} must be an integer")
-            if value <= 0:
-                raise ValueError(f"{item.name} must be positive")
-        if result.max_inflight_groups > result.max_buffer_groups:
-            raise ValueError("In-flight capacity exceeds total group capacity")
-        if result.max_buffer_bytes < result.max_buffer_groups * result.max_group_bytes:
-            raise ValueError("Reserve max_group_bytes for every admitted group")
-        return result
+    def load(cls, directory: str | None, config: Mapping[str, Any]) -> dict | None:
+        """Reject corrupt commits, changed learning/data identity and invalid restored steps."""
+        if directory is None:
+            return None
+        root = Path(directory)
+        manifest, data = json.loads((root / "async_complete.json").read_text()), (root / "async_state.pkl").read_bytes()
+        _require(manifest.get("schema") == cls.schema and manifest.get("sha256") == hashlib.sha256(data).hexdigest(),
+                 "Incomplete or corrupted asynchronous checkpoint")
+        _require(manifest.get("configuration") == configuration_fingerprint(config),
+                 "Asynchronous checkpoint learning/data configuration differs")
+        state = pickle.loads(data)
+        _require(state["learner_update"] == manifest["learner_update"], "Checkpoint step identity differs")
+        _require(config["train"].get("max_steps", state["learner_update"]) >= state["learner_update"],
+                 "Resume max_steps is below the checkpoint update")
+        _require(state["policy_version"] == state["source_update"] + 1, "Invalid restored policy/source mapping")
+        return state
+
+    @staticmethod
+    def invalidate(directory: Path) -> None:
+        """Hide the old commit before overwriting any model component at this step."""
+        (directory / "async_complete.json").unlink(missing_ok=True)
+
+    @classmethod
+    def commit(cls, directory: Path, state: dict, config: Mapping[str, Any]) -> None:
+        """Publish durable state, then its final manifest; incomplete model state cannot commit."""
+        if not (directory / "checkpoint_complete.json").is_file():
+            raise RuntimeError("Cannot commit async state before the model checkpoint")
+        data = pickle.dumps(state, protocol=pickle.HIGHEST_PROTOCOL)
+        manifest = {"schema": cls.schema, "sha256": hashlib.sha256(data).hexdigest(),
+                    "learner_update": state["learner_update"], "configuration": configuration_fingerprint(config)}
+        payloads = (("async_state.pkl", data), ("async_complete.json", json.dumps(manifest, sort_keys=True).encode()))
+        for name, payload in payloads:
+            path = directory / name
+            pending = path.with_suffix(path.suffix + ".tmp")
+            with pending.open("wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            pending.replace(path)
+            descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
 
 
-def validate_async_config(config: Mapping[str, Any]) -> AsyncTrainingConfig:
-    """Reject unvalidated combinations before creating models or processes."""
-    settings = AsyncTrainingConfig.from_mapping(config.get("async_training", {}))
-    data = config.get("data", {})
-    if data.get("num_workers", 0) != 0 or data.get("pin_memory", False):
-        raise ValueError("Initial async CPU source requires num_workers=0 and pin_memory=false")
-    if config.get("algorithm", {}).get("name") != "grpo":
-        raise ValueError("Asynchronous training currently supports GRPO only")
-    if config.get("rollout", {}).get("engine") != "vllm":
-        raise ValueError("Asynchronous training requires vLLM")
-    rollout = config["rollout"]
-    vllm = rollout.get("vllm", {})
-    if vllm.get("deployment") != "disjoint":
-        raise ValueError("Asynchronous training requires disjoint inference devices")
-    if vllm.get("logprobs_mode", "raw_logprobs") != "raw_logprobs":
-        raise ValueError("Asynchronous GRPO requires raw_logprobs")
-    if (rollout.get("temperature", 1.0), rollout.get("top_p", 1.0), rollout.get("top_k", 0)) != (1.0, 1.0, 0):
-        raise ValueError("Initial async recipe requires temperature=1, top_p=1, top_k=0")
-    candidates = rollout.get("num_return_sequences", 0)
-    if isinstance(candidates, bool) or not isinstance(candidates, int) or candidates < 2:
-        raise ValueError("GRPO requires at least two candidates")
-    agent = config.get("agentic", {})
-    if agent.get("runner", "internal") != "internal" or agent.get("max_turns", 1) != 1:
-        raise ValueError("Initial async recipe supports internal single-turn tasks only")
-    if agent.get("interaction_mode", "single_turn") != "single_turn":
-        raise ValueError("Initial async recipe requires single_turn")
-    if config.get("consistency", {}).get("enabled", False):
-        raise ValueError("Synchronous same-version consistency gates cannot validate stale policies")
-    if "reward_model" in config or config.get("distillation", {}).get("enabled", False):
-        raise ValueError("Model rewards and distillation are not validated for asynchronous training")
-    if config.get("model", {}).get("name") != "qwen3":
-        raise ValueError("Initial async recipe supports Qwen3 dense only")
-    accelerator = config.get("train", {}).get("accelerator", {})
-    if any(accelerator.get(name, 1) != 1 for name in ("cp", "pp", "dp_replicate", "ep", "edp_shard")):
-        raise ValueError("Unsupported async parallel topology")
-    dp_size = accelerator.get("dp_shard", 1)
-    if isinstance(dp_size, bool) or not isinstance(dp_size, int) or dp_size <= 0:
-        raise ValueError("dp_shard must be an explicit positive size")
-    if settings.max_buffer_groups < dp_size * settings.groups_per_dp_rank:
-        raise ValueError("Buffer must hold at least one global batch")
-    rows = settings.groups_per_dp_rank * rollout["num_return_sequences"]
-    train = config["train"]
-    mini = train["response_mini_batch_size"]
-    micro = train["micro_batch_size"]
-    if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in (mini, micro)):
-        raise ValueError("Training mini/micro batch sizes must be positive integers")
-    if rows % mini or mini % micro:
-        raise ValueError("Local candidate rows must divide into equal mini/micro batches")
-    return settings
+class ExperienceBuffer:
+    """Own all admitted identities until consumption or explicit stale eviction."""
+
+    def __init__(self, settings: AsyncTrainingConfig, candidates: int) -> None:
+        self.settings = settings
+        self.candidates = candidates
+        self.next_identity = self.consumed_groups = self.dropped_groups = 0
+        self.reserved: dict[int, SamplingTask] = {}
+        self.ready: dict[int, bytes] = {}
+        self.selected: tuple[int, ...] = ()
+        self.completed_intervals: deque = deque(maxlen=1024)
+
+    def reserve(self, version: int, source_update: int) -> SamplingTask | None:
+        """Reserve worst-case storage before the producer reads another prompt."""
+        occupied = len(self.reserved) + len(self.ready)
+        if occupied >= self.settings.max_buffer_groups or len(self.reserved) >= self.settings.max_inflight_groups:
+            return None
+        task = SamplingTask(self.next_identity, version, source_update)
+        self.next_identity += 1
+        self.reserved[task.identity] = task
+        return task
+
+    def accept(self, payload: bytes) -> None:
+        """Accept exactly one result for a live reservation."""
+        group = decode_group(payload, self.candidates, self.settings.max_group_bytes)
+        if self.reserved.get(group.task.identity) != group.task:
+            raise ValueError("Unreserved, duplicated or incorrectly versioned group")
+        del self.reserved[group.task.identity]
+        self.ready[group.task.identity] = payload
+        self.completed_intervals.append((group.started_at, group.finished_at))
+
+    def discard(self, task: SamplingTask) -> None:
+        """Release a failed complete reservation without creating a zero-reward sample."""
+        if self.reserved.get(task.identity) != task:
+            raise ValueError("Unreserved or duplicate failed group")
+        del self.reserved[task.identity]
+        self.dropped_groups += 1
+
+    def evict_stale(self, update: int) -> int:
+        """Evict whole groups; selected data cannot change during optimization."""
+        if self.selected:
+            raise RuntimeError("Cannot evict during an uncommitted training update")
+        stale = []
+        for identity, payload in self.ready.items():
+            group = decode_group(payload, self.candidates, self.settings.max_group_bytes)
+            ages = [update - source for source in group.source_updates]
+            if min(ages) < 0:
+                raise ValueError("Experience comes from a future training update")
+            if max(ages) > self.settings.max_policy_lag_updates:
+                stale.append(identity)
+        for identity in stale:
+            del self.ready[identity]
+        self.dropped_groups += len(stale)
+        return len(stale)
+
+    def select(self, count: int) -> tuple[SampleGroup, ...]:
+        """Lease a complete global batch without releasing its capacity."""
+        if self.selected or len(self.ready) < count:
+            raise RuntimeError("No complete batch or an update is already selected")
+        self.selected = tuple(list(self.ready)[:count])
+        return tuple(decode_group(self.ready[key], self.candidates, self.settings.max_group_bytes)
+                     for key in self.selected)
+
+    def commit(self) -> None:
+        """Release selected identities only after all training ranks succeed."""
+        if not self.selected:
+            raise RuntimeError("No selected update to commit")
+        for identity in self.selected:
+            del self.ready[identity]
+        self.consumed_groups += len(self.selected)
+        self.selected = ()
+
+    def overlap_seconds(self, started: float, finished: float) -> float:
+        """Return a lower bound on task/update overlap from received completion timestamps."""
+        overlap = max((max(0.0, min(end, finished) - max(begin, started))
+                       for begin, end in self.completed_intervals), default=0.0)
+        self.completed_intervals.clear()
+        return overlap
+
+    def state_dict(self) -> dict[str, Any]:
+        """Export a quiescent buffer; no in-flight or partial update is resumable."""
+        if self.reserved or self.selected:
+            raise RuntimeError("Checkpoint requires a drained producer and committed update")
+        return {"next_identity": self.next_identity, "ready": list(self.ready.values()),
+                "consumed_groups": self.consumed_groups, "dropped_groups": self.dropped_groups}
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore a snapshot and validate capacity, identities and accounting."""
+        if self.reserved or self.ready or self.selected:
+            raise RuntimeError("Restore requires an empty buffer")
+        next_identity = state["next_identity"]
+        ready = {}
+        for payload in state["ready"]:
+            group = decode_group(payload, self.candidates, self.settings.max_group_bytes)
+            identity = group.task.identity
+            if identity in ready or identity >= next_identity:
+                raise ValueError("Invalid restored group identity")
+            ready[identity] = payload
+        consumed, dropped = state["consumed_groups"], state["dropped_groups"]
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0
+               for value in (next_identity, consumed, dropped)):
+            raise ValueError("Invalid restored buffer counters")
+        if len(ready) > self.settings.max_buffer_groups or next_identity != consumed + dropped + len(ready):
+            raise ValueError("Restored buffer violates capacity or identity conservation")
+        self.next_identity, self.ready = next_identity, ready
+        self.consumed_groups, self.dropped_groups = consumed, dropped

@@ -1,14 +1,14 @@
 # HyperParallel
 
-An Ascend SuperPod-affinity distributed parallel acceleration library that simplifies supernode programming and
+A Huawei Ascend SuperPod-affinity distributed parallel acceleration library that simplifies supernode programming and
 unleashes computational potential.
 
-HyperParallel provides Ascend SuperPod-affinity distributed parallel acceleration capabilities. Whilst maintaining ease
-of use, it addresses the architectural characteristics of Ascend SuperPods, including resource pooling, peer-to-peer
+HyperParallel provides Huawei Ascend SuperPod-affinity distributed parallel acceleration capabilities. Whilst maintaining ease
+of use, it addresses the architectural characteristics of Huawei Ascend SuperPods, including resource pooling, peer-to-peer
 architecture, hierarchical and diverse network topology, and FP8 low-precision formats. It implements distributed
 parallelism from cluster level to multi-core parallelism within chips, supports unified pooled management of CPU DRAM
 and NPU HBM, topology-aware scheduling and communication path planning, and FP8 mixed-precision training amongst other
-Ascend SuperPod-affinity acceleration capabilities.
+Huawei Ascend SuperPod-affinity acceleration capabilities.
 
 Key design principles:
 

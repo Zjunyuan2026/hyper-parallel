@@ -31,6 +31,8 @@ class PartialRequestService:
         self.trace = trace or EventTrace(None, "inference")
         self.lock = asyncio.Lock()
         self.closed = False
+        self.admission = asyncio.Event()
+        self.admission.set()
         self.active = 0
         self.committed_version: int | None = None
         self.idle = asyncio.Event()
@@ -46,7 +48,7 @@ class PartialRequestService:
             raise ValueError("Inference workers have no common committed policy")
         return next(iter(versions))
 
-    async def generate(self, payload: dict) -> dict:
+    async def generate(self, payload: dict, *, wait: bool = False) -> dict:
         """Register under admission, then collect output without blocking publication."""
         params = self.sampling_factory(
             n=1, temperature=1.0, top_p=1.0, top_k=-1, logprobs=1,
@@ -57,6 +59,8 @@ class PartialRequestService:
         collector = None
         registered = finished = False
         try:
+            if wait:
+                await self.admission.wait()
             async with self.lock:
                 if self.closed:
                     return {"paused": True}
@@ -91,10 +95,7 @@ class PartialRequestService:
                         collector.close()
             finally:
                 if registered:
-                    self.trace.emit("segment_end", segment_id=payload["request_id"], policy_version=version)
-                    self.active -= 1
-                    if self.active == 0:
-                        self.idle.set()
+                    self.leave_call(payload["request_id"], version, kind="segment")
 
     @staticmethod
     def _capture(output: Any, previous_tokens: list, previous_scores: list) -> tuple:
@@ -115,13 +116,39 @@ class PartialRequestService:
             raise ValueError("Engine changed an already emitted token/probability prefix")
         return tokens, scores, reason
 
-    async def pause(self) -> dict:
-        """Close admission, abort running generation and await captured partial output."""
+    async def enter_call(self, identity: str) -> int:
+        """Bind one chat call to the committed version under the publication lock."""
+        while True:
+            await self.admission.wait()
+            async with self.lock:
+                if self.closed:
+                    continue
+                if self.committed_version is None:
+                    self.committed_version = await self.version()
+                self.active += 1
+                self.idle.clear()
+                self.trace.emit("call_start", segment_id=identity, policy_version=self.committed_version)
+                return self.committed_version
+
+    def leave_call(self, identity: str, version: int, *, kind: str = "call") -> None:
+        """Release admission only after the backend response/cancellation settles."""
+        self.trace.emit(f"{kind}_end", segment_id=identity, policy_version=version)
+        self.active -= 1
+        if self.active == 0:
+            self.idle.set()
+
+    async def pause(self, *, drain: bool = False) -> dict:
+        """Close admission and either finish chat calls or capture aborted internal output."""
         async with self.lock:
             self.closed = True
+            self.admission.clear()
             self.committed_version = None
-            await self.engine.pause_generation(mode="abort", clear_cache=True)
+            if not drain:
+                await self.engine.pause_generation(mode="abort", clear_cache=True)
         await self.idle.wait()
+        if drain:
+            async with self.lock:
+                await self.engine.pause_generation(mode="abort", clear_cache=True)
         return {"status": "paused"}
 
     async def resume(self, payload: dict) -> dict:
@@ -132,7 +159,39 @@ class PartialRequestService:
             await self.engine.resume_generation()
             self.committed_version = payload["policy_version"]
             self.closed = False
+            self.admission.set()
         return {"status": "resumed"}
+
+
+class CallAdmissionMiddleware:
+    """Guard the native chat route without changing its token/tool protocol."""
+
+    def __init__(self, app: Any, service_factory: Any, timeout: float) -> None:
+        self.app, self.service_factory, self.timeout = app, service_factory, timeout
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http" or scope["path"].rstrip("/") != "/v1/chat/completions":
+            await self.app(scope, receive, send)
+            return
+        service = self.service_factory(scope["app"])
+        identity = os.urandom(16).hex()
+        version = await asyncio.wait_for(service.enter_call(identity), timeout=self.timeout)
+
+        async def send_version(message: dict) -> None:
+            """Stamp backend evidence before forwarding the response."""
+            if message["type"] == "http.response.start":
+                message = {**message, "headers": [*message.get("headers", []),
+                                                  (b"x-hyper-policy-version", str(version).encode())]}
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_version)
+        except BaseException:
+            # A disconnected HTTP client does not prove that engine cancellation settled.
+            # Keep the lease held and fail future publication rather than write live weights.
+            service.trace.emit("call_failed", segment_id=identity, policy_version=version)
+            raise
+        service.leave_call(identity, version)
 
 
 def install_async_routes() -> None:
@@ -153,41 +212,37 @@ def install_async_routes() -> None:
 
     @wraps(original)
     def register(app: Any) -> None:
+        """Register guarded native chat and explicit async control routes."""
         original(app)
 
-        def service(request: Any) -> PartialRequestService:
-            if not hasattr(request.app.state, "hyper_async_service"):
-                request.app.state.hyper_async_service = PartialRequestService(
-                    request.app.state.engine_client, partial(SamplingParams, output_kind=RequestOutputKind.CUMULATIVE),
+        def service(application: Any) -> PartialRequestService:
+            """Resolve the single frontend admission owner."""
+            if not hasattr(application.state, "hyper_async_service"):
+                application.state.hyper_async_service = PartialRequestService(
+                    application.state.engine_client, partial(SamplingParams, output_kind=RequestOutputKind.CUMULATIVE),
                     EventTrace(os.environ.get("HYPER_RL_ASYNC_AUDIT_DIR"), "inference"),
                 )
-            return request.app.state.hyper_async_service
+            return application.state.hyper_async_service
 
-        async def generate(request: Request) -> dict:
-            return await service(request).generate(await request.json())
+        app.add_middleware(
+            CallAdmissionMiddleware, service_factory=service,
+            timeout=float(os.environ.get("HYPER_RL_ASYNC_OPERATION_TIMEOUT", "900")),
+        )
 
-        async def pause(request: Request) -> dict:
-            return await service(request).pause()
+        async def control(request: Request) -> dict:
+            """Dispatch explicit control routes through the single admission owner."""
+            payload = await request.json()
+            owner = service(request.app)
+            operation = request.url.path.rsplit("/", 1)[-1]
+            if operation == "pause":
+                drain = payload.get("drain", False)
+                if not isinstance(drain, bool):
+                    raise ValueError("drain must be a boolean")
+                return await owner.pause(drain=drain)
+            return await {"generate": partial(owner.generate, wait=True), "resume": owner.resume}[operation](payload)
 
-        async def resume(request: Request) -> dict:
-            return await service(request).resume(await request.json())
-
-        app.add_api_route("/hyper_async/generate", generate, methods=["POST"])
-        app.add_api_route("/hyper_async/pause", pause, methods=["POST"])
-        app.add_api_route("/hyper_async/resume", resume, methods=["POST"])
+        for operation in ("generate", "pause", "resume"):
+            app.add_api_route(f"/hyper_async/{operation}", control, methods=["POST"])
 
     register.hyper_async_routes = True
     serve.register_vllm_serve_api_routers = register
-
-
-if __name__ in ("__main__", "__mp_main__"):
-    # Spawned inference workers must register the same hooks before deserializing their targets.
-    # vLLM is optional outside this explicitly selected inference entry.
-    from rl.roles.rollout.vllm_plugin import register_hyper_models
-
-    os.environ["HYPER_RL_ASYNC_TRAINING"] = "1"
-    register_hyper_models()
-    if __name__ == "__main__":
-        from vllm.entrypoints.cli.main import main
-
-        main()

@@ -78,6 +78,19 @@ Actor 更新 → PPO Critic 更新 → 发布 Actor 策略 → 提交 policy_ver
 - `RLCheckpointManager` 保存角色、优化器、调度器、数据加载器、步数及 RNG 状态。恢复后训练器按恢复步数
   重新发布策略。评估输出使用 `validation/` 指标，和训练 rollout 的 `reward/` 指标分开。
 
+### 3.1 共卡异步执行边界
+
+共卡异步使用独立的 `rl/colocate_async/`：`colocate_async_trainer.py` 持有训练/发布与保存时序，
+`colocate_async_rollouter.py` 在 rank 0 组合已有 CPU producer 和经验池。同步与分离全异步的主循环保持独立。
+共卡的采样协调不执行训练 collective；所有训练 rank 参与 sleep、Actor 和 IPC 发布。
+Codex 在模型调用之间暂停；checkpoint 评估前关闭已排空的 producer 并交接网关，之后从冻结快照重建采样。
+共卡专用角色适配负责评估网关的释放，Rollouter 拥有 producer；Trainer 继续显式协调交接与重建顺序。
+`utils/monitoring/colocate_async_metrics.py` 负责统计与上报，步骤结果显式携带校正指标和拒绝组；
+batch 构造继续复用 `dataset/batch_builder.py`。统计先完成 rollout collective，再读取 rank 0 采样计数。
+共卡校正由 Trainer 调用共享算法模块计算冻结权重，Actor 在逐 token 策略损失归约前应用；
+默认关闭时沿用原有损失和采样路径。
+范围、启动、保存恢复与验证状态见[共卡异步运行合同](../hyper_parallel/rl/docs/architecture.md#共卡异步-grpo)。
+
 ## 4. Torch 与平台边界
 
 主项目和 RL 均直接使用 Torch 与 Torch distributed API；Platform/MindSpore 抽象已移除，

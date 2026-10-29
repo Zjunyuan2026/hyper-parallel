@@ -96,3 +96,13 @@ def register_hyper_models() -> None:
     for architecture, model_class in _ADAPTED_MODELS.items():
         if architecture not in supported_architectures:
             ModelRegistry.register_model(architecture, model_class)
+
+
+if __name__ in ("__main__", "__mp_main__"):
+    # The async service and spawned workers register hooks before loading their targets.
+    os.environ["HYPER_RL_ASYNC_TRAINING"] = "1"
+    register_hyper_models()
+    if __name__ == "__main__":
+        from vllm.entrypoints.cli.main import main
+
+        main()

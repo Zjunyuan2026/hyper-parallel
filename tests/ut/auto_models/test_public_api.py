@@ -20,14 +20,18 @@ the directory refactoring. These tests intentionally import the current
 (pre-migration) module paths; the same commit that moves a production file
 must update the import here, with no signature/field change.
 """
-# pylint: disable=wrong-import-position
-
 import dataclasses
 import inspect
-import os
 import unittest
 
-
+from hyper_parallel.components import optim
+from hyper_parallel.components.optim import mixed_precision_optimizer
+from hyper_parallel.components.quantization.config import LowPrecisionConfig
+from hyper_parallel.distributed import ShardingPlanner, ShardingTemplate
+from hyper_parallel.distributed.plan import ShardingPlan
+from hyper_parallel.distributed.recipe_spec import ModuleShardingSpec
+from hyper_parallel.trainer import config as trainer_config
+from hyper_parallel.trainer.config import AcceleratorConfig, CompileConfig
 from tests.common.mark_utils import arg_mark
 
 
@@ -55,11 +59,12 @@ class TestShardingConfigContracts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_module_sharding_spec_fields(self):
-        """ModuleShardingSpec field order and defaults stay unchanged."""
-        from hyper_parallel.distributed.recipe_spec import (
-            ModuleShardingSpec,
-        )
+        """ModuleShardingSpec field order and defaults stay unchanged.
 
+        Feature: Public API contracts.
+        Description: ModuleShardingSpec field order and defaults stay unchanged.
+        Expectation: Public signatures, fields and exports match their snapshots.
+        """
         self.assertEqual(
             _field_snapshot(ModuleShardingSpec),
             [
@@ -91,11 +96,12 @@ class TestShardingConfigContracts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_sharding_plan_fields(self):
-        """ShardingPlan field order and defaults stay unchanged."""
-        from hyper_parallel.distributed.plan import (
-            ShardingPlan,
-        )
+        """ShardingPlan field order and defaults stay unchanged.
 
+        Feature: Public API contracts.
+        Description: ShardingPlan field order and defaults stay unchanged.
+        Expectation: Public signatures, fields and exports match their snapshots.
+        """
         self.assertEqual(
             _field_snapshot(ShardingPlan),
             [
@@ -111,11 +117,12 @@ class TestShardingConfigContracts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_sharding_template_fields(self):
-        """ShardingTemplate field order and defaults stay unchanged."""
-        from hyper_parallel.distributed import (
-            ShardingTemplate,
-        )
+        """ShardingTemplate field order and defaults stay unchanged.
 
+        Feature: Public API contracts.
+        Description: ShardingTemplate field order and defaults stay unchanged.
+        Expectation: Public signatures, fields and exports match their snapshots.
+        """
         self.assertEqual(
             _field_snapshot(ShardingTemplate),
             [
@@ -139,11 +146,12 @@ class TestShardingConfigContracts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_sharding_planner_signature(self):
-        """ShardingPlanner constructor signature stays unchanged."""
-        from hyper_parallel.distributed import (
-            ShardingPlanner,
-        )
+        """ShardingPlanner constructor signature stays unchanged.
 
+        Feature: Public API contracts.
+        Description: ShardingPlanner constructor signature stays unchanged.
+        Expectation: Public signatures, fields and exports match their snapshots.
+        """
         self.assertEqual(
             str(inspect.signature(ShardingPlanner.__init__)),
             "(self, plan_overrides: Optional[Dict[str, "
@@ -159,9 +167,12 @@ class TestTrainerConfigContracts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_accelerator_config_fields(self):
-        """AcceleratorConfig field order and defaults stay unchanged."""
-        from hyper_parallel.trainer.config import AcceleratorConfig
+        """AcceleratorConfig field order and defaults stay unchanged.
 
+        Feature: Public API contracts.
+        Description: AcceleratorConfig field order and defaults stay unchanged.
+        Expectation: Public signatures, fields and exports match their snapshots.
+        """
         self.assertEqual(
             _field_snapshot(AcceleratorConfig),
             [
@@ -186,8 +197,6 @@ class TestTrainerConfigContracts(unittest.TestCase):
         Description: CompileConfig field order and defaults stay unchanged.
         Expectation: Losses, gradients and public contracts remain correct.
         """
-        from hyper_parallel.trainer.config import CompileConfig
-
         self.assertEqual(
             _field_snapshot(CompileConfig),
             [
@@ -200,17 +209,21 @@ class TestTrainerConfigContracts(unittest.TestCase):
                 ("options", "None"),
                 ("dynamo_cache_size_limit", "256"),
                 ("dynamic_arg_dims", "None"),
+                ("fsdp_allgather_prefetch", "True"),
+                ("fsdp_overlap_grad_reduce", "True"),
+                ("max_in_flight_gb", "0.25"),
             ],
         )
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_low_precision_config_fields(self):
-        """LowPrecisionConfig field order and defaults stay unchanged."""
-        from hyper_parallel.components.quantization.config import (
-            LowPrecisionConfig,
-        )
+        """LowPrecisionConfig field order and defaults stay unchanged.
 
+        Feature: Public API contracts.
+        Description: LowPrecisionConfig field order and defaults stay unchanged.
+        Expectation: Public signatures, fields and exports match their snapshots.
+        """
         self.assertEqual(
             _field_snapshot(LowPrecisionConfig),
             [
@@ -225,9 +238,12 @@ class TestTrainerConfigContracts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_trainer_config_module_all(self):
-        """trainer.config ``__all__`` stays unchanged."""
-        from hyper_parallel.trainer import config as trainer_config
+        """Check the public configuration exports.
 
+        Feature: Trainer configuration exports.
+        Description: Inspect the public configuration class list.
+        Expectation: Public exports include memory, profiling and stress detection configurations.
+        """
         self.assertEqual(
             trainer_config.__all__,
             [
@@ -239,11 +255,16 @@ class TestTrainerConfigContracts(unittest.TestCase):
                 "DatasetConfig",
                 "DebugConfig",
                 "FSDP2Config",
+                "MemoryConfig",
                 "MixedPrecisionConfig",
                 "ModelIntegrationConfig",
                 "OptimizerConfig",
                 "OptimizerSwapConfig",
+                "ProfilingAnalysisConfig",
                 "ProfilingConfig",
+                "StressDetectConfig",
+                "OpStressDetectConfig",
+                "ModelStressDetectConfig",
                 "Target",
                 "TrainerConfig",
                 "TrainingConfig",
@@ -260,9 +281,12 @@ class TestOptimizerContracts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_optimizer_wrapper_signatures(self):
-        """AdamW/Muon/MixedPrecisionOptimizer/MultiLRScheduler signatures stay unchanged."""
-        from hyper_parallel.components import optim
+        """AdamW/Muon/MixedPrecisionOptimizer/MultiLRScheduler signatures stay unchanged.
 
+        Feature: Public API contracts.
+        Description: AdamW/Muon/MixedPrecisionOptimizer/MultiLRScheduler signatures stay unchanged.
+        Expectation: Public signatures, fields and exports match their snapshots.
+        """
         self.assertEqual(
             str(inspect.signature(optim.AdamW.__init__)),
             "(self, adamw_config: dict, model: torch.nn.modules.module.Module, "
@@ -296,10 +320,12 @@ class TestOptimizerContracts(unittest.TestCase):
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
     def test_optimizer_module_all(self):
-        """optim package and mixed_precision_optimizer ``__all__`` stay unchanged."""
-        from hyper_parallel.components import optim
-        from hyper_parallel.components.optim import mixed_precision_optimizer
+        """optim package and mixed_precision_optimizer ``__all__`` stay unchanged.
 
+        Feature: Public API contracts.
+        Description: optim package and mixed_precision_optimizer ``__all__`` stay unchanged.
+        Expectation: Public signatures, fields and exports match their snapshots.
+        """
         self.assertEqual(
             optim.__all__,
             [

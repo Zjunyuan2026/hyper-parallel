@@ -89,6 +89,8 @@ UT 包含 CPU 计算与 mock；真实模型、通信和数值效果需执行对�
 | 结构化任务数据 | `data.row_adapter=module:function`；与列名/指令覆盖互斥 | `rl/dataset/data_source.py::PromptDataset._adapt_sample`、`examples/code/prepare_data.py::adapt_row` | 原始 messages、稳定 ID、metadata、结构化 ground truth；超长消息报错 | `tests/ut/rl/data/test_code_data.py` |
 | 经验与目标 | rollout 结果、Reference、可选 Critic | `rl/dataset/batch_builder.py::build_experience_batch`、`rl/dataset/batch_builder.py::ExperiencePreparer.prepare` | `ExperienceBatch` 的 mask、old_log_probs、advantages、returns | `tests/ut/rl/data/test_contracts.py`、`tests/ut/rl/data/test_experience_preparer.py` |
 | 保存与恢复 | `train.checkpoint.save_steps`、`save_final`、`load_path` | `rl/checkpoint.py::RLCheckpointManager`、`rl/trainer.py::SyncTrainer.train` | 角色模型/优化器/调度器、数据进度、global_step、RNG；恢复后重新发布策略 | `tests/ut/rl/trainer/test_checkpoint.py`、`tests/ut/rl/trainer/test_ppo_targets.py::TestPPOCheckpoint.test_both_roles_survive_resume` |
+| 共卡异步 GRPO | `examples/colocate_async/launch.py`、`colocate_async.*` | `rl/colocate_async/colocate_async_trainer.py::ColocateAsyncTrainer`、`colocate_async_rollouter.py::ColocateAsyncRollouter`、`rl/utils/monitoring/colocate_async_metrics.py` | 完整组预取、partial pause → sleep → update → publish → resume；Codex 调用边界暂停及评估网关交接；质量与长稳待验收 | `tests/ut/rl/colocate_async/`；`hyper_parallel/rl/tests/st/test_colocate_async.py`（CPU/Gloo） |
+| 共卡 off-policy 校正 | `colocate_async.off_policy.*` | `rl/algorithm/rollout_correction.py`、`rl/roles/policy/actor.py`、`rl/algorithm/loss.py` | 固定 Actor 锚点、token IS、可选整组拒绝及同版本有界补样；默认关闭 | `tests/ut/rl/colocate_async/test_rollout_correction.py`；`hyper_parallel/rl/tests/st/test_rollout_correction.py` |
 | 评估 | `evaluation.enabled`；保存边界和最终保存调度 | `rl/evaluation.py::Evaluator.run`、`rl/trainer.py::SyncTrainer._complete_step` | `validation/` 指标及样本表 | `tests/ut/rl/utils/test_evaluation.py`、`tests/ut/rl/trainer/test_trainer_orchestration.py` |
 | 指标与记录 | `logging.backends`、`logging.log_steps`、`logging.wandb.*` | `rl/utils/monitoring/metrics.py::build_training_metrics`、`rl/utils/monitoring/tracker.py` | `train/`、`critic/`、`reward/`、`rollout/`、`policy/`、`weight_sync/` | `tests/ut/rl/utils/test_monitoring_metrics.py`、`tests/ut/rl/utils/test_monitoring_tracker.py` |
 | Code 奖励与状态观测 | code 环境返回的 success/status/finish_reason | `rl/utils/monitoring/metrics.py::summarize_rollout`、`rl/evaluation.py::Evaluator` | `reward/accuracy`、`rollout/status/*`、`rollout/truncated_ratio`；评估成功率与样本状态 | `tests/ut/rl/agentic/test_code_runner.py`；`hyper_parallel/rl/tests/st/_code_train.py` |
@@ -146,14 +148,3 @@ CPU 合同位于 `tests/ut/rl/agentic/swe_smith/`、`agentic/codex/` 和 `agenti
 [实现与验证边界](../hyper_parallel/rl/docs/swe_smith.md)维护模块职责、评分合同和验证范围。
 短预算闭环通过不代表已获得非零学习信号；跨训练 DP 的会话分发、长轨迹训练和全量数据效果
 须分别验收，不能从单次推理结果推导。
-
-## Rayless asynchronous GRPO
-
-| Feature | Configuration | Implementation | Validation |
-| --- | --- | --- | --- |
-| Complete-group asynchronous training | `async_training.groups_per_dp_rank`, `publish_every_updates` | `rl/async_training/fully_async_trainer.py`, `buffer.py` | `tests/ut/rl/async_training/`, `hyper_parallel/rl/tests/st/test_async_training.py` |
-| Interrupted responses and mixed-policy candidates | Default async publication behavior | `rl/roles/rollout/client.py`, `rl/async_training/vllm_server.py`, `fully_async_rollouter.py`, `protocol.py` | `tests/ut/rl/async_training/test_partial_rollout.py`; real NPU/HCCL separately required |
-| Segment staleness and diagnostics | `async_training.max_policy_lag_updates`, `audit_dir` | `rl/async_training/runtime.py`, `rl/utils/async_audit.py`; `async/sample_age_max`, `async/sample_age_token_mean`, `async/behavior_versions` | `hyper_parallel/rl/tests/st/async_reference.py`, `tests/ut/rl/async_training/test_partial_rollout.py` |
-
-See [runtime and validation boundaries](../hyper_parallel/rl/docs/architecture.md#partial-rollout-and-mixed-behavior-policies).
-The async entry point does not change synchronous entry points, defaults or training behavior.

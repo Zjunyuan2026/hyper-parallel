@@ -28,8 +28,11 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
+from tests.common.mark_utils import arg_mark
+
 from hyper_parallel import init_empty_weights
 from hyper_parallel.data.constants import IGNORE_INDEX
+from hyper_parallel.models.deepseek_v41.adapter.validation.cropped_model import build_layer_cropped_config
 from hyper_parallel.models.deepseek_v41.dspark import DeepseekV41DSpark
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41ForCausalLM
 
@@ -529,3 +532,36 @@ class TestDSparkCropSwitches(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class TestHFLayerCropConfig(unittest.TestCase):
+    """Exercise the real config helpers after upstream crop API changes."""
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_windows", "cpu_macos"], level_mark="level0",
+              card_mark="onecard", essential_mark="essential")
+    def test_vision_depth_and_original_dimensions(self) -> None:
+        """
+        Feature: Runtime HF prefix-layer crop configuration.
+        Description: Build real configs with zero, two or three vision layers using current upstream helpers.
+        Expectation: Requested depths are applied without resizing text, vision or expert dimensions.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            source = json.loads(_write_released_config(directory).read_text(encoding="utf-8"))
+            source["text_config"]["engram_vocab_size"] = 1024
+            for depth in (0, 2, 3):
+                with self.subTest(vision_layers=depth):
+                    destination = Path(directory) / f"crop_{depth}"
+                    config = build_layer_cropped_config(source, destination, text_layers=1, vision_layers=depth)
+                    self.assertEqual(config.num_hidden_layers, 1,
+                                     f"text depth={config.num_hidden_layers}, expected=1")
+                    self.assertEqual(config.hidden_size, 256,
+                                     f"hidden size={config.hidden_size}, expected=256")
+                    self.assertEqual(config.num_local_experts, 384,
+                                     f"experts={config.num_local_experts}, expected=384")
+                    self.assertEqual(config.v41_vision_enabled, depth > 0,
+                                     f"vision enabled={config.v41_vision_enabled}, expected={depth > 0}")
+                    self.assertEqual(config.v41_vision_num_hidden_layers, depth,
+                                     f"vision depth={config.v41_vision_num_hidden_layers}, expected={depth}")
+                    self.assertEqual(config.v41_vision_hidden_size, 128,
+                                     f"vision width={config.v41_vision_hidden_size}, expected=128")

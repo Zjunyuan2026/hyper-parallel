@@ -17,10 +17,11 @@ import json
 import os
 import math
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from typing import Any, Callable
+from unittest.mock import Mock, patch
 
 import torch
 import torch.distributed as dist
@@ -30,8 +31,9 @@ from rl.algorithm.loss import build_algorithm
 from rl.async_training.protocol import AsyncTrainingConfig
 from rl.async_training.fully_async_trainer import FullyAsyncTrainer
 from rl.async_training.protocol import SampleGroup
-from rl.async_training.runtime import AsyncRuntime
-from rl.dataset.batch_builder import ExperiencePreparer
+from rl.async_training.fully_async_rollouter import AsyncRuntime
+from rl.roles.rollout.base import GenerationSettings
+from rl.dataset.batch_builder import ExperiencePreparer, pad_agent_call_batch_for_dp
 from rl.dataset.contracts import Trajectory, Turn
 from rl.roles.policy.actor import Actor
 
@@ -43,12 +45,14 @@ class TinyPolicy(torch.nn.Module):
         super().__init__()
         self.table = torch.nn.Parameter(torch.zeros(8, 8))
 
-    def forward(self, input_ids, attention_mask, use_cache=False):
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor,
+                use_cache: bool = False) -> dict[str, torch.Tensor]:
+        """Return real categorical logits for the tiny trainable policy."""
         del attention_mask, use_cache
         return {"logits": self.table[input_ids]}
 
 
-def producer(config, connection, results, source):
+def producer(config: dict, connection: Any, results: Any, source: dict | None) -> None:
     """Maintain the real CPU producer protocol with deterministic complete trajectories."""
     connection.send(("ready", 1))
     cursor = 0 if source is None else source["cursor"]
@@ -70,6 +74,18 @@ def producer(config, connection, results, source):
                 reward=float(index), reward_components={"task": float(index)},
                 done=True, truncated=False, terminal_reason="completed",
             ) for index in range(2))
+            if config["agentic"].get("runner") == "codex":
+                calls = []
+                for candidate, row in enumerate(rows):
+                    count = 1 + (value.identity + candidate) % 3
+                    for index in range(count):
+                        calls.append(replace(row, trajectory_id=f"{row.trajectory_id}:call:{index}", metadata={
+                            "episode_id": row.trajectory_id, "call_index": index, "call_count": count,
+                            "async_training": True,
+                            "behavior_segments": ({"start": 0, "end": 2, "policy_version": row.policy_version,
+                                                   "source_update": row.policy_version - 1},),
+                        }))
+                rows = tuple(calls)
             payload = SampleGroup(value, rows, 0.03, started, time.monotonic()).encode(
                 2, config["async_training"]["max_group_bytes"],
             )
@@ -94,27 +110,33 @@ class Checkpoints:
         self.root = Path(config["output_dir"])
 
     @property
-    def load_path(self):
+    def load_path(self) -> str | None:
+        """Return the selected checkpoint source."""
         return self.config.get("load_path")
 
-    def directory(self, step):
+    def directory(self, step: int) -> Path:
+        """Locate one committed training step."""
         return self.root / f"step_{step}"
 
-    def validate_resume(self):
+    def validate_resume(self) -> None:
+        """Reject incomplete test checkpoints."""
         if self.load_path and not (Path(self.load_path) / "checkpoint_complete.json").exists():
             raise RuntimeError("Incomplete test model checkpoint")
 
-    def begin(self, state):
+    def begin(self, state: Any) -> None:
+        """Restore actual model and optimizer state."""
         if self.load_path:
             data = torch.load(Path(self.load_path) / f"rank{dist.get_rank()}.pt", weights_only=False)
             self.runtime.model.load_state_dict(data["model"])
             self.runtime.actor.optimizer.load_state_dict(data["optimizer"])
             state.global_step = data["step"]
 
-    def will_save(self, step):
+    def will_save(self, step: int) -> bool:
+        """Save at the final boundary for this integration test."""
         return step == self.runtime.state.max_steps
 
-    def save(self, state):
+    def save(self, state: Any) -> None:
+        """Persist each replica before publishing the completion marker."""
         directory = self.directory(state.global_step)
         directory.mkdir(parents=True, exist_ok=True)
         torch.save({"model": self.runtime.model.state_dict(),
@@ -125,7 +147,8 @@ class Checkpoints:
             (directory / "checkpoint_complete.json").write_text("{}")
         dist.barrier()
 
-    def finalize(self, state):
+    def finalize(self, state: Any) -> None:
+        """Finalize through the same model persistence boundary."""
         self.save(state)
 
 
@@ -149,7 +172,8 @@ class TinyRuntime:
         )
         original_update = self.actor.update
 
-        def delayed_update(batch):
+        def delayed_update(batch: Any) -> Any:
+            """Keep a measurable overlap window around actual Actor updates."""
             # Leave a deterministic window for producer work while exercising actual Actor/DDP updates.
             time.sleep(0.15)
             return original_update(batch)
@@ -161,26 +185,36 @@ class TinyRuntime:
         self.metrics = []
         self.tracker = SimpleNamespace(log=lambda metrics, **kwargs: self.metrics.append(metrics))
         self.rollout_engine = SimpleNamespace(start_service=lambda: None, policy_version=0)
+        self.rollout_manager = SimpleNamespace(agent_runner=SimpleNamespace(
+            settings=GenerationSettings(2, 1., 1., 0, True, 0, 4, collect_log_probs=True)))
         self.publications = []
 
     @staticmethod
-    def run_synchronized(operation, callback):
+    def run_synchronized(operation: str, callback: Callable[[], Any]) -> Any:
+        """Execute the already coordinated CPU role operation."""
         del operation
         return callback()
 
-    def prepare_experience(self, batch):
+    def align_rollout(self, batch: Any) -> Any:
+        """Use production DP call padding before model forwards."""
+        group_info = SimpleNamespace(group=dist.group.WORLD, rank_size=dist.get_world_size())
+        return pad_agent_call_batch_for_dp(batch, group_info)
+
+    def prepare_experience(self, batch: Any) -> Any:
+        """Build real episode-level GRPO targets."""
         return self.preparer.prepare(batch)
 
-    def publish_policy(self, version):
+    def publish_policy(self, version: int) -> None:
+        """Coordinate the scripted inference version on every rank."""
         dist.barrier()
         self.rollout_engine.policy_version = version
         self.publications.append(version)
 
-    def close(self):
-        pass
+    def close(self) -> None:
+        """The parent owns process-group cleanup in this CPU fixture."""
 
 
-def run(output):
+def run(output: str) -> None:
     """Verify actual updates, publication, complete checkpoint and resume on two ranks."""
     torch.set_num_threads(1)
     dist.init_process_group("gloo")
@@ -191,7 +225,7 @@ def run(output):
                     "vllm": {"deployment": "disjoint"}},
         "agentic": {"max_turns": 1, "interaction_mode": "single_turn"},
         "train": {"max_steps": 3, "micro_batch_size": 1, "response_mini_batch_size": 2,
-                  "accelerator": {"dp_shard": 2}, "checkpoint": {
+                  "accelerator": {"dp_shard": dist.get_world_size()}, "checkpoint": {
                       "load_path": None, "output_dir": output, "save_final": True}},
         "async_training": asdict(AsyncTrainingConfig(
             groups_per_dp_rank=1, max_inflight_groups=4, max_buffer_groups=8,
@@ -200,8 +234,12 @@ def run(output):
         )),
     }
 
-    def sampler_factory(*args):
-        return AsyncRuntime(*args, target=producer)
+    if os.environ.get("HYPER_RL_ASYNC_ST_MULTITURN") == "1":
+        config["agentic"] = {"runner": "codex", "max_turns": 3, "codex": {}}
+
+    def sampler_factory(*args: Any) -> AsyncRuntime:
+        """Keep production IPC while substituting a deterministic producer."""
+        return AsyncRuntime(*args, target=producer, control_client=Mock())
 
     with patch("rl.async_training.fully_async_trainer.RLRoleRuntime", TinyRuntime), patch(
         "rl.async_training.fully_async_trainer.AsyncRuntime", sampler_factory,
@@ -230,7 +268,7 @@ def run(output):
         for step in range(1, 6):
             path = Path(output).parent / "rollouts" / f"step_{step}_rank_{dist.get_rank()}.jsonl"
             records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
-            if len(records) != 2 or not all(record["group_nonzero_advantage"] for record in records):
+            if len(records) < 2 or not all(record["group_nonzero_advantage"] for record in records):
                 raise RuntimeError("Consumed rollout diagnostics lost a DP group or its advantage signal")
     if dist.get_rank() == 0:
         print("ASYNC_GLOO_OK: updates, publication, checkpoint, resume and DP agreement")
