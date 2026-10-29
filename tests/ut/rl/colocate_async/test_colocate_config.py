@@ -26,7 +26,7 @@ from unittest.mock import patch
 from rl.algorithm import build_algorithm
 from rl.cli import load_config
 from rl.config import ColocateAsyncConfig, validate_colocate_async_config, validate_config
-from rl.async_training.protocol import configuration_fingerprint
+from rl.fully_async.protocol import configuration_fingerprint
 from rl.colocate_async.colocate_async_trainer import ColocateAsyncTrainer
 from tests.ut.rl.colocate_async.support import trainer_fixture
 
@@ -158,7 +158,7 @@ class TestColocateConfig(unittest.TestCase):
         script = (
             "import sys, rl.trainer; "
             "assert not any(name.startswith('rl.colocate_async') for name in sys.modules); "
-            "assert 'rl.async_training.fully_async_rollouter' not in sys.modules"
+            "assert 'rl.fully_async.fully_async_rollouter' not in sys.modules"
         )
         result = subprocess.run([sys.executable, "-c", script],
                                 env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},

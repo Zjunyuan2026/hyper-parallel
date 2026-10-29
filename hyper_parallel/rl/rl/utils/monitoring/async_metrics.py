@@ -16,7 +16,7 @@
 import time
 from typing import Any
 
-from rl.async_training.protocol import behavior_segments, decode_group
+from rl.fully_async.protocol import behavior_segments, decode_group
 from rl.utils.monitoring.metrics import build_training_metrics, enforce_learning_gate, summarize_rollout
 from rl.weight_sync.sync import coordinator_call
 

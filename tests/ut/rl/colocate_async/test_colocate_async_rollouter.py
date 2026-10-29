@@ -17,9 +17,9 @@ from copy import deepcopy
 import unittest
 from unittest.mock import Mock, patch
 
-from rl.async_training.protocol import AsyncTrainingConfig, decode_group
+from rl.fully_async.protocol import AsyncTrainingConfig, decode_group
 from rl.colocate_async.colocate_async_rollouter import ColocateAsyncRollouter
-from tests.ut.rl.async_training.support import group
+from tests.ut.rl.fully_async.support import group
 
 
 class TestColocateAsyncRollouter(unittest.TestCase):

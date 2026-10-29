@@ -26,7 +26,7 @@ import torch
 import torch.distributed as dist
 
 from rl.algorithm.rollout_correction import correction_metrics, prepare_rollout_correction
-from rl.async_training.protocol import AsyncCheckpoint, decode_group
+from rl.fully_async.protocol import AsyncCheckpoint, decode_group
 from rl.colocate_async.colocate_async_rollouter import ColocateAsyncRollouter
 from rl.config import validate_colocate_async_config
 from rl.dataset.batch_builder import build_experience_batch

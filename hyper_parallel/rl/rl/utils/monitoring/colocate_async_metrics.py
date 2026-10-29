@@ -15,7 +15,7 @@
 """All-rank colocated reporting; stage scheduling stays with the trainer."""
 from typing import Any, Callable
 
-from rl.async_training.protocol import behavior_segments, decode_group
+from rl.fully_async.protocol import behavior_segments, decode_group
 from rl.utils.monitoring.metrics import build_training_metrics, enforce_learning_gate, summarize_rollout
 
 

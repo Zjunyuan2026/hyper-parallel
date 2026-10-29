@@ -21,7 +21,7 @@ from unittest.mock import Mock, patch
 import torch
 import torch.distributed as dist
 
-from rl.async_training.fully_async_rollouter import AsyncRuntime
+from rl.fully_async.fully_async_rollouter import AsyncRuntime
 from rl.colocate_async.colocate_async_trainer import ColocateAsyncTrainer, _ColocateRoleRuntime
 from hyper_parallel.rl.tests.st._async_train import TinyRuntime, producer
 

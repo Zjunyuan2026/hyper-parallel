@@ -22,6 +22,7 @@ import pickle
 from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -32,6 +33,16 @@ __all__ = ["AsyncTrainingConfig", "validate_async_config", "SamplingTask", "Samp
            "AsyncCheckpoint", "behavior_segments", "validate_behavior", "decode_group", "configuration_fingerprint"]
 
 logger = logging.getLogger(__name__)
+
+
+class _ProtocolUnpickler(pickle.Unpickler):
+    """Read sample types saved before the package rename."""
+
+    def find_class(self, module: str, name: str) -> Any:
+        """Resolve the former protocol module to its current location."""
+        if module == "rl.async_training.protocol":
+            module = __name__
+        return super().find_class(module, name)
 
 
 @dataclass(frozen=True)
@@ -120,7 +131,7 @@ class SampleGroup:
 def decode_group(payload: bytes, candidates: int, max_bytes: int) -> SampleGroup:
     """Revalidate trusted local-process data at the receiving boundary."""
     _require(isinstance(payload, bytes) and len(payload) <= max_bytes, "Invalid or oversized group payload")
-    group = pickle.loads(payload)
+    group = _ProtocolUnpickler(BytesIO(payload)).load()
     _require(isinstance(group, SampleGroup), "Unexpected group payload")
     group.validate(candidates)
     return group
@@ -179,7 +190,7 @@ class AsyncCheckpoint:
                  "Incomplete or corrupted asynchronous checkpoint")
         _require(manifest.get("configuration") == configuration_fingerprint(config),
                  "Asynchronous checkpoint learning/data configuration differs")
-        state = pickle.loads(data)
+        state = _ProtocolUnpickler(BytesIO(data)).load()
         _require(state["learner_update"] == manifest["learner_update"], "Checkpoint step identity differs")
         _require(config["train"].get("max_steps", state["learner_update"]) >= state["learner_update"],
                  "Resume max_steps is below the checkpoint update")

@@ -28,9 +28,9 @@ from rl.utils.async_audit import (
     EventTrace, record_async_state, record_async_rollout, record_async_checkpoint, install_async_audit,
     begin_async_update, finish_async_update, record_async_selection, record_publication_timing,
 )
-from rl.async_training.protocol import AsyncCheckpoint, ExperienceBuffer
-from rl.async_training.protocol import decode_group, validate_async_config
-from rl.async_training.fully_async_rollouter import AsyncRuntime
+from rl.fully_async.protocol import AsyncCheckpoint, ExperienceBuffer
+from rl.fully_async.protocol import decode_group, validate_async_config
+from rl.fully_async.fully_async_rollouter import AsyncRuntime
 from rl.dataset.batch_builder import build_experience_batch
 from rl.trainer import RLRoleRuntime
 from rl.utils.monitoring.async_metrics import report_async_update

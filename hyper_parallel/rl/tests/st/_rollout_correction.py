@@ -29,7 +29,7 @@ from torch.nn.parallel import DistributedDataParallel
 
 from rl.algorithm import build_algorithm
 from rl.algorithm.rollout_correction import correction_metrics, prepare_rollout_correction
-from rl.async_training.fully_async_rollouter import AsyncRuntime
+from rl.fully_async.fully_async_rollouter import AsyncRuntime
 from rl.colocate_async.colocate_async_trainer import ColocateAsyncTrainer
 from rl.config import RolloutCorrectionConfig
 from rl.dataset.contracts import ExperienceBatch

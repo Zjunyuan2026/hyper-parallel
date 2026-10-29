@@ -15,7 +15,7 @@
 """Canonical real trajectory fixture shared by asynchronous contracts."""
 import torch
 
-from rl.async_training.protocol import SampleGroup, SamplingTask
+from rl.fully_async.protocol import SampleGroup, SamplingTask
 from rl.dataset.contracts import Trajectory, Turn
 
 

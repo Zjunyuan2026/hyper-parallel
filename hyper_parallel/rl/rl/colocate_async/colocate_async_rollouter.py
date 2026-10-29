@@ -17,8 +17,8 @@ import time
 from dataclasses import asdict
 from typing import Any, Mapping, Optional
 
-from rl.async_training.fully_async_rollouter import AsyncRuntime
-from rl.async_training.protocol import ExperienceBuffer
+from rl.fully_async.fully_async_rollouter import AsyncRuntime
+from rl.fully_async.protocol import ExperienceBuffer
 from rl.config import AsyncTrainingConfig
 from rl.utils.async_audit import EventTrace
 

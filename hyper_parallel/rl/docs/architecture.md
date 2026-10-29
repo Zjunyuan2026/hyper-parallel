@@ -367,7 +367,9 @@ Trainer 控制训练和设备阶段，Rollouter 在 rank 0 协调已有 `AsyncRu
 | `rl/colocate_async/colocate_async_trainer.py` | 所有训练 rank 的模型阶段、更新计数、发布、评估和保存顺序 |
 | `rl/colocate_async/colocate_async_rollouter.py` | rank 0 的组配额、完整组租约、过期淘汰与采样控制 |
 | `rl/config.py::ColocateAsyncConfig` | 新模式的独立配置、支持范围及容量推导 |
-| 原有 `rl/async_training/` | 不修改地复用 CPU producer、IPC、经验合同和 partial 服务 |
+| 原有 `rl/fully_async/` | 不修改地复用 CPU producer、IPC、经验合同和 partial 服务 |
+
+Package renaming preserves existing sample/checkpoint payloads and the `async_training` configuration key.
 
 阶段顺序参考 [verl 共卡异步 Trainer](https://github.com/verl-project/verl/tree/main/verl/trainer/ppo/v1/trainer_colocate_async.py)：
 取到完整样本后 abort/sleep，更新结束后发布/resume。本实现沿用本仓库的有界 IPC 经验池，

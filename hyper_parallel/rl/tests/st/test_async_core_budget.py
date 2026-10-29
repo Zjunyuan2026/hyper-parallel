@@ -19,7 +19,7 @@ from pathlib import Path
 
 def test_async_core_code_budget():
     """Count every physical line, including licenses, comments, docstrings and blank lines."""
-    root = Path(__file__).resolve().parents[2] / "rl/async_training"
+    root = Path(__file__).resolve().parents[2] / "rl/fully_async"
     counts = {}
     for path in sorted(root.rglob("*.py")):
         source = path.read_text(encoding="utf-8")

@@ -24,8 +24,8 @@ from typing import Any, Mapping
 
 from rl.agentic.envs.environment import load_agentic_module
 from rl.utils.async_audit import EventTrace
-from rl.async_training.protocol import AsyncTrainingConfig
-from rl.async_training.protocol import SampleGroup, SamplingTask, ExperienceBuffer
+from rl.fully_async.protocol import AsyncTrainingConfig
+from rl.fully_async.protocol import SampleGroup, SamplingTask, ExperienceBuffer
 from rl.roles.model_setup import load_tokenizer
 from rl.dataset.data_source import StatefulPromptSource
 from rl.roles.rollout.client import AsyncGenerationClient

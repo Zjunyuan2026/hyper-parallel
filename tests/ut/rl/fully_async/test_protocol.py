@@ -16,10 +16,11 @@
 from dataclasses import replace
 import json
 import math
+import sys
 from pathlib import Path
 import shutil
 import tempfile
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import Any
 import unittest
 from unittest.mock import patch
@@ -30,8 +31,8 @@ import rl
 
 from rl.algorithm import GRPOAlgorithm, GRPOConfig
 from rl.algorithm.loss import build_algorithm
-from rl.async_training.fully_async_rollouter import ExperienceBuffer
-from rl.async_training.protocol import (
+from rl.fully_async.fully_async_rollouter import ExperienceBuffer
+from rl.fully_async.protocol import (
     AsyncCheckpoint, AsyncTrainingConfig, SampleGroup, SamplingTask, validate_async_config,
 )
 from rl.cli import load_config
@@ -40,7 +41,7 @@ from rl.dataset.batch_builder import build_experience_batch, ExperiencePreparer
 from rl.dataset.episodes import episode_rows
 from rl.roles.rollout.base import GenerationSettings
 from rl.utils.async_audit import ActorLossAudit, EventTrace
-from tests.ut.rl.async_training.support import group
+from tests.ut.rl.fully_async.support import group
 
 
 class TestExperienceBuffer(unittest.TestCase):
@@ -55,6 +56,18 @@ class TestExperienceBuffer(unittest.TestCase):
     def submit(self, task: Any) -> None:
         """Encode and deliver one reserved test group."""
         self.buffer.accept(group(task).encode(2, 65536))
+
+    def test_restore_groups_saved_before_package_rename(self) -> None:
+        """Restore buffered groups whose pickle records the former module path."""
+        legacy = "rl.async_training.protocol"
+        module = sys.modules[SampleGroup.__module__]
+        aliases = {legacy: module, "rl.async_training": ModuleType("rl.async_training")}
+        with patch.dict(sys.modules, aliases), patch.object(SampleGroup, "__module__", legacy), \
+                patch.object(SamplingTask, "__module__", legacy):
+            payload = group(SamplingTask(0, 1, 0)).encode(2, 65536)
+        self.buffer.load_state_dict({"next_identity": 1, "ready": [payload],
+                                     "consumed_groups": 0, "dropped_groups": 0})
+        self.assertEqual(self.buffer.select(1)[0].task, SamplingTask(0, 1, 0))
 
     def test_capacity_includes_selected_batch(self):
         """Test capacity includes selected batch."""

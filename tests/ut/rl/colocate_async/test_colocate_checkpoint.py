@@ -18,7 +18,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from rl.async_training.protocol import AsyncCheckpoint
+from rl.fully_async.protocol import AsyncCheckpoint
 from tests.ut.rl.colocate_async.support import trainer_fixture
 
 

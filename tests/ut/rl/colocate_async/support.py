@@ -18,12 +18,12 @@ from unittest.mock import Mock
 
 import torch
 
-from rl.async_training.protocol import SamplingTask
+from rl.fully_async.protocol import SamplingTask
 from rl.colocate_async.colocate_async_trainer import ColocateAsyncTrainer, _ColocateRoleRuntime
 from rl.config import ColocateAsyncConfig
 from rl.roles.rollout.base import GenerationSettings
 from rl.utils.monitoring.metrics import ActorUpdateMetrics
-from tests.ut.rl.async_training.support import group
+from tests.ut.rl.fully_async.support import group
 
 
 def trainer_fixture() -> tuple[ColocateAsyncTrainer, list, tuple[bytes, ...]]:
