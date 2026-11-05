@@ -18,8 +18,8 @@
 import pytest
 import torch
 
-import rl.weight_sync.packed_weight as packed_module
-from rl.weight_sync.packed_weight import (
+import rl.rollout.weight_sync.packed_weight as packed_module
+from rl.rollout.weight_sync.packed_weight import (
     build_packed_weight_buckets,
     materialize_packed_weight_bucket,
     unpack_packed_weights,

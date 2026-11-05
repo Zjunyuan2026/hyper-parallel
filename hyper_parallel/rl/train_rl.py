@@ -12,33 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""``torchrun`` entry point for synchronous Hyper-RL training."""
-
-import argparse
-import logging
-
-# Preserve the historical CLI helper imports for existing callers.
-from rl.cli import load_config, _apply_override, _parse_override_value
-from rl.trainer import SyncTrainer
-
-__all__ = ["load_config", "_apply_override", "_parse_override_value", "main"]
-
-
-def main() -> None:
-    """Parse configuration and execute the Hyper-RL trainer."""
-    parser = argparse.ArgumentParser(description="Hyper-Parallel synchronous RL trainer")
-    parser.add_argument(
-        "config",
-        help="Path to Hyper-RL YAML configuration",
-    )
-    args, overrides = parser.parse_known_args()
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
-    config = load_config(args.config, overrides)
-    trainer = SyncTrainer(config)
-    trainer.train()
+"""Torchrun entry point; configuration selects the concrete RL mode."""
+from rl.config.cli import main
 
 
 if __name__ == "__main__":

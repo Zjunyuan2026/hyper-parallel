@@ -64,11 +64,11 @@ verl 基线配置及独立启动脚本也保存在该本地目录；主仓仅提
 
 | 功能 | 配置或说明 |
 | --- | --- |
-| 基础 GRPO / 内部多轮 / TP 与一致性测试 | [基础配置](configs/qwen3_4b_gsm8k_base.yaml)，供功能测试及并行策略入口复用 |
+| 基础 GRPO / 内部多轮 / TP 测试 | [基础配置](configs/qwen3_4b_gsm8k_base.yaml)，供功能测试及并行策略入口复用 |
 | GSPO / PPO / 模型奖励 | [GSPO](configs/qwen3_4b_gsm8k_gspo.yaml)、[PPO](configs/qwen3_4b_gsm8k_ppo.yaml)、[Reward Model](configs/qwen3_4b_gsm8k_model_reward.yaml) |
 | DeepSeek Harness | [配置](configs/deepseek_multi_turn.yaml)、[运行要求](../../docs/agentic_rl.md) |
 | Qwen3-30B-A3B | [单轮](configs/qwen3_30b_a3b_gsm8k_vllm.yaml)、[Codex](configs/qwen3_30b_a3b_codex_multi_turn.yaml)、[MoE与R3](../../docs/moe_code_agent.md#启用-r3) |
-| TP / 一致性检查 | [TP入口](scripts/run_qwen3_tp_docker.sh)、[一致性入口](scripts/run_qwen3_consistency_docker.sh)、[合同](../../docs/qwen3_training_inference_consistency.md) |
+| TP 检查 | [TP入口](scripts/run_qwen3_tp_docker.sh)、[推理与权重发布](../../docs/vllm_rollout.md) |
 
 内部多轮runner复用[基础GRPO配方](configs/qwen3_4b_gsm8k_base.yaml)，设置
 `agentic.interaction_mode=multi_turn`、`apply_chat_template=true`、`max_turns=4`、`max_observation_tokens=256`。

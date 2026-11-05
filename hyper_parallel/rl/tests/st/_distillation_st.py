@@ -29,7 +29,7 @@ import torch
 import torch.distributed as dist
 import yaml
 
-from rl.trainer import SyncTrainer
+from rl.trainer.build import build_trainer
 
 
 def main() -> None:
@@ -55,7 +55,7 @@ def main() -> None:
     distillation.setdefault("probability_gate", {}).update(
         max_mean_logprob_diff=mean_limit, max_logprob_diff=max_limit,
     )
-    trainer = SyncTrainer(config)
+    trainer = build_trainer(config)
     original = trainer._complete_step
 
     def verify_step(**kwargs: Any) -> None:

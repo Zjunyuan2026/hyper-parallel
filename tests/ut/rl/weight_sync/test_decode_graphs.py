@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from rl.weight_sync import vllm_worker
+from rl.rollout.weight_sync import vllm_worker
 
 
 class TestDecodeGraphs(unittest.TestCase):
