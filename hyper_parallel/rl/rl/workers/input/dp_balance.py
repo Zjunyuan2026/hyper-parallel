@@ -23,7 +23,7 @@ import torch.distributed as dist
 from torch.nn import functional
 
 from rl.data.contracts import ExperienceBatch
-from rl.rollout.weight_sync.sync import synchronized_call
+from rl.weight_sync.sync import synchronized_call
 
 
 _ROW_FIELDS = ("trajectories", "responses", "teacher_keys", "router_traces")

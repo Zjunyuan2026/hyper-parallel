@@ -325,7 +325,7 @@ Codex 和 DeepSeek 除各自子配置外，还必须满足以下共享约束：
 | DeepSeek 适配 | `rl/agentic/ds_harness/` |
 | MCP 工具桥接 | `rl/agentic/mcp_server.py` |
 | 标准训练数据契约与 episode 分组 | `rl/data/contracts.py`、`batch_builder.py`、`episodes.py` |
-| 原始工具证据与可训练性 | `rl/tooling/protocol.py`、`rl/rollout/vllm_plugin.py` |
+| 原始工具证据与可训练性 | `rl/tool_protocol/protocol.py`、`rl/rollout/vllm_plugin.py` |
 | 共享 vLLM 与策略身份 | `rl/rollout/vllm.py` |
 
 ## 当前实现边界

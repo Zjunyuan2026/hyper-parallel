@@ -38,7 +38,7 @@ from rl.data.experience import pad_agent_call_batch_for_dp
 from rl.utils.async_audit import EventTrace
 from rl.utils.monitoring.colocate_async_metrics import report_colocate_update, summarize_colocate_payloads
 from rl.utils.process_cleanup import temporary_environment
-from rl.rollout.weight_sync.sync import coordinator_call
+from rl.weight_sync.sync import coordinator_call
 
 logger = logging.getLogger(__name__)
 

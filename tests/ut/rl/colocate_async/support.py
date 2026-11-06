@@ -59,7 +59,6 @@ def trainer_fixture() -> tuple[ColocateAsyncTrainer, list, tuple[bytes, ...]]:
     engine.start_service = Mock(side_effect=lambda: events.append("start_service"))
     update = ActorUpdateMetrics(1., 1., 0., 0., 0., 0., .1, .001, 4, 1)
     roles = SimpleNamespace(
-        resolved_config=trainer.config,
         state=SimpleNamespace(global_step=0, max_steps=1, consumed_samples=0, consumed_tokens=0),
         device=torch.device("cpu"), parallel_dims=SimpleNamespace(dp_rank=0, dp_size=2, tp_rank=0),
         rollout_manager=SimpleNamespace(agent_runner=SimpleNamespace(

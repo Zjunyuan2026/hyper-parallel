@@ -35,6 +35,7 @@ class TestColocateAsyncMetrics(unittest.TestCase):
         """Verify reporting keeps diagnostics and enforces gate before log on non root."""
         trainer, _, payloads = trainer_fixture()
         trainer.rank = 1
+        trainer.config["train"]["learning_gate"] = {"enabled": True, "min_gradient_norm": 0.25}
         trainer.rollout_engine.policy_version = 1
         rollout = trainer._build_local_batch(payloads)
         update = trainer.actor.update.return_value
@@ -51,5 +52,6 @@ class TestColocateAsyncMetrics(unittest.TestCase):
                                        lambda: events.append("sampling_metrics") or result.diagnostics)
         trainer.tracker.log.assert_not_called()
         self.assertEqual(gate.call_args.args[0]["off_policy/is_ess_fraction"], .75)
+        self.assertEqual(gate.call_args.kwargs["config"], trainer.config["train"]["learning_gate"])
         self.assertEqual(events, ["rollout_metrics", "sampling_metrics"])
         self.assertEqual(diagnostics, {"off_policy/is_ess_fraction": .75, "timing_s/sample_wait": .2})

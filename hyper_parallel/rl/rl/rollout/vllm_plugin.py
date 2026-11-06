@@ -18,8 +18,8 @@ import os
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 
-from rl.rollout.weight_sync.vllm_worker import install_vllm_weight_sync_hooks
-from rl.tooling.protocol import install_tool_evidence
+from rl.weight_sync.vllm_worker import install_vllm_weight_sync_hooks
+from rl.tool_protocol.protocol import install_tool_evidence
 from rl.rollout.sampler import install_partial_prefill_rng_fix
 
 _SUPPORTED_RUNTIMES = {("0.22.1", "0.22.1rc1"), ("0.23.0", "0.23.0.post1")}

@@ -25,8 +25,8 @@ from typing import Any, Optional
 import pytest
 import torch
 
-import rl.rollout.weight_sync.vllm_worker as worker_module
-from rl.rollout.weight_sync.vllm_worker import _native_weight_layout, get_policy_version, init_packed_weight_group, install_vllm_weight_sync_hooks, receive_ipc_packed_weights, receive_packed_weights
+import rl.weight_sync.vllm_worker as worker_module
+from rl.weight_sync.vllm_worker import _native_weight_layout, get_policy_version, init_packed_weight_group, install_vllm_weight_sync_hooks, receive_ipc_packed_weights, receive_packed_weights
 
 
 class _Placement:

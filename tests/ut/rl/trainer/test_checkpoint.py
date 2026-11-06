@@ -526,6 +526,7 @@ def test_failed_overwrite_removes_completion_marker(
     manifest.write_text('{"step": 1, "world_size": 1}', encoding="utf-8")
     manager._last_saved_step = 1
     monkeypatch.setattr(checkpoint_backend.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(checkpoint_backend.dist, "get_world_size", lambda: 1)
     monkeypatch.setattr(checkpoint_backend.torch, "get_rng_state", lambda *_args: b"rng")
     if failure_stage == "preparation":
         trainer.actor.actor_model.state_dict = MagicMock(side_effect=OSError("prepare failed"))
@@ -620,3 +621,71 @@ def test_resume_rejects_historical_or_unknown_schema(tmp_path, schema):
         manager.validate_resume()
     assert not hasattr(manager, "trainer")
     assert manager.resources is resources
+
+
+@pytest.mark.parametrize("rank", [0, 1, 3])
+def test_rank_runtime_serialization_has_one_owner_per_synchronized_phase(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rank: int,
+) -> None:
+    """Large optimizer serialization cannot overlap across training ranks."""
+    manager, _ = _manager(tmp_path)
+    phases = []
+    saves = []
+    active_phase = []
+    monkeypatch.setattr(checkpoint_backend.dist, "get_rank", lambda: rank)
+    monkeypatch.setattr(checkpoint_backend.dist, "get_world_size", lambda: 4)
+    monkeypatch.setattr(checkpoint_backend, "SkipDTensorDispatch", MagicMock)
+
+    def synchronize(operation: str, callback: Any) -> None:
+        phases.append(operation)
+        active_phase[:] = [operation]
+        callback()
+
+    def save(state: dict[str, Any], **kwargs: Any) -> None:
+        if not kwargs["use_collectives"]:
+            saves.append((active_phase[0], kwargs["checkpoint_id"], pickle.loads(state["runtime"])))
+
+    manager.run_synchronized = synchronize
+    monkeypatch.setattr(checkpoint_backend, "dcp_save", save)
+    manager.save(SimpleNamespace(global_step=1, epoch=0, consumed_samples=8, consumed_tokens=16))
+
+    expected_phases = [f"checkpoint rank-state save rank={owner}" for owner in range(4)]
+    observed_phases = [phase for phase in phases if phase.startswith("checkpoint rank-state save")]
+    assert observed_phases == expected_phases, f"Expected {expected_phases}, got {observed_phases}"
+    assert len(saves) == 1, f"Expected one rank-local serialization, got {len(saves)}"
+    operation, directory, restored = saves[0]
+    assert operation == expected_phases[rank], f"Expected {expected_phases[rank]}, got {operation}"
+    assert directory == manager.directory(1) / f"rank_{rank}", f"Unexpected runtime directory {directory}"
+    assert restored["optimizer"] == {"value": "optimizer-live"}, f"Unexpected optimizer {restored}"
+    assert restored["scheduler"] == {"value": "scheduler-live"}, f"Unexpected scheduler {restored}"
+
+
+def test_rank_runtime_failure_aborts_before_later_owners_and_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed owner cannot publish completion or let later ranks serialize."""
+    manager, _ = _manager(tmp_path)
+    phases = []
+    monkeypatch.setattr(checkpoint_backend.dist, "get_rank", lambda: 2)
+    monkeypatch.setattr(checkpoint_backend.dist, "get_world_size", lambda: 4)
+    monkeypatch.setattr(checkpoint_backend, "SkipDTensorDispatch", MagicMock)
+
+    def synchronize(operation: str, callback: Any) -> None:
+        phases.append(operation)
+        callback()
+
+    def save(_state: dict[str, Any], **kwargs: Any) -> None:
+        if not kwargs["use_collectives"]:
+            raise OSError("runtime write failed")
+
+    manager.run_synchronized = synchronize
+    monkeypatch.setattr(checkpoint_backend, "dcp_save", save)
+    with pytest.raises(OSError, match="runtime write failed"):
+        manager.save(SimpleNamespace(global_step=1, epoch=0, consumed_samples=8, consumed_tokens=16))
+
+    expected_phases = [f"checkpoint rank-state save rank={owner}" for owner in range(3)]
+    observed_phases = [phase for phase in phases if phase.startswith("checkpoint rank-state save")]
+    assert observed_phases == expected_phases, f"Expected {expected_phases}, got {observed_phases}"
+    marker = manager.directory(1) / "checkpoint_complete.json"
+    assert not marker.exists(), f"Failed save unexpectedly published {marker}"
+    assert manager._last_saved_step is None, f"Failed save recorded step {manager._last_saved_step}"

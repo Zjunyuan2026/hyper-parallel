@@ -2,7 +2,7 @@
 
 ## 系统视图
 
-`train_rl.py` 调用 `rl.config.cli.main`。`trainer/build.py` 校验配置并组装资源，按 YAML 选择同步、分离异步或共卡异步循环。
+`train_rl.py` 的 `main()` 调用 `rl.config.loader.load_config()` 加载配置。`trainer/build.py` 校验配置并组装资源，按 YAML 选择同步、分离异步或共卡异步循环。
 构建对象只在初始化期间存在；循环直接持有所需组件，不继承共享角色运行时。
 主项目继续负责模型加载、并行计划、HSDP、优化器和 DCP；RL 保留算法、轨迹、奖励及训练调度。
 `trainer/` 表示训练循环与控制流程；`workers/` 表示 Actor/Critic 等执行角色，
@@ -12,9 +12,9 @@
 | --- | --- |
 | 类型与基本字段 | `rl/config/schema.py` |
 | HP 配置转换、自动容量与支持矩阵 | `rl/config/resolve.py`、`limits.py`、`validate.py` |
-| CLI 与严格 YAML 覆盖 | `rl/config/cli.py`；外部入口为 `train_rl.py` |
+| YAML 加载与严格覆盖 | `rl/config/loader.py`；外部入口为 `train_rl.py` |
 | Checkpoint 与评估 | `rl/trainer/checkpoint.py`、`rl/trainer/evaluation.py` |
-| 工具证据、XML 校验与诊断 | `rl/tooling/protocol.py`、`xml.py`、`diagnostics.py` |
+| 工具证据、XML 校验与诊断 | `rl/tool_protocol/protocol.py`、`xml.py`、`diagnostics.py` |
 | 共享扩展点注册 | `rl/utils/registry.py` |
 | 唯一组装入口 | `rl/trainer/build.py` |
 | 三种训练循环 | `rl/trainer/sync.py`、`fully_async.py`、`colocate_async.py` |
@@ -23,7 +23,8 @@
 | 模型、优化器、驻留 | `rl/workers/engine/` |
 | token 分批、DP 重排、模型适配 | `rl/workers/input/`、`adapters/` |
 | 轨迹、提示、episode 和经验 | `rl/data/` |
-| native-vLLM、发布及 IPC/HCCL | `rl/rollout/`、`rl/rollout/weight_sync/` |
+| native-vLLM 推理 | `rl/rollout/` |
+| 权重发布及 IPC/HCCL 传输 | `rl/weight_sync/` |
 | CPU producer、版本化样本、partial service | `rl/async_runtime/` |
 
 ## 控制面
@@ -113,7 +114,7 @@ IsoExec 不属于本次实现。当前代码与配置可运行不代表新组合
 
 ## 阅读代码
 
-从 `trainer/build.py` 进入对应循环，再阅读 `workers/targets.py`、Actor/Critic update、`rollout/weight_sync/publication.py` 和 checkpoint。
+从 `trainer/build.py` 进入对应循环，再阅读 `workers/targets.py`、Actor/Critic update、`weight_sync/publication.py` 和 checkpoint。
 配置、源码、示例与测试索引见[功能导航](../../../docs/rl-navigation.md)。
 
 ## Rayless asynchronous GRPO

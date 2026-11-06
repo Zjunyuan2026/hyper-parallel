@@ -16,7 +16,7 @@
 import argparse
 import logging
 
-from rl.config.cli import load_config
+from rl.config.loader import load_config
 from rl.trainer.colocate_async import ColocateAsyncTrainer
 
 

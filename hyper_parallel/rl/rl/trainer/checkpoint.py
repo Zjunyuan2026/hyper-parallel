@@ -22,6 +22,7 @@ import os
 import pickle
 from copy import deepcopy
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
@@ -35,10 +36,41 @@ from rl.utils.monitoring.config import sanitize_config
 
 from hyper_parallel import SkipDTensorDispatch
 from hyper_parallel.core.distributed_checkpoint import load as dcp_load
-from hyper_parallel.core.distributed_checkpoint import save as dcp_save
+from hyper_parallel.core.distributed_checkpoint import (
+    FileSystemWriter,
+    Metadata,
+    StandardSavePlanner,
+    save as _save_distributed_checkpoint,
+)
 from hyper_parallel.models._transformers.checkpoint_loader import CheckpointManager
 
 logger = logging.getLogger(__name__)
+
+
+def dcp_save(
+    state_dict: dict[str, Any], *, checkpoint_id: Path, use_collectives: bool = True,
+) -> Metadata:
+    """Save collective model shards or independent rank-local runtime state."""
+    if use_collectives:
+        return _save_distributed_checkpoint(
+            state_dict, checkpoint_id=checkpoint_id, use_collectives=True,
+        )
+
+    # The main-project save entry point always ends in a global barrier.
+    # Rank-local writes use its public storage interfaces and let RL synchronize failures.
+    rank = dist.get_rank()
+    planner = StandardSavePlanner(enable_plan_caching=False)
+    writer = FileSystemWriter(checkpoint_id)
+    planner.configure_planner(
+        state_dict=state_dict, is_coordinator=rank == 0, rank=rank, use_collectives=False,
+    )
+    writer.configure_writer(is_coordinator=rank == 0, rank=rank, use_collectives=False)
+    local_plan = writer.optimize_local_plan(planner.build_local_plan())
+    global_plan, metadata = planner.build_global_plan([local_plan])
+    final_plan = planner.finalize_plan(writer.optimize_global_plan(global_plan))
+    results = writer.execute_write(final_plan, planner)
+    writer.finalize_checkpoint(metadata, [results])
+    return metadata
 
 
 def _rank_local_optimizer_state(value: Any) -> Any:
@@ -339,8 +371,10 @@ class RLCheckpointManager:
         self.run_synchronized("checkpoint model save", save_model_state)
         del checkpoint_state
 
-        def save_rank_state() -> None:
-            """Persist RNG, scheduler, optimizer, and dataloader state per rank."""
+        def save_rank_state(owner_rank: int) -> None:
+            """Persist runtime state only on the synchronized owner rank."""
+            if dist.get_rank() != owner_rank:
+                return
             rank_state = {
                 "cpu_rng": torch.get_rng_state(),
                 "device_rng": self.resources.device_handle.get_rng_state(self.resources.device),
@@ -362,7 +396,13 @@ class RLCheckpointManager:
                 use_collectives=False,
             )
 
-        self.run_synchronized("checkpoint rank-state save", save_rank_state)
+        # Pickling optimizer tensors creates full CPU copies. Bound the peak to
+        # one rank's runtime state instead of duplicating every rank concurrently.
+        for owner_rank in range(dist.get_world_size()):
+            self.run_synchronized(
+                f"checkpoint rank-state save rank={owner_rank}",
+                partial(save_rank_state, owner_rank),
+            )
         self._write_metadata(checkpoint_dir, state)
         self._last_saved_step = step
 

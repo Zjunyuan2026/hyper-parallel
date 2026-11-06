@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Optional, Protocol
 
 from rl.data.contracts import RouterTrace
-from rl.rollout.weight_sync.sync import PolicySnapshot
+from rl.weight_sync.sync import PolicySnapshot
 
 
 @dataclass(frozen=True)

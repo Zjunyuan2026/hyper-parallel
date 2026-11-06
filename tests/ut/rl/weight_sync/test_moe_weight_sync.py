@@ -24,10 +24,10 @@ from unittest.mock import patch
 
 import torch
 
-from rl.rollout.weight_sync.model_adapter import ModelWeightAdapter, _native_expert_descriptions
-from rl.rollout.weight_sync import vllm_worker
-from rl.rollout.weight_sync.ipc import IPCWeightTransport, PhysicalRolloutWorker
-from rl.rollout.weight_sync.packed_weight import PackedWeight, unpack_packed_weights
+from rl.weight_sync.model_adapter import ModelWeightAdapter, _native_expert_descriptions
+from rl.weight_sync import vllm_worker
+from rl.weight_sync.ipc import IPCWeightTransport, PhysicalRolloutWorker
+from rl.weight_sync.packed_weight import PackedWeight, unpack_packed_weights
 
 from hyper_parallel.core.dtensor.placement_types import Shard
 

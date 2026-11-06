@@ -68,7 +68,6 @@ TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m pytest -q tests/ut/rl hyper_parallel/r
 | [deepseek_multi_turn](../examples/gsm8k/configs/deepseek_multi_turn.yaml) | qwen3 / grpo / 同步; dp_replicate=1, dp_shard=2, tp=1, cp=1, pp=1 | native → native | YAML/显式规则通过；设备与学习待验收 |
 | [qwen3_30b_a3b_codex_multi_turn](../examples/gsm8k/configs/qwen3_30b_a3b_codex_multi_turn.yaml) | qwen3_moe / grpo / 同步; dp_replicate=1, dp_shard=2, tp=2, ep=2, cp=1, pp=1 | native → native | YAML/显式规则通过；设备与学习待验收 |
 | [qwen3_30b_a3b_gsm8k_vllm](../examples/gsm8k/configs/qwen3_30b_a3b_gsm8k_vllm.yaml) | qwen3_moe / grpo / 同步; dp_replicate=1, dp_shard=2, tp=2, ep=2, cp=1, pp=1 | native → native | YAML/显式规则通过；设备与学习待验收 |
-| [qwen3_4b_gsm8k_50step](../examples/gsm8k/configs/qwen3_4b_gsm8k_50step.yaml) | qwen3 / grpo / 同步; dp_replicate=1, dp_shard=8, tp=1, cp=1, pp=1 | native → native | YAML/显式规则通过；设备与学习待验收 |
 | [qwen3_4b_gsm8k_base](../examples/gsm8k/configs/qwen3_4b_gsm8k_base.yaml) | qwen3 / grpo / 同步; dp_replicate=1, dp_shard=8, tp=1, cp=1, pp=1 | hyper → native | YAML/显式规则通过；设备与学习待验收 |
 | [qwen3_4b_gsm8k_codex_50step](../examples/gsm8k/configs/qwen3_4b_gsm8k_codex_50step.yaml) | qwen3 / grpo / 同步; dp_replicate=1, dp_shard=8, tp=1, cp=1, pp=1 | native → native | YAML/显式规则通过；设备与学习待验收 |
 | [qwen3_4b_gsm8k_gspo](../examples/gsm8k/configs/qwen3_4b_gsm8k_gspo.yaml) | qwen3 / gspo / 同步; dp_replicate=1, dp_shard=8, tp=1, cp=1, pp=1 | hyper → native | YAML/显式规则通过；设备与学习待验收 |

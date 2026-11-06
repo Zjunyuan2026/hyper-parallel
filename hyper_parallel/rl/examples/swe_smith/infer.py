@@ -31,7 +31,7 @@ from rl.workers.engine.model import resolve_model
 from rl.rollout.registry import build_rollout_engine
 from rl.rollout.manager import CodexRolloutManager
 from rl.utils.process_cleanup import cleanup_processes
-from rl.config.cli import load_config
+from rl.config.loader import load_config
 
 
 def load_prompts(paths: Sequence[Path], tokenizer: Any,

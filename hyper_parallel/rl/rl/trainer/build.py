@@ -57,7 +57,7 @@ from hyper_parallel.trainer.runtime.distributed import create_distributed_setup_
 from rl.trainer.state import RLTrainerState
 from rl.trainer.distributed import run_synchronized
 from rl.trainer.lifecycle import RunLifecycle
-from rl.rollout.weight_sync.publication import PolicyPublication
+from rl.weight_sync.publication import PolicyPublication
 from rl.distillation.runtime import TeacherScorer
 from rl.reward_model.runtime import RewardScorer
 

@@ -37,9 +37,9 @@ from rl.workers.engine.model import (
     NATIVE_QWEN3_MOE_ARCHITECTURE,
     NATIVE_QWEN3_5_ARCHITECTURE,
 )
-from rl.rollout.weight_sync.model_adapter import rollout_tensor_descriptions
-from rl.rollout.weight_sync.packed_weight import unpack_packed_weights
-from rl.rollout.weight_sync.vllm_client import KEEP_SCHEDULER_PAUSED_TAG
+from rl.weight_sync.model_adapter import rollout_tensor_descriptions
+from rl.weight_sync.packed_weight import unpack_packed_weights
+from rl.weight_sync.vllm_client import KEEP_SCHEDULER_PAUSED_TAG
 
 _SUPPORTED_ARCHITECTURES = frozenset(
     (

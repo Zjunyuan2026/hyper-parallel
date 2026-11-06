@@ -12,4 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""RL rollout weight_sync; import concrete interfaces directly."""
+"""RL weight publication and transport; import concrete interfaces directly."""

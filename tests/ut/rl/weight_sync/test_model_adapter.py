@@ -19,7 +19,7 @@ import pytest
 import torch
 
 from rl.workers.engine.model import ModelRegistration, resolve_vllm_model
-from rl.rollout.weight_sync.model_adapter import (
+from rl.weight_sync.model_adapter import (
     ModelWeightAdapter,
     build_model_weight_adapter,
 )

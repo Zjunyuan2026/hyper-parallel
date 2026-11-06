@@ -23,9 +23,9 @@ from typing import Any, Mapping, Optional, Sequence
 import torch
 import torch.distributed as dist
 
-from rl.rollout.weight_sync.packed_weight import PackedWeightAck
-from rl.rollout.weight_sync.sync import coordinator_call, synchronized_call
-from rl.rollout.weight_sync.vllm_client import VLLMWeightSyncClientMixin, shared_endpoint
+from rl.weight_sync.packed_weight import PackedWeightAck
+from rl.weight_sync.sync import coordinator_call, synchronized_call
+from rl.weight_sync.vllm_client import VLLMWeightSyncClientMixin, shared_endpoint
 
 
 @dataclass(frozen=True)

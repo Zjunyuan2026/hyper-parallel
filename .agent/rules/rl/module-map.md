@@ -7,7 +7,7 @@ Paths below are relative to `hyper_parallel/rl/` unless prefixed with `hyper_par
 
 | Area | Code or entry | Contract |
 | --- | --- | --- |
-| Configuration and CLI | `rl/config/validate.py`, `rl/config/cli.py`, `train_rl.py` | [Runtime architecture](../../../hyper_parallel/rl/docs/architecture.md) |
+| Configuration and CLI | `rl/config/validate.py`, `rl/config/loader.py`, `train_rl.py` | [Runtime architecture](../../../hyper_parallel/rl/docs/architecture.md) |
 | Synchronous roles and orchestration | `rl/trainer/build.py`, `rl/trainer/sync.py`, `rl/workers/engine/model.py` | [Training step](../../../hyper_parallel/rl/docs/architecture.md#一个训练步) |
 | Asynchronous orchestration | `rl/async_runtime/`, `examples/fully_async/launch.py` | [Rayless GRPO](../../../hyper_parallel/rl/docs/architecture.md#rayless-asynchronous-grpo) |
 | Colocated async orchestration | `hyper_parallel/rl/rl/trainer/colocate_async.py`, `colocate_async_rollouter.py`, `hyper_parallel/rl/rl/utils/monitoring/colocate_async_metrics.py` | [Colocated contract](../../../hyper_parallel/rl/docs/architecture.md#共卡异步-grpo); independent entry, reused producer/protocol/partial service; eight-card GSM8K/Search execution verified; quality/long-run acceptance pending |
@@ -25,12 +25,12 @@ Paths below are relative to `hyper_parallel/rl/` unless prefixed with `hyper_par
 | Agent environments and tools | `rl/agentic/core/trajectory_runner.py`, `rl/agentic/core/session.py`, `rl/agentic/envs/environment.py`, `rl/agentic/tools/` | [Agentic RL](../../../hyper_parallel/rl/docs/agentic_rl.md) |
 | External programs and CPU preparation | `rl/agentic/core/program_runner.py`, `rl/agentic/core/prepared_batch.py`, `rl/agentic/codex/`, `rl/agentic/ds_harness/`, `rl/agentic/mcp_server.py` | [Agentic RL](../../../hyper_parallel/rl/docs/agentic_rl.md) |
 | Shared isolated Codex execution | `rl/agentic/codex/container_execution.py`, `rl/agentic/envs/docker_workspace.py`, `rl/agentic/core/gateway_transport.py` | [Isolation and failure contracts](../../../hyper_parallel/rl/docs/agentic_rl.md); stdlib-only host imports |
-| Tool evidence | `rl/tooling/protocol.py`, `rl/tooling/xml.py`, `rl/tooling/diagnostics.py` | [Failure attribution](../../../hyper_parallel/rl/docs/agentic_rl.md#工具失败归因与收尾) |
+| Tool evidence | `rl/tool_protocol/protocol.py`, `rl/tool_protocol/xml.py`, `rl/tool_protocol/diagnostics.py` | [Failure attribution](../../../hyper_parallel/rl/docs/agentic_rl.md#工具失败归因与收尾) |
 | GSM8K | `examples/gsm8k/agent.py`, `examples/gsm8k/configs/`, `examples/gsm8k/scripts/` | [Recipes and result scope](../../../hyper_parallel/rl/examples/gsm8k/README.md); strict rule reward, eight-card guard |
 | Search-R1 | `examples/search_r1/agent.py`, `examples/search_r1/container_runtime.py`, `examples/search_r1/workspace.py`, `examples/search_r1/reward.py` | [HotpotQA file search](../../../hyper_parallel/rl/docs/search_r1.md); task-specific host handoff and citation checks |
 | Single-turn code | `examples/code/` | [Private tests and SandboxFusion](../../../hyper_parallel/rl/examples/code/README.md) |
 | Repository Code Agent | `examples/swe_smith/` | [Recipes, images and launch](../../../hyper_parallel/rl/examples/swe_smith/README.md), [implementation and acceptance](../../../hyper_parallel/rl/docs/swe_smith.md) |
-| Weight publication and transport | `rl/rollout/weight_sync/` | [full_gather and IPC/HCCL](../../../hyper_parallel/rl/docs/vllm_rollout.md) |
+| Weight publication and transport | `rl/weight_sync/` | [full_gather and IPC/HCCL](../../../hyper_parallel/rl/docs/vllm_rollout.md) |
 | Persistence and evaluation | `rl/trainer/checkpoint.py`, `rl/trainer/evaluation.py` | [Checkpoint and resume](../../../hyper_parallel/rl/docs/architecture.md#checkpoint-与恢复) |
 | Metrics, failures and cleanup | `rl/utils/monitoring/`, `rl/utils/failure_reporting.py`, `rl/utils/process_cleanup.py` | [Runtime architecture](../../../hyper_parallel/rl/docs/architecture.md) |
 | Runtime installation and patches | `docker/`, `pyproject.toml`; package manifests in root `setup.py` and `MANIFEST.in` | [Runtime image](../../../hyper_parallel/rl/docker/README.md) |

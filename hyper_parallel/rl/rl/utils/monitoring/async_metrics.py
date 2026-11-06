@@ -18,7 +18,7 @@ from typing import Any
 
 from rl.async_runtime.protocol import behavior_segments, decode_group
 from rl.utils.monitoring.metrics import build_training_metrics, enforce_learning_gate, summarize_rollout
-from rl.rollout.weight_sync.sync import coordinator_call
+from rl.weight_sync.sync import coordinator_call
 
 
 def report_async_update(trainer: Any, rollout: Any, update: Any, payloads: tuple[bytes, ...],

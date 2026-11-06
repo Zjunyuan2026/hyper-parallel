@@ -29,7 +29,7 @@ import torch.distributed as dist
 from rl.agentic.core.types import RewardResult
 from rl.data.contracts import ExperienceBatch, PromptRecord, Trajectory
 from rl.reward_model.client import RewardModelClient
-from rl.rollout.weight_sync.sync import synchronized_call
+from rl.weight_sync.sync import synchronized_call
 
 ModelRewardFunction = Callable[..., Awaitable[RewardResult | float]]
 

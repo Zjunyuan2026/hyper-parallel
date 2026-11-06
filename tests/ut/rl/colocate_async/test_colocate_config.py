@@ -25,7 +25,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from rl.algorithm import build_algorithm
-from rl.config.cli import load_config
+from rl.config.loader import load_config
 from rl.config.schema import ColocateAsyncConfig
 from rl.config.validate import validate_colocate_async_config, validate_config
 from rl.async_runtime.protocol import configuration_fingerprint

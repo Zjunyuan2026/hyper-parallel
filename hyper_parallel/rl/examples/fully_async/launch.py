@@ -17,7 +17,7 @@ import argparse
 import logging
 
 from rl.trainer.fully_async import FullyAsyncTrainer
-from rl.config.cli import load_config
+from rl.config.loader import load_config
 
 
 def main() -> None:

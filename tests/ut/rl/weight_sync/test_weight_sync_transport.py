@@ -25,12 +25,12 @@ from typing import Any, Mapping
 import pytest
 import torch
 
-import rl.rollout.weight_sync.hccl as hccl_module
-import rl.rollout.weight_sync.ipc as ipc_module
-import rl.rollout.weight_sync.sync as sync_module
-import rl.rollout.weight_sync.vllm_client as client_module
-from rl.rollout.weight_sync.hccl import HCCLWeightTransport
-from rl.rollout.weight_sync.ipc import PhysicalRolloutWorker
+import rl.weight_sync.hccl as hccl_module
+import rl.weight_sync.ipc as ipc_module
+import rl.weight_sync.sync as sync_module
+import rl.weight_sync.vllm_client as client_module
+from rl.weight_sync.hccl import HCCLWeightTransport
+from rl.weight_sync.ipc import PhysicalRolloutWorker
 
 
 class _Collectives:

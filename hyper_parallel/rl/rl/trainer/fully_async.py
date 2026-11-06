@@ -35,7 +35,7 @@ from rl.trainer.build import build_resources
 from rl.trainer.distributed import run_synchronized
 from rl.data.experience import pad_agent_call_batch_for_dp
 from rl.utils.monitoring.async_metrics import report_async_update
-from rl.rollout.weight_sync.sync import coordinator_call
+from rl.weight_sync.sync import coordinator_call
 from rl.utils.process_cleanup import temporary_environment
 
 

@@ -14,7 +14,7 @@
 # ============================================================================
 """Training-to-rollout publication boundary."""
 from typing import Any
-from rl.rollout.weight_sync.sync import PolicySnapshot
+from rl.weight_sync.sync import PolicySnapshot
 from hyper_parallel import hsdp_sync_stream
 
 class PolicyPublication:

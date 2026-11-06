@@ -31,7 +31,7 @@ from typing import Any, Mapping, Optional
 import torch
 import torch.distributed as dist
 
-from rl.rollout.weight_sync.layout import local_tensor
+from rl.weight_sync.layout import local_tensor
 
 
 @dataclass(frozen=True)

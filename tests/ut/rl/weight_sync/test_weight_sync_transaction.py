@@ -25,17 +25,17 @@ import torch
 import torch.distributed as dist
 
 from rl.workers.engine.model import ModelRegistration, resolve_vllm_model
-from rl.rollout.weight_sync import transfer as transfer_module
-from rl.rollout.weight_sync import vllm_worker
-from rl.rollout.weight_sync.packed_weight import PackedWeightAck
-from rl.rollout.weight_sync.sync import (
+from rl.weight_sync import transfer as transfer_module
+from rl.weight_sync import vllm_worker
+from rl.weight_sync.packed_weight import PackedWeightAck
+from rl.weight_sync.sync import (
     ActorRolloutWeightSync,
     PolicySnapshot,
     coordinator_call,
     synchronized_call,
 )
-from rl.rollout.weight_sync.transfer import WeightPublisher, WeightSource
-from rl.rollout.weight_sync.vllm_client import VLLMWeightSyncClientMixin
+from rl.weight_sync.transfer import WeightPublisher, WeightSource
+from rl.weight_sync.vllm_client import VLLMWeightSyncClientMixin
 
 
 def _model():

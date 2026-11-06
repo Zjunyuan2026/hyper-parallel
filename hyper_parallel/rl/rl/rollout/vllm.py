@@ -49,10 +49,10 @@ from rl.rollout.topology import (
     VLLMRolloutTopology,
     resolve_vllm_rollout_topology,
 )
-from rl.rollout.weight_sync.sync import ActorRolloutWeightSync, PolicySnapshot, synchronize_error, synchronized_call
-from rl.rollout.weight_sync.vllm_client import VLLMWeightSyncClientMixin
-from rl.rollout.weight_sync.transfer import WeightPublisher, build_weight_publisher
-from rl.rollout.weight_sync.config import resolve_weight_sync_config
+from rl.weight_sync.sync import ActorRolloutWeightSync, PolicySnapshot, synchronize_error, synchronized_call
+from rl.weight_sync.vllm_client import VLLMWeightSyncClientMixin
+from rl.weight_sync.transfer import WeightPublisher, build_weight_publisher
+from rl.weight_sync.config import resolve_weight_sync_config
 
 _DISTRIBUTED_ENVIRONMENT_VARIABLES = (
     "RANK",

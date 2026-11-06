@@ -35,7 +35,7 @@ from rl.async_runtime.producer import ExperienceBuffer
 from rl.async_runtime.protocol import (
     AsyncCheckpoint, AsyncTrainingConfig, SampleGroup, SamplingTask, validate_async_config,
 )
-from rl.config.cli import load_config
+from rl.config.loader import load_config
 from rl.config.validate import validate_config
 from rl.data.experience import build_experience_batch, ExperiencePreparer
 from rl.data.episodes import episode_rows

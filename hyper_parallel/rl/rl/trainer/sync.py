@@ -23,7 +23,7 @@ from rl.data.experience import pad_agent_call_batch_for_dp
 from rl.data.contracts import ExperienceBatch
 from rl.data.prompts import build_prompt_records
 from rl.utils.failure_reporting import report_failure
-from rl.rollout.weight_sync.sync import PolicySnapshot
+from rl.weight_sync.sync import PolicySnapshot
 from rl.utils.monitoring.metrics import build_training_metrics, enforce_learning_gate, summarize_rollout
 from rl.trainer.distributed import run_synchronized, add_step_timing_metrics
 import logging
@@ -358,7 +358,14 @@ class SyncTrainer:
         """Choose an independent evaluation interval or the legacy saving boundary."""
         if self.evaluator is None or step <= 0:
             return False
-        interval = self.resolved_config.get("evaluation", {}).get("every_n_steps")
+        evaluation = self.resolved_config.get("evaluation", {})
+        checkpoint = self.resolved_config.get("train", {}).get("checkpoint", {})
+        if step == self.state.max_steps and (
+            checkpoint.get("save_final", True) or evaluation.get("at_end", False)
+        ):
+            # Final checkpointing closes rollout; evaluate the published policy first.
+            return True
+        interval = evaluation.get("every_n_steps")
         if interval is None:
             return self.checkpoints.will_save(step)
         return interval > 0 and step % interval == 0

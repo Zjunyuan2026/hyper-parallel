@@ -17,7 +17,7 @@ import time
 from typing import Any
 from rl.data.contracts import ExperienceBatch
 from rl.reward_model import score_model_batch
-from rl.rollout.weight_sync.sync import coordinator_call
+from rl.weight_sync.sync import coordinator_call
 
 import logging
 

@@ -28,7 +28,7 @@ from typing import Any, Callable, Mapping, Optional
 
 import torch.distributed as dist
 
-from rl.rollout.weight_sync.vllm_client import (
+from rl.weight_sync.vllm_client import (
     VLLMWeightSyncClientMixin,
     committed_policy_version,
 )

@@ -30,7 +30,7 @@ from rl.data.contracts import ExperienceBatch
 from rl.workers.input.dp_balance import balance_experience
 from rl.workers.input.batching import equalize_batch_count, plan_token_batches, select_experience_rows
 from rl.workers.adapters.router_replay import RouterReplay
-from rl.rollout.weight_sync.sync import synchronized_call
+from rl.weight_sync.sync import synchronized_call
 from rl.utils.monitoring.metrics import (
     ActorMetricAccumulator,
     ActorMicroBatchMetrics,

@@ -35,10 +35,10 @@ import rl.utils.process_cleanup as cleanup_module
 import rl.trainer.sync as trainer_module
 import rl.trainer.build as builder_module
 import rl.trainer.lifecycle as lifecycle_module
-import rl.rollout.weight_sync.publication as publication_module
+import rl.weight_sync.publication as publication_module
 from rl.trainer.build import _TrainerBuilder
 from rl.trainer.lifecycle import RunLifecycle
-from rl.rollout.weight_sync.publication import PolicyPublication
+from rl.weight_sync.publication import PolicyPublication
 import rl.workers.targets as targets_module
 import rl.workers.engine.residency as residency_module
 from rl.workers.targets import TargetPreparer
@@ -1671,6 +1671,56 @@ class TestTrainingContracts(unittest.TestCase):
                 self.assertEqual(calls, [0, 5] if last_step == 5 else [0, 5, 6])
                 trainer.checkpoints.will_save.assert_not_called()
 
+    def test_final_evaluation_precedes_rollout_shutdown(self) -> None:
+        """A final save must evaluate the published policy before closing its server."""
+        trainer = SyncTrainer.__new__(SyncTrainer)
+        trainer.state = SimpleNamespace(global_step=1, max_steps=2)
+        trainer.resolved_config = {
+            "train": {"checkpoint": {"save_final": True}, "learning_gate": {}},
+            "evaluation": {"every_n_steps": 10, "at_end": False},
+        }
+        trainer._log_samples, trainer._log_steps = 0, 1
+        trainer.rollout_engine = SimpleNamespace(is_request_owner=True)
+        trainer._run_rank_synchronized = lambda _name, callback: callback()
+        trainer._tracker = Mock()
+        events = []
+        trainer.evaluator = Mock(last_step=-1)
+
+        def evaluate(step: int) -> tuple[dict[str, float], list]:
+            events.append("evaluate")
+            trainer.evaluator.last_step = step
+            return {"validation/accuracy": 0.5}, []
+
+        trainer.evaluator.run.side_effect = evaluate
+        trainer._close_rollout_for_final_checkpoint = Mock(side_effect=lambda: events.append("close"))
+        trainer.checkpoints = SimpleNamespace(
+            will_save=lambda _step: True,
+            complete_step=lambda *_args, **_kwargs: events.append("save"),
+        )
+        update = SimpleNamespace(total_loss=0.1, gradient_norm=1.0)
+        with patch.object(trainer_module, "summarize_rollout", return_value=({}, [])), patch.object(
+                trainer_module, "build_training_metrics", return_value={"train/gradient_norm": 1.0}), patch.object(
+                trainer_module, "enforce_learning_gate"), patch.object(
+                trainer_module, "uses_colocated_vllm", return_value=True):
+            trainer._complete_step(step=2, batch={}, rollout=object(), actor_update=update,
+                                   critic_update=None, diagnostic_metrics={})
+        self.assertEqual(events, ["evaluate", "close", "save"])
+        self.assertEqual(trainer.evaluator.last_step, 2)
+
+    def test_final_evaluation_request_preserves_opt_out(self) -> None:
+        """Final evaluation follows final-save/at-end requests without enabling an opted-out run."""
+        for save_final in (False, True):
+            for at_end in (False, True):
+                with self.subTest(save_final=save_final, at_end=at_end):
+                    trainer = SyncTrainer.__new__(SyncTrainer)
+                    trainer.state = SimpleNamespace(max_steps=2)
+                    trainer.evaluator = Mock()
+                    trainer.resolved_config = {
+                        "train": {"checkpoint": {"save_final": save_final}},
+                        "evaluation": {"every_n_steps": 10, "at_end": at_end},
+                    }
+                    self.assertEqual(trainer._evaluation_due(2), save_final or at_end)
+
     def test_periodic_evaluation_preserves_legacy_schedule_when_unspecified(self) -> None:
         """An explicit interval overrides saving; omitted intervals retain existing behavior."""
         trainer = SyncTrainer.__new__(SyncTrainer)
@@ -1678,6 +1728,7 @@ class TestTrainingContracts(unittest.TestCase):
         trainer.lifecycle = RunLifecycle(state=getattr(trainer, "state", None))
         trainer.residency = SimpleNamespace(offload_manager=None, metrics={}, move=lambda **kw: None, reshard_model=TrainingResidency.reshard_model)
         trainer.evaluator = Mock()
+        trainer.state = SimpleNamespace(max_steps=10)
         trainer.checkpoints = Mock()
         trainer.checkpoints.will_save.return_value = True
         for interval, expected in ((None, True), (0, False), (5, True), (3, False)):

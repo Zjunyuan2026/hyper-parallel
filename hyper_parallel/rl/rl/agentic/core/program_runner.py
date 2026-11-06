@@ -40,7 +40,7 @@ from rl.agentic.core.gateway_transport import (  # pylint: disable=unused-import
 )
 from rl.rollout.base import GenerationSettings
 from rl.rollout.router_capture import router_trace_from_capture, router_trace_from_wire, router_trace_to_wire
-from rl.tooling.protocol import validate_trainability
+from rl.tool_protocol.protocol import validate_trainability
 
 _NATURAL_STOPS = frozenset({"stop", "tool_calls", "stop_sequence"})
 _LOGGER = logging.getLogger(__name__)

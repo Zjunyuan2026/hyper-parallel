@@ -28,17 +28,17 @@ from typing import TYPE_CHECKING, Any, Mapping, Optional, Union
 import torch
 import torch.distributed as dist
 
-from rl.rollout.weight_sync.config import validate_weight_sync_support
-from rl.rollout.weight_sync.hccl import HCCLWeightTransport
-from rl.rollout.weight_sync.ipc import IPCContext, IPCWeightTransport
-from rl.rollout.weight_sync.model_adapter import alias_tied_embeddings, build_model_weight_adapter
-from rl.rollout.weight_sync.packed_weight import (
+from rl.weight_sync.config import validate_weight_sync_support
+from rl.weight_sync.hccl import HCCLWeightTransport
+from rl.weight_sync.ipc import IPCContext, IPCWeightTransport
+from rl.weight_sync.model_adapter import alias_tied_embeddings, build_model_weight_adapter
+from rl.weight_sync.packed_weight import (
     PackedWeightBucket,
     build_packed_weight_buckets,
     materialize_packed_weight_bucket,
 )
-from rl.rollout.weight_sync.sync import PolicySnapshot, coordinator_call, synchronized_call
-from rl.rollout.weight_sync.vllm_client import (
+from rl.weight_sync.sync import PolicySnapshot, coordinator_call, synchronized_call
+from rl.weight_sync.vllm_client import (
     VLLMWeightSyncClientMixin,
     committed_policy_version,
 )

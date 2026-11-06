@@ -33,9 +33,9 @@ import rl
 from hyper_parallel.trainer.config import PlanOverride, normalize_distributed_setup_overrides
 from hyper_parallel.trainer.config.resolver import resolve_component
 from rl.workers.adapters.qwen3 import restore_tied_parameter as _replicate_tied_weights
-from rl.rollout.weight_sync import packed_weight
-from rl.rollout.weight_sync.model_adapter import ModelWeightAdapter, rollout_tensor_descriptions
-from rl.rollout.weight_sync.packed_weight import build_packed_weight_buckets, materialize_packed_weight_bucket, unpack_packed_weights
+from rl.weight_sync import packed_weight
+from rl.weight_sync.model_adapter import ModelWeightAdapter, rollout_tensor_descriptions
+from rl.weight_sync.packed_weight import build_packed_weight_buckets, materialize_packed_weight_bucket, unpack_packed_weights
 
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 from hyper_parallel.distributed import ShardingPlanner as SharedPlanner

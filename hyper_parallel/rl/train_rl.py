@@ -13,7 +13,23 @@
 # limitations under the License.
 # ============================================================================
 """Torchrun entry point; configuration selects the concrete RL mode."""
-from rl.config.cli import main
+import argparse
+import logging
+
+from rl.config.loader import load_config
+
+
+def main() -> None:
+    """Load one RL configuration and run its declared training mode."""
+    parser = argparse.ArgumentParser(description="Hyper-Parallel RL trainer")
+    parser.add_argument("config", help="Path to the RL YAML configuration")
+    args, overrides = parser.parse_known_args()
+    # Keep configuration loading and --help independent of training dependencies.
+    from rl.trainer.build import build_trainer
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    trainer = build_trainer(load_config(args.config, overrides))
+    trainer.train()
 
 
 if __name__ == "__main__":

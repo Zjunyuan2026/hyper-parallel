@@ -24,7 +24,7 @@ from rl.algorithm.loss import RLAlgorithm
 from rl.data.contracts import ExperienceBatch, Trajectory, Turn
 from rl.data.episodes import episode_rows
 from rl.rollout.base import GenerationSettings
-from rl.tooling.protocol import validate_trainability
+from rl.tool_protocol.protocol import validate_trainability
 
 
 def _detached(value: Optional[Any]) -> Optional[Any]:

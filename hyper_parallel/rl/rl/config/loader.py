@@ -13,8 +13,6 @@
 # limitations under the License.
 # ============================================================================
 """Shared strict YAML and command-line configuration loading."""
-import argparse
-import logging
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -63,17 +61,3 @@ def load_config(config_path: str, overrides: list[str]) -> dict[str, Any]:
     for override in overrides:
         _apply_override(config, override)
     return config
-
-
-
-def main() -> None:
-    """Load one RL configuration and run its declared training mode."""
-    parser = argparse.ArgumentParser(description="Hyper-Parallel RL trainer")
-    parser.add_argument("config", help="Path to the RL YAML configuration")
-    args, overrides = parser.parse_known_args()
-    # Keep configuration loading and --help independent of training dependencies.
-    from rl.trainer.build import build_trainer
-
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-    trainer = build_trainer(load_config(args.config, overrides))
-    trainer.train()

@@ -30,9 +30,9 @@ from rl.config.schema import build_model_registration
 from rl.config.resolve import build_runtime_config
 from rl.config.validate import validate_rollout_and_agentic
 from rl.workers.engine.model import resolve_vllm_model
-from rl.rollout.weight_sync.model_adapter import ModelWeightAdapter, alias_tied_embeddings
-from rl.rollout.weight_sync.packed_weight import PackedWeight, unpack_packed_weights
-from rl.rollout.weight_sync import vllm_worker
+from rl.weight_sync.model_adapter import ModelWeightAdapter, alias_tied_embeddings
+from rl.weight_sync.packed_weight import PackedWeight, unpack_packed_weights
+from rl.weight_sync import vllm_worker
 
 
 class TestQwen35Runtime(unittest.TestCase):

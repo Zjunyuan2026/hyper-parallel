@@ -22,7 +22,7 @@ import json
 import re
 from typing import Any, Iterable, Mapping
 
-from rl.tooling.xml import inspect_xml_calls
+from rl.tool_protocol.xml import inspect_xml_calls
 
 
 class InfrastructureRolloutError(RuntimeError):
