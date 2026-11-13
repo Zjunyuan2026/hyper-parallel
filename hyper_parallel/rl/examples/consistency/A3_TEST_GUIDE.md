@@ -72,6 +72,8 @@ sha256:f139fa4776cf71fa1ebf00c47fa1f4c313deec48267c2102a1a42d968634fb08
 
 模型目录还需要 tokenizer、完整权重分片等文件。
 检查 16 个有效 `Chip Logic ID`，不要把 Mcu 行计入设备数。
+如果 `Ascend910_9382` 在基础 `torch.ones` 上报 `EZ1013` / `OnesLike` 配置缺失，
+先按 [A3 算子包修复](A3_OPS_REPAIR.md) 构建并验证派生镜像，再继续本指南。
 启动器会将逻辑编号映射到物理 NPU，并保守拒绝使用忙的物理 NPU。
 CPU offload 会消耗主机内存；模型、优化器和权重发布需要的内存不能只用总显存判断。
 预留模型裁剪、结果、图编译及 Docker 运行所需磁盘空间。

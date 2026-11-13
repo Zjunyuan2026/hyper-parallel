@@ -56,7 +56,13 @@ done
     printf 'V4 wheel differs from the expected SHA256\n' >&2; exit 1;
 }
 image_id=$(docker image inspect "${image}" --format '{{.Id}}')
-[[ "${image_id}" == sha256:f139fa4776cf71fa1ebf00c47fa1f4c313deec48267c2102a1a42d968634fb08 ]] || {
+expected_image_id=${EXPECTED_IMAGE_ID:-sha256:f139fa4776cf71fa1ebf00c47fa1f4c313deec48267c2102a1a42d968634fb08}
+[[ "${expected_image_id}" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+    printf 'EXPECTED_IMAGE_ID must be a complete sha256 Image ID\n' >&2; exit 1;
+}
+printf 'IMAGE_ID actual=%s expected=%s\n' "${image_id}" "${expected_image_id}"
+printf '%s\n' "${image_id}" > "${result_root}/run/image-id.txt"
+[[ "${image_id}" == "${expected_image_id}" ]] || {
     printf 'Image identity differs from the validated environment: %s\n' "${image_id}" >&2; exit 1;
 }
 npu_info=$(npu-smi info)

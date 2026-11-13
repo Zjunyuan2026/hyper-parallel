@@ -1,0 +1,21 @@
+# Build with DOCKER_BUILDKIT=1. The context contains the official A3 installer.
+# The installer is mounted during RUN and is not retained in the final image.
+FROM scratch AS installer
+COPY Ascend-cann-A3-ops_9.2.1_linux-aarch64.run /a3-ops.run
+
+FROM hyper-rl:consistency-v0.30.0-cann9.2.1-arm64
+USER root
+RUN --mount=type=bind,from=installer,source=/a3-ops.run,target=/tmp/a3-ops.run,readonly \
+    /bin/bash -c 'set -euo pipefail; \
+    sha256sum /tmp/a3-ops.run > /opt/a3-ops-installer.sha256; \
+    bash /tmp/a3-ops.run --check; \
+    bash /tmp/a3-ops.run --install --type=toolkit --install-path=/usr/local/Ascend \
+        --install-for-all --force --quiet; \
+    test "$(readlink -f /usr/local/Ascend/cann)" = /usr/local/Ascend/cann-9.2.1; \
+    grep -qx "package_name=Ascend-cann-A3-ops" \
+        /usr/local/Ascend/cann-9.2.1/aarch64-linux/ascend_ops_install.info; \
+    grep -qx "version=9.2.1" \
+        /usr/local/Ascend/cann-9.2.1/aarch64-linux/ascend_ops_install.info; \
+    find /usr/local/Ascend/cann-9.2.1/opp/built-in/op_impl/ai_core/tbe/kernel/config/ascend910_93 \
+        -type f -iname "*ones*" -print -quit | grep -q .; \
+    cp /usr/local/Ascend/cann-9.2.1/aarch64-linux/ascend_ops_install.info /opt/a3-ops-install.info'
