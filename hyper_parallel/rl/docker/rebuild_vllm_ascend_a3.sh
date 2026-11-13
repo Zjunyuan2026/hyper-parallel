@@ -9,18 +9,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 set -eo pipefail
+# Vendor environment scripts may overwrite or unset the build target.
+readonly hp_a3_build_soc="${SOC_VERSION:-}"
+if [[ ! "$hp_a3_build_soc" =~ ^ascend910_93[0-9][0-9]$ ]]; then
+    printf 'Invalid build SOC_VERSION=%q; expected an A3 target such as ascend910_9382\n' \
+        "$hp_a3_build_soc" >&2
+    exit 1
+fi
 source /usr/local/Ascend/cann/set_env.sh
 if [[ -f /usr/local/Ascend/nnal/atb/set_env.sh ]]; then
     source /usr/local/Ascend/nnal/atb/set_env.sh
 fi
 set -u
+printf 'A3_BUILD_TARGET requested=%q environment_after_source=%q\n' \
+    "$hp_a3_build_soc" "${SOC_VERSION:-}"
+export SOC_VERSION="$hp_a3_build_soc"
 
 source_dir=/vllm-workspace/vllm-ascend
 record_dir=/opt/a3-vllm-build
 [[ "$(realpath "$source_dir")" == /vllm-workspace/vllm-ascend ]]
-[[ "${SOC_VERSION:-}" =~ ^ascend910_93[0-9][0-9]$ ]] || {
-    printf 'Set SOC_VERSION to the actual A3 model, e.g. ascend910_9382\n' >&2; exit 1;
-}
 [[ "${MAX_JOBS:-8}" =~ ^[1-9][0-9]*$ ]] || {
     printf 'MAX_JOBS must be positive\n' >&2; exit 1;
 }
