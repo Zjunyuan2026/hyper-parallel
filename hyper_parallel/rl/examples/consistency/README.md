@@ -1,7 +1,115 @@
 # Qwen3-MoE 训推一致性
 
+## 可配置 Codex 与 A3 入口
+
+### 普通 Git 传递依赖
+
+仓库内的 `wheels/` 保存V4补丁和 `runtime/` 中的PEFT、Accelerate wheel，使用普通Git二进制文件，
+不使用Git LFS。A3克隆目标分支后，在仓库根目录执行 `sha256sum --check wheels/SHA256SUMS`。
+启动器及 `a3.env` 默认读取仓库内的wheel，无需另外复制，也不需要安装Git LFS。
+代码仍需准备模型和Parquet数据；这些不包含在Git wheel目录中。
+
+在仓库根目录运行。默认执行 Codex GRPO 两步；`RUNNER=internal` 可复现原始单轮路径。
+本机 910B3 四卡初测与 A3 十六设备验收必须分别记录，裁剪四层的结果不代表完整模型通过。
+
+```bash
+PROFILE=hyper_parallel/rl/examples/consistency/configs/local_910b.env \
+  bash hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_docker.sh
+```
+
+修改组合和步数只需覆盖环境变量，结果目录必须为新目录，防止覆盖已有实验：
+
+```bash
+PROFILE=hyper_parallel/rl/examples/consistency/configs/local_910b.env \
+TRAIN_TP=2 TRAIN_EP=4 TRAIN_SP=false \
+ROLLOUT_TP=4 ROLLOUT_EP=2 ROLLOUT_SP=true STEPS=2 \
+RESULT_ROOT=/path/to/new-result \
+  bash hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_docker.sh
+```
+
+训练 FSDP=`设备数/TRAIN_TP`，推理 DP=`设备数/ROLLOUT_TP`；EP 使用同一物理域，
+不额外乘卡数。训练 EDP 默认=`设备数/TRAIN_EP`（EP1 时为1），CP/PP固定为1。
+SP 是 TP 内的 sequence parallel，不是 CP。默认 PIK leaf 数保持8，TP/EP须满足配置与模型约束。
+`MODEL_LAYERS=0` 使用完整权重，正整数生成独立裁剪权重，不改原始模型。
+每个训练 DP rank 的题数由 `PROMPTS_PER_RANK` 指定，每题候选数由 `CANDIDATES` 指定；
+改变 DP 会改变全局 batch，跨实验对比时应主动保持工作量一致。
+Codex采用仓库现有GSM8K计算任务的简短模型指令、`compact_harness_context`和
+`exec_command`/`write_stdin`工具白名单，避免通用编码说明占满数学任务上下文。
+这是生成前的显式任务配方，最终配置及原始请求均保存；训练仍使用实际发送给模型的完整上下文，
+不会在采样后裁剪prompt来通过一致性检查。
+`STEPS` 表示每次新运行从零开始的训练步数，不代表恢复 checkpoint。
+
+### A3 十六设备迁移
+
+复制完整仓库、V4补丁wheel和运行依赖wheel目录；不需要重新制作Docker镜像。
+源码安装后要求PEFT，当前基础镜像缺少PEFT及Accelerate。离线依赖目录由
+`EXTRA_WHEELS_DIR` 指定，默认是仓库上一级的 `wheels/runtime`；已验证的组合为
+`peft-0.21.2-py3-none-any.whl`、`accelerate-1.15.0-py3-none-any.whl`。
+启动器只在临时容器安装，不自动联网或升级Torch，仍严格执行 `pip check`。
+
+先将原始数据转换到新的目录（只做一次，不覆盖已有数据）：
+
+```bash
+docker run --rm \
+  -v "$PWD:/workspace:ro" \
+  -v /home/z00988596/datasets/gsm8k/grade_school_math/data:/raw:ro \
+  -v /home/z00988596/datasets/gsm8k:/data \
+  --entrypoint python hyper-rl:consistency-v0.30.0-cann9.2.1-arm64 \
+  /workspace/hyper_parallel/rl/examples/consistency/scripts/prepare_gsm8k.py \
+  --source /raw --output /data/prepared
+```
+
+确认设备实际枚举及空闲状态后，指定wheel、依赖目录和A3配置：
+
+```bash
+export V4_WHEEL=/absolute/path/to/flash_attn_npu-0.5.0+hpbi1-cp312-cp312-linux_aarch64.whl
+export V4_WHEEL_SHA256=5ef04a872b1be2c812bb0c36c17ba4776a4b5f9b9eabb24eab0a56a139a497c9
+export EXTRA_WHEELS_DIR=/absolute/path/to/wheels/runtime
+PROFILE=hyper_parallel/rl/examples/consistency/configs/a3.env \
+  bash hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_docker.sh
+```
+
+重新构建的V4 wheel应使用其自身校验和。A3配置使用本地短镜像名，仍检查完整Image ID。
+默认完整模型，训练TP4/FSDP4/EP4/SP开，推理TP2/DP8/EP8/SP关；这是待A3实机验收的组合。
+物理卡与逻辑设备编号以目标机实际枚举为准，不能仅凭“16卡”认定编号必为0–15。
+启动器根据 `npu-smi info -m` 将逻辑编号映射到物理NPU后检查空闲状态，保存
+`run/npu-mapping.txt`；同一物理NPU任一芯片忙时会保守拒绝使用该NPU。
+
+### 结果与故障定位
+
+`run/consistency.json` 仅在所有请求步数通过且训练正常结束后生成成功报告。
+`run/summary.json` 包含运行成败、请求/记录步数和总耗时；初始化失败或进程被强杀时，
+优先查看 `launcher-status.txt`、`container-status.txt` 和torchrun错误，不能把文件缺失当成功。
+
+| 输出 | 内容 |
+| --- | --- |
+| `run/steps.jsonl`、`run/steps.csv` | 原始Trainer每步指标，缺失项保持缺失，不伪造零值 |
+| `run/train.log`、`run/torchrun/` | 合并日志与各rank的stdout/stderr |
+| `run/launcher.log` | 预检、依赖安装、裁剪和启动错误 |
+| `run/progress-rank*.json`、`run/events-rank*.jsonl` | 各rank当前阶段与阶段耗时，无额外设备同步 |
+| `run/failure-rank*.json` | Python捕获的rank异常与堆栈 |
+| `run/config.yaml`、`run/environment.txt` | 最终生效配置和依赖版本 |
+| `run/trajectories/` | Codex原始事件、会话与工具证据 |
+
+检查 `training/rollout_probs_diff_valid=1`、`training/log_probs_valid_tokens>0`，
+以及 `training/rollout_log_probs_diff_max`、`training/rollout_log_probs_diff_mean` 均为0。
+每步必须在同一策略版本、有效action token上比较独立采样概率与Actor重算值；缺失或非有限数立即失败。
+通过日志不等于学习收益或梯度逐位一致。
+
+查看 `train/gradient_norm`、`train/total_loss`、`train/policy_loss`、`train/kl_loss`，
+以及 `reward/mean`、`reward/std`、`reward/min`、`reward/max`、`reward/accuracy`（有提供时）
+和原始 `rollout/` episode指标。原生指标保留其既有聚合语义。
+`perf/time_per_step` 和 `timing_s/` 给出Trainer计算的阶段耗时，`STEP_RESULT`打印完整指标。
+阶段事件是各rank的主机墙钟区间，不是设备kernel时间；rank0指标不是额外全rank取最大值的性能测量。
+首步包括冷启动/编译开销，warm平均值应排除首步；两步样本不足以评估稳态性能。
+统一执行的严格零误差门禁不会因迁移失败而自动降级或跳过。
+
+---
+
 四层 Qwen3-MoE 运行两步正常 GRPO，验证不同训推并行配置下的实际采样 token log-prob 完全一致。
 模型保留原始 128 专家、top-k8 和权重，只裁剪 decoder 层数。
+下方保留原始单轮复现说明；执行前请在同一终端设置 `export RUNNER=internal`。
+Codex与可变步数使用上方入口。
 
 ```text
 consistency/
