@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Check basic BF16 operators under the same Level 3 policy as unified RL."""
+"""Check Level 3 BF16 operators and the vLLM-Ascend hardware build type."""
 
 import json
 import os
 
 import torch
 import torch_npu
+
+from vllm_ascend.device.device_config import check_ascend_device_type, get_ascend_device_type
 
 
 def main() -> None:
@@ -41,7 +43,10 @@ def main() -> None:
     torch_npu.npu.synchronize()
     expected = torch.full((1, 16), 16, dtype=torch.bfloat16)
     torch.testing.assert_close(result.cpu(), expected, atol=0, rtol=0)
-    print("RUNTIME_PROBE_PASS: BF16 ones and mm at Level 3", flush=True)
+    print("MM_OK", flush=True)
+    print("VLLM_ASCEND_BUILD_DEVICE", str(get_ascend_device_type()), flush=True)
+    check_ascend_device_type()
+    print("RUNTIME_PROBE_PASS: BF16 ones/mm Level 3 and vLLM-Ascend device match", flush=True)
 
 
 if __name__ == "__main__":

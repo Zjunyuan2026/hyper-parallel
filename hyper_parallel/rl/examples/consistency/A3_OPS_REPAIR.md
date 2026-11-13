@@ -3,6 +3,7 @@
 适用于 `Ascend910_9382` 在 BF16 `torch.ones` 上报 `561103` / `EZ1013`，
 提示缺少 `aclnnInplaceOne_1_OnesLikeAiCore` 配置的情况。
 原始固定镜像的安装记录为 `Ascend-cann-910b-ops 9.2.1`，A3 需要对应的算子包。
+原始镜像的 vLLM-Ascend 同时为 A2 构建。需要完成下面两层修复：基础算子包，以及 vLLM-Ascend A3 编译。
 修复应先通过基础算子测试，再恢复四层模型及后续并行测试。
 
 此流程创建新的派生镜像，保留原镜像和宿主机环境。构建不需要占用 NPU。
@@ -53,15 +54,35 @@ Dockerfile 先执行安装包完整性检查，然后以 `/usr/local/Ascend` 为
 构建检查 A3 包名、9.2.1 版本、CANN 软链和 `ascend910_93` 的 OnesLike 内核配置，保存安装记录及包 SHA256。
 构建成功只证明安装与静态检查成功，不代表 A3 算子、V4 或训推一致性已验收。
 
+### 再编译同版本 vLLM-Ascend 的 A3 二进制
+
+如果已经构建过上述 `a3-ops-arm64` 镜像，不必重复构建它，继续执行：
+
+```bash
+docker build \
+  -f hyper_parallel/rl/docker/Dockerfile.a3-vllm \
+  --build-arg SOC_VERSION=ascend910_9382 \
+  --build-arg MAX_JOBS=8 \
+  -t hyper-rl:consistency-v0.30.0-cann9.2.1-a3-runtime-arm64 \
+  hyper_parallel/rl/docker
+```
+
+此步骤不占用 NPU，但会消耗编译 CPU、主机内存和磁盘；内存紧张可降低 `MAX_JOBS`。
+脚本使用镜像里已有的同一份源码及补丁，清理派生镜像内的 A2 生成物，开启自定义算子编译后重新 editable 安装。
+不通过修改 `_build_info.py` 标记或关闭硬件检查冒充 A3；该标记由实际构建生成。
+`--no-deps --no-build-isolation` 保留依赖，构建前后检查 Torch、Torch-NPU、vLLM、vLLM-Ascend 等版本不变。
+源码、编译日志、版本和二进制 SHA256 保存在镜像 `/opt/a3-vllm-build/`。
+A3 构建检查通过后仍须做下方硬件测试，并继续验证真实 vLLM worker、V4 和分布式通信。
+
 ## 3. 保存新镜像身份并做单设备验证
 
 同一个 Bash 终端中执行。以下假设逻辑设备 0 空闲；实际使用前检查占用，并按需修改可见设备：
 
 ```bash
-export IMAGE=hyper-rl:consistency-v0.30.0-cann9.2.1-a3-ops-arm64
+export IMAGE=hyper-rl:consistency-v0.30.0-cann9.2.1-a3-runtime-arm64
 docker image inspect "$IMAGE" --format '{{.Id}}' \
-  > /home/z00988596/installers/a3-ops-image-id.txt
-export EXPECTED_IMAGE_ID="$(cat /home/z00988596/installers/a3-ops-image-id.txt)"
+  > /home/z00988596/installers/a3-runtime-image-id.txt
+export EXPECTED_IMAGE_ID="$(cat /home/z00988596/installers/a3-runtime-image-id.txt)"
 
 npu-smi info
 docker run --rm --privileged \
@@ -75,7 +96,8 @@ docker run --rm --privileged \
   '
 ```
 
-应看到 `ONES_OK` 和 `RUNTIME_PROBE_PASS`，后者确认 Level 3 下 BF16 矩阵乘法结果正确。
+应看到 `ONES_OK`、`MM_OK`、`VLLM_ASCEND_BUILD_DEVICE AscendDeviceType.A3` 和 `RUNTIME_PROBE_PASS`。
+这确认基础计算正确且 vLLM-Ascend 的构建类型与实际设备匹配，还不能证明所有 vLLM 算子均可执行。
 如果仍报错，保留完整输出，暂不运行 16 进程测试。不要通过关闭 Level 3、伪造 SoC 或复制其他 SoC 的 JSON 绕过错误。
 
 ## 4. 恢复四层模型两步基线
@@ -109,4 +131,6 @@ RESULT_ROOT="/home/z00988596/results/consistency/$(date +%Y%m%d-%H%M%S)-a3-ops-b
 
 - [官方 vLLM Ascend 环境安装说明](https://docs.vllm.ai/projects/ascend/en/main/getting_started/installation.html)
 - [派生镜像 Dockerfile](../../docker/Dockerfile.a3-ops)
+- [A3 vLLM-Ascend 重编译 Dockerfile](../../docker/Dockerfile.a3-vllm)
+- [A3 重编译脚本](../../docker/rebuild_vllm_ascend_a3.sh)
 - [基础算子检查脚本](scripts/probe_npu_runtime.py)
