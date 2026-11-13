@@ -61,13 +61,15 @@ Dockerfile 先执行安装包完整性检查，然后以 `/usr/local/Ascend` 为
 ```bash
 docker build \
   -f hyper_parallel/rl/docker/Dockerfile.a3-vllm \
-  --build-arg SOC_VERSION=ascend910_9382 \
+  --build-arg HP_A3_SOC_VERSION=ascend910_9382 \
   --build-arg MAX_JOBS=8 \
   -t hyper-rl:consistency-v0.30.0-cann9.2.1-a3-runtime-arm64 \
   hyper_parallel/rl/docker
 ```
 
 此步骤不占用 NPU，但会消耗编译 CPU、主机内存和磁盘；内存紧张可降低 `MAX_JOBS`。
+构建参数使用 `HP_A3_SOC_VERSION`，避免基础镜像已有的同名 `ENV SOC_VERSION=ascend910b1` 遮蔽构建参数。
+Dockerfile 从该独立参数设置实际编译所需的 `SOC_VERSION`；不要再传旧的 `--build-arg SOC_VERSION=...`。
 脚本使用镜像里已有的同一份源码及补丁，清理派生镜像内的 A2 生成物，开启自定义算子编译后重新 editable 安装。
 不通过修改 `_build_info.py` 标记或关闭硬件检查冒充 A3；该标记由实际构建生成。
 `--no-deps --no-build-isolation` 保留依赖，构建前后检查 Torch、Torch-NPU、vLLM、vLLM-Ascend 等版本不变。

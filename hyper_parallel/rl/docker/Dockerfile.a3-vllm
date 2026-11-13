@@ -1,9 +1,10 @@
 ARG BASE_IMAGE=hyper-rl:consistency-v0.30.0-cann9.2.1-a3-ops-arm64
 FROM ${BASE_IMAGE}
 USER root
-ARG SOC_VERSION=ascend910_9382
+# The base image defines ENV SOC_VERSION, which shadows an ARG with that name.
+ARG HP_A3_SOC_VERSION=ascend910_9382
 ARG MAX_JOBS=8
-ENV SOC_VERSION=${SOC_VERSION}
-ENV HP_A3_TARGET_SOC=${SOC_VERSION}
+ENV SOC_VERSION=${HP_A3_SOC_VERSION}
+ENV HP_A3_TARGET_SOC=${HP_A3_SOC_VERSION}
 COPY rebuild_vllm_ascend_a3.sh /opt/hyper-rl/rebuild_vllm_ascend_a3.sh
 RUN MAX_JOBS=${MAX_JOBS} bash /opt/hyper-rl/rebuild_vllm_ascend_a3.sh
