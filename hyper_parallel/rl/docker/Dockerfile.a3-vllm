@@ -4,5 +4,6 @@ USER root
 ARG SOC_VERSION=ascend910_9382
 ARG MAX_JOBS=8
 ENV SOC_VERSION=${SOC_VERSION}
+ENV HP_A3_TARGET_SOC=${SOC_VERSION}
 COPY rebuild_vllm_ascend_a3.sh /opt/hyper-rl/rebuild_vllm_ascend_a3.sh
 RUN MAX_JOBS=${MAX_JOBS} bash /opt/hyper-rl/rebuild_vllm_ascend_a3.sh

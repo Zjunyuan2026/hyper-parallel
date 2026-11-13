@@ -9,8 +9,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 set -eo pipefail
-# Vendor environment scripts may overwrite or unset the build target.
-readonly hp_a3_build_soc="${SOC_VERSION:-}"
+# Preserve the Docker target even when BASH_ENV changes SOC_VERSION before this script starts.
+readonly hp_a3_build_soc="${HP_A3_TARGET_SOC:-${SOC_VERSION:-}}"
+printf 'A3_BUILD_INPUT target=%q shell_soc=%q BASH_ENV=%q\n' \
+    "$hp_a3_build_soc" "${SOC_VERSION:-}" "${BASH_ENV:-}"
 if [[ ! "$hp_a3_build_soc" =~ ^ascend910_93[0-9][0-9]$ ]]; then
     printf 'Invalid build SOC_VERSION=%q; expected an A3 target such as ascend910_9382\n' \
         "$hp_a3_build_soc" >&2
@@ -24,6 +26,8 @@ set -u
 printf 'A3_BUILD_TARGET requested=%q environment_after_source=%q\n' \
     "$hp_a3_build_soc" "${SOC_VERSION:-}"
 export SOC_VERSION="$hp_a3_build_soc"
+# CANN/ATB are already loaded; child build shells must inherit this target unchanged.
+export BASH_ENV=/dev/null
 
 source_dir=/vllm-workspace/vllm-ascend
 record_dir=/opt/a3-vllm-build
