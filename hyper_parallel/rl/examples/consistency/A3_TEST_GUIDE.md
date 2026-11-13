@@ -10,7 +10,7 @@
 进程数和 TP/DP/FSDP 网格按逻辑设备数计算，显存预算按每个逻辑设备 64 GB 计算。
 先用 `npu-smi info -m` 确认逻辑编号，下面以 0–15 为例。
 
-本指南测试 GSM8K、Codex、多轮 episode GRPO 和统一执行路径。CP、PP 固定为 1。
+本指南默认测试 GSM8K 单轮生成、GRPO 和统一执行路径，不接入 Codex。CP、PP 固定为 1。
 SP 指 TP 内的 sequence parallel，与 CP 是不同的配置。
 下方组合是目标 A3 的待验收矩阵；其他硬件或四层模型的通过结果不能代替 A3 完整模型验收。
 每次比较的是同一策略版本下，实际采样 action token 的 rollout logprob 与 Actor 重算 logprob。
@@ -114,10 +114,13 @@ ls -lh /home/z00988596/datasets/gsm8k/prepared/
 cd /home/z00988596/A3_ARL/hyper-parallel
 
 export PROFILE="$PWD/hyper_parallel/rl/examples/consistency/configs/a3.env"
+export RUNNER=internal
 export DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 export STEPS=2
 export MODEL_LAYERS=4
 export MAX_MODEL_LEN=4096
+export MAX_PROMPT=512
+export MAX_NEW_TOKENS=1024
 export EP_CAPACITY=4096
 
 run_case() {
@@ -155,7 +158,7 @@ run_case() {
 run_case smoke-A 4 4 false 4 4 false
 ```
 
-先检查模型加载、Codex、V4、采样、训练、发布和清理流程。第一次有冷启动、编译和图捕获开销。
+先检查模型加载、GSM8K 单轮生成与评分、V4、训练、发布和清理流程。第一次有冷启动、编译和图捕获开销。
 必须满足第 11 节的通过标准，再运行下一批。
 
 ## 7. 第二批：分别改变 TP、EP、SP
@@ -267,7 +270,7 @@ grep -E 'STEP_SUMMARY|CONSISTENCY_CHECK|CONSISTENCY_PASS|RUN_FAILED' \
 | 逐步完整数据 | `run/steps.csv`、`run/steps.jsonl` |
 | 实际生效配置 | `run/config.yaml` |
 | 软件和输入身份 | `run/environment.txt`、源码提交、wheel 校验记录 |
-| Codex 调用证据 | `run/trajectories/` |
+| 实际运行模式和长度 | `run/generated-config.yaml`、日志 `TASK_READY` |
 
 字段缺失时检查原始日志，不补成零值。首步包含冷启动，应与后续步分开分析。
 `summary.json` 给出排除首步的平均耗时及样本数；两步实验只有一个后续步，不能据此判断稳态性能。

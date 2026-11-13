@@ -70,7 +70,7 @@ def configure(config: dict, world: int) -> dict:
     config["model"]["tokenizer_path"] = os.environ["RUN_MODEL_PATH"]
     if os.environ["RUN_MODEL_PATH"] == "/models/Qwen3-30B-A3B":
         config["model"]["registry_name"] = "qwen3_30b_a3b"
-    runner = os.environ.get("RUNNER", "codex")
+    runner = os.environ.get("RUNNER", "internal")
     if runner not in ("codex", "internal"):
         raise ValueError("RUNNER must be codex or internal")
     if runner == "codex":
@@ -82,19 +82,33 @@ def configure(config: dict, world: int) -> dict:
         for key in ("model_instructions", "compact_harness_context", "allowed_tools"):
             config["agentic"]["codex"][key] = math_harness[key]
         config["agentic"]["codex"]["session_root"] = "/results/run/trajectories"
-        config["data"].update(prompt_instruction=None, max_prompt_length=integer("MAX_PROMPT", 512))
+        config["data"]["prompt_instruction"] = None
         context = integer("MAX_MODEL_LEN", 8192)
         config["agentic"]["max_episode_tokens"] = context
-        inference.update(max_model_len=context, max_num_batched_tokens=integer("PREFILL_TOKENS", 512),
-                         enable_auto_tool_choice=True, tool_call_parser="hermes")
-        config["rollout"]["max_new_tokens"] = integer("MAX_NEW_TOKENS", 128)
-        capacity = integer("EP_CAPACITY", context)
-        for rule in train["plan_overrides"]:
-            implementation = rule.get("replace", {}).get("implementation", {})
-            if implementation.get("_target_", "").endswith("fixed_capacity_ep_compute_fn"):
-                implementation["capacity"] = capacity
-        if capacity < context or capacity < inference["max_num_batched_tokens"]:
-            raise ValueError("EP_CAPACITY must cover a training sequence and inference prefill rows")
+        inference.update(enable_auto_tool_choice=True, tool_call_parser="hermes")
+    else:
+        config["agentic"] = {
+            "runner": "internal", "module_path": "examples.gsm8k.agent", "environment": "gsm8k_tools",
+            "interaction_mode": "single_turn", "max_turns": 1, "max_observation_tokens": 0,
+            "apply_chat_template": False, "max_episode_tokens": None,
+        }
+        config["data"]["prompt_instruction"] = 'Let\'s think step by step and output the final answer after "####".'
+        # Bound Qwen3 reasoning explicitly for the short consistency benchmark.
+        config["data"]["chat_template_kwargs"] = {"enable_thinking": False}
+        context = integer("MAX_MODEL_LEN", 4096)
+        inference.update(enable_auto_tool_choice=False, tool_call_parser=None)
+    config["data"]["max_prompt_length"] = integer("MAX_PROMPT", 512)
+    config["rollout"]["max_new_tokens"] = integer("MAX_NEW_TOKENS", 1024 if runner == "internal" else 128)
+    if config["data"]["max_prompt_length"] + config["rollout"]["max_new_tokens"] > context:
+        raise ValueError("MAX_PROMPT + MAX_NEW_TOKENS must not exceed MAX_MODEL_LEN")
+    inference.update(max_model_len=context, max_num_batched_tokens=integer("PREFILL_TOKENS", 512))
+    capacity = integer("EP_CAPACITY", context)
+    for rule in train["plan_overrides"]:
+        implementation = rule.get("replace", {}).get("implementation", {})
+        if implementation.get("_target_", "").endswith("fixed_capacity_ep_compute_fn"):
+            implementation["capacity"] = capacity
+    if capacity < context or capacity < inference["max_num_batched_tokens"]:
+        raise ValueError("EP_CAPACITY must cover a training sequence and inference prefill rows")
     return config
 
 
@@ -109,6 +123,11 @@ def main() -> None:
         raise ValueError("world must be positive")
     config = configure(yaml.safe_load(args.source.read_text()), args.world)
     args.destination.write_text(yaml.safe_dump(config, sort_keys=False))
+    print("TASK_READY", "runner=", config["agentic"]["runner"],
+          "interaction=", config["agentic"]["interaction_mode"], "data=", config["data"]["train_path"],
+          "max_prompt=", config["data"]["max_prompt_length"],
+          "max_new_tokens=", config["rollout"]["max_new_tokens"],
+          "max_model_len=", config["rollout"]["vllm"]["max_model_len"], flush=True)
     print("CONFIG_READY", args.destination, "training=", config["train"]["accelerator"],
           "rollout=", config["rollout"]["vllm"], flush=True)
 

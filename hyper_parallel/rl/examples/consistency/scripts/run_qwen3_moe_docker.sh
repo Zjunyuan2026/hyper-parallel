@@ -145,7 +145,7 @@ docker run --rm --name "${container}" --privileged --network=host --shm-size="${
         fi
         python -m pip check
         python -m pip freeze > /results/run/environment.txt
-        if [[ "${RUNNER:-codex}" == codex ]]; then
+        if [[ "${RUNNER:-internal}" == codex ]]; then
             [[ "$(codex --version)" == "codex-cli 0.152.1" ]]
             export SHELL=/bin/bash
         fi

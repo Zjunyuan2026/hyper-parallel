@@ -3,7 +3,7 @@
 A3 单节点、8 卡双 die（16 个逻辑设备）的分批执行顺序见
 [A3 测试指南](A3_TEST_GUIDE.md)，覆盖四层预检、完整模型、TP/EP/SP 组合和结果排查。
 
-## 可配置 Codex 与 A3 入口
+## GSM8K 单轮生成与 A3 入口
 
 ### 普通 Git 传递依赖
 
@@ -12,7 +12,8 @@ A3 单节点、8 卡双 die（16 个逻辑设备）的分批执行顺序见
 启动器及 `a3.env` 默认读取仓库内的wheel，无需另外复制，也不需要安装Git LFS。
 代码仍需准备模型和Parquet数据；这些不包含在Git wheel目录中。
 
-在仓库根目录运行。默认执行 Codex GRPO 两步；`RUNNER=internal` 可复现原始单轮路径。
+在仓库根目录运行。默认 `RUNNER=internal`：直接由 vLLM 生成 GSM8K 答案，再做 GRPO 训练，运行两步。
+此路径不启动 Codex、不调用工具、不需要 Codex 登录。`agentic` 是共享配置节名，单轮路径使用内部环境评分。
 本机 910B3 四卡初测与 A3 十六设备验收必须分别记录，裁剪四层的结果不代表完整模型通过。
 
 ```bash
@@ -36,11 +37,49 @@ SP 是 TP 内的 sequence parallel，不是 CP。默认 PIK leaf 数保持8，TP
 `MODEL_LAYERS=0` 使用完整权重，正整数生成独立裁剪权重，不改原始模型。
 每个训练 DP rank 的题数由 `PROMPTS_PER_RANK` 指定，每题候选数由 `CANDIDATES` 指定；
 改变 DP 会改变全局 batch，跨实验对比时应主动保持工作量一致。
-Codex采用仓库现有GSM8K计算任务的简短模型指令、`compact_harness_context`和
+仅在显式 `RUNNER=codex` 时，采用仓库现有GSM8K计算任务的简短模型指令、`compact_harness_context`和
 `exec_command`/`write_stdin`工具白名单，避免通用编码说明占满数学任务上下文。
 这是生成前的显式任务配方，最终配置及原始请求均保存；训练仍使用实际发送给模型的完整上下文，
 不会在采样后裁剪prompt来通过一致性检查。
 `STEPS` 表示每次新运行从零开始的训练步数，不代表恢复 checkpoint。
+
+### A3 完整 MoE，直接运行 GSM8K
+
+使用已通过 A3 探测的派生镜像，不需要为任务切换重新编译镜像。所有命令从仓库根目录、同一个 Bash 终端执行。
+先结束已有测试并确认设备空闲；不要与另一组十六设备任务同时运行。
+
+```bash
+export IMAGE=hyper-rl:consistency-v0.30.0-cann9.2.1-a3-runtime-arm64
+export EXPECTED_IMAGE_ID="$(docker image inspect "$IMAGE" --format '{{.Id}}')"
+export PROFILE="$PWD/hyper_parallel/rl/examples/consistency/configs/a3.env"
+export RUNNER=internal
+export DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export MODEL_LAYERS=0
+export STEPS=2
+export MAX_PROMPT=512
+export MAX_NEW_TOKENS=1024
+export MAX_MODEL_LEN=4096
+export EP_CAPACITY=4096
+export RESULT_ROOT="/home/z00988596/results/consistency/$(date +%Y%m%d-%H%M%S)-gsm8k-internal-full"
+
+TRAIN_TP=4 TRAIN_EP=4 TRAIN_SP=false \
+ROLLOUT_TP=4 ROLLOUT_EP=4 ROLLOUT_SP=false \
+  bash hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_docker.sh
+```
+
+显式设置 `RUNNER=internal` 可覆盖旧终端中残留的 `RUNNER=codex`。
+已有 `prompt` / `extra_info.answer` Parquet 可直接复用，无需重新准备数据。
+启动日志 `TASK_READY` 应显示 `runner= internal`、`interaction= single_turn` 和实际 token 预算。
+单轮模式沿用数据加载器的 chat template，关闭 Qwen3 隐式 thinking，提示模型推理并以 `#### NUMBER` 作答。
+已有 GSM8K 规则从回答末尾提取数值，与隐藏标准答案精确匹配，正确奖励为 1，否则为 0。
+`MAX_PROMPT + MAX_NEW_TOKENS` 不得超过 `MAX_MODEL_LEN`；`EP_CAPACITY` 必须覆盖上下文和 prefill 预算。
+长度、EP 容量设置在单轮和显式 Codex 模式都生效，不改变一致性检查的精确零差异要求。
+
+结果仍保存于 `run/consistency.json`、`run/summary.json`、`run/steps.csv`、`run/steps.jsonl` 和 `run/train.log`。
+查看 `CONSISTENCY_CHECK`、`STEP_SUMMARY`、原始 reward、梯度范数和计时；阶段日志为 `rollout_generate`。
+两步只验证运行与采样 token 的训推一致性，不代表 GSM8K 全测试集准确率。
+同题候选奖励完全相同时，GRPO 优势和梯度可能为零；不会伪造奖励或强制产生非零梯度。
+短输出若频繁未生成最终答案，可以增大 `MAX_NEW_TOKENS`，并同步检查上下文预算。
 
 ### A3 十六设备迁移
 
@@ -92,7 +131,7 @@ PROFILE=hyper_parallel/rl/examples/consistency/configs/a3.env \
 | `run/progress-rank*.json`、`run/events-rank*.jsonl` | 各rank当前阶段与阶段耗时，无额外设备同步 |
 | `run/failure-rank*.json` | Python捕获的rank异常与堆栈 |
 | `run/config.yaml`、`run/environment.txt` | 最终生效配置和依赖版本 |
-| `run/trajectories/` | Codex原始事件、会话与工具证据 |
+| `run/trajectories/` | 仅显式 Codex 模式保存原始事件、会话与工具证据 |
 
 检查 `training/rollout_probs_diff_valid=1`、`training/log_probs_valid_tokens>0`，
 以及 `training/rollout_log_probs_diff_max`、`training/rollout_log_probs_diff_mean` 均为0。

@@ -85,7 +85,7 @@ def run(config: dict[str, Any], report_path: Path) -> None:
 
     # This example adds an observation gate at the existing pre-update boundary.
     trainer.targets.prepare = _checked_prepare
-    for owner, method, stage in ((trainer.rollout_manager, "generate", "codex_or_rollout"),
+    for owner, method, stage in ((trainer.rollout_manager, "generate", "rollout_generate"),
                                  (trainer.targets, "prepare", "recompute_and_consistency"),
                                  (trainer.actor, "update", "actor_update"),
                                  (trainer.publication, "publish", "weight_publish")):
