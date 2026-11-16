@@ -350,3 +350,48 @@ rg 'CONSISTENCY_CHECK|CONSISTENCY_PASS' "$RESULT_ROOT/run/train.log"
 | `run/environment.txt`             | 容器中的 Python 依赖版本   |
 | `run/v4-wheel.sha256`             | 本次使用的 V4 wheel 校验和 |
 | `Qwen3-MoE-4L/crop_manifest.json` | 裁剪权重的来源和校验记录   |
+
+## Repeated runs on A3 108 and 119
+
+From the checkout root, both nodes use `bash run_a3.sh`. The host name is recorded
+automatically. Model/data paths default to `/mnt/share/zjy`; override `MODEL_ROOT`
+and `DATA_ROOT` for local copies. Each invocation creates a new child directory
+under `RESULT_BASE`, or under an inherited `RESULT_ROOT`. Old results are preserved.
+Use `RESULT_BASE=/home/z00988596/results/consistency` for a stable parent directory.
+
+```bash
+git pull --ff-only origin A3_hyper_rl
+bash run_a3.sh --steps 2 --train-tp 4 --train-ep 4 --rollout-tp 4 --rollout-ep 4
+GLOBAL_PROMPT_BATCH_SIZE=16 CANDIDATES=4 MICRO_BATCH_SIZE=2 MAX_NUM_SEQS=4 \
+  bash run_a3.sh --train-tp 2 --train-ep 8 --rollout-tp 4 --rollout-ep 4
+```
+
+`--sp` sets training and rollout together; use `--train-sp` / `--rollout-sp` to
+select them independently. TP is limited to 1/2/4. TP and EP must divide the
+selected device count, and EP must divide the 128 experts. Increasing batch or
+concurrency needs separate memory validation. A fixed global prompt batch must
+divide evenly across training DP (`device_count / TRAIN_TP`). This controls batch
+size only: independent sampled trajectories are not a cross-topology replay test.
+
+| Environment variable | Meaning / default |
+| --- | --- |
+| `GLOBAL_PROMPT_BATCH_SIZE` | Optional global prompt count; overrides per-rank prompts |
+| `PROMPTS_PER_RANK`, `CANDIDATES` | Prompts per training DP rank / responses per prompt; 1 / 2 |
+| `MICRO_BATCH_SIZE`, `RESPONSE_MINI_BATCH_SIZE` | Training micro-batch / mini-batch; 1 / candidates |
+| `MAX_NUM_SEQS`, `KV_CACHE_MEMORY_BYTES` | Inference concurrency / KV bytes; 2 / 536870912 |
+| `MAX_PROMPT`, `MAX_NEW_TOKENS`, `MAX_MODEL_LEN` | 512 / 1024 / 4096 |
+| `EP_CAPACITY`, `PREFILL_TOKENS` | Fixed EP capacity / prefill tokens; 4096 / 512 |
+| `WEIGHT_SYNC_TRANSPORT`, `WEIGHT_BUCKET_MB` | auto / 128; strategy remains full_gather |
+| `IMAGE_ID_FILE`, `IMAGE_ARCHIVE` | Expected ID / exported image archive under shared images |
+
+The launcher checks the expected image ID, loads a missing image from the archive,
+and retains a stopped image-reference container without allocating NPU resources.
+This mitigates deletion by image GC; it does not resolve node disk pressure or
+protect against forced administrative deletion. It never prunes images or changes kubelet.
+
+For the A3 IPC storage error, `--transport hccl` explicitly selects the existing
+HCCL receiver with a locally allocated buffer; `--transport ipc` keeps same-device
+IPC. There is no automatic fallback. HCCL selection is an alternative requiring
+A3 device acceptance, not a proven root-cause fix for IPC. Default `auto` retains
+IPC for colocated execution. Failure messages now include the logical weight name.
+Keep full logs and generated configuration when validating on both nodes.

@@ -96,7 +96,9 @@ if [[ -d "${extra_wheels_dir}" ]]; then
     extra_wheels=(-v "${extra_wheels_dir}:/runtime-wheels:ro")
 fi
 for option in TRAIN_TP TRAIN_EP TRAIN_SP ROLLOUT_TP ROLLOUT_EP ROLLOUT_SP STEPS RUNNER \
-    MODEL_INIT_THREADS PROMPTS_PER_RANK CANDIDATES MAX_PROMPT MAX_MODEL_LEN MAX_NEW_TOKENS EP_CAPACITY PREFILL_TOKENS; do
+    MODEL_INIT_THREADS PROMPTS_PER_RANK CANDIDATES MAX_PROMPT MAX_MODEL_LEN MAX_NEW_TOKENS EP_CAPACITY PREFILL_TOKENS \
+    MICRO_BATCH_SIZE RESPONSE_MINI_BATCH_SIZE GLOBAL_PROMPT_BATCH_SIZE MAX_NUM_SEQS \
+    KV_CACHE_MEMORY_BYTES WEIGHT_SYNC_TRANSPORT WEIGHT_BUCKET_MB; do
     if [[ -v "${option}" ]]; then portable_options+=(-e "${option}=${!option}"); fi
 done
 printf 'RUN_PLAN world=%s devices=%s layers=%s config=%s results=%s\n' "${device_count}" "${devices}" "${model_layers}" "${config}" "${result_root}"
@@ -120,7 +122,7 @@ docker run --rm --name "${container}" --privileged --network=host --shm-size="${
     -v "${repo_root}:/workspace:ro" -v "${model_root}:/models/Qwen3-30B-A3B:ro" \
     -v "${data_root}:/data/gsm8k:ro" -v "${result_root}:/results" \
     -v "${v4_wheel}:/wheels/$(basename -- "${v4_wheel}"):ro" -v "${config}:/run-config.yaml:ro" \
-    -w /workspace "${image}" /bin/bash -c '
+    -w /workspace "${image_id}" /bin/bash -c '
         set -eo pipefail
         phase=environment
         trap '\''rc=$?; printf "CONTAINER_EXIT phase=%s code=%s\n" "$phase" "$rc"; printf "phase=%s\nexit_code=%s\n" "$phase" "$rc" > /results/run/container-status.txt; chown -R "${RESULT_UID}:${RESULT_GID}" /results'\'' EXIT

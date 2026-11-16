@@ -247,7 +247,13 @@ class LogicalWeightLoader:
             self.begin()
         loaded: set[str] = set()
         for name, value in weights:
-            destination_name = self._load_weight(name, value)
+            try:
+                destination_name = self._load_weight(name, value)
+            except RuntimeError as error:
+                raise RuntimeError(
+                    f"Logical weight load failed: name={name}, shape={tuple(value.shape)}, "
+                    f"device={value.device}, dtype={value.dtype}, offset={value.storage_offset()}; {error}"
+                ) from error
             if destination_name is not None:
                 loaded.add(destination_name)
         if implicit:

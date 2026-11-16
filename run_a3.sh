@@ -15,7 +15,10 @@ set -euo pipefail
 usage() {
     cat <<'EOF'
 Usage: bash run_a3.sh [--steps N] [--tp N] [--ep N] [--sp true|false]
-                      [--layers N] [--dry-run]
+                      [--layers N] [--train-tp N] [--rollout-tp N]
+                      [--train-ep N] [--rollout-ep N] [--train-sp BOOL] [--rollout-sp BOOL]
+                      [--micro-batch N] [--prompts N] [--candidates N]
+                      [--transport auto|ipc|hccl] [--dry-run]
 
 Defaults: full Qwen3-30B-A3B, 2 steps, TP4/EP4/SP=false, all 16 logical devices.
 --tp/--ep/--sp set both training and rollout; --layers 0 selects the full model.
@@ -30,6 +33,13 @@ Environment overrides: SHARED_ROOT, MODEL_ROOT, DATA_ROOT, IMAGE,
 EXPECTED_IMAGE_ID, IMAGE_ID_FILE, DEVICES, RESULT_ROOT, MODEL_LAYERS, STEPS,
 TRAIN_TP/EP/SP, ROLLOUT_TP/EP/SP, MAX_PROMPT, MAX_NEW_TOKENS, MAX_MODEL_LEN,
 EP_CAPACITY, PREFILL_TOKENS, PROMPTS_PER_RANK, CANDIDATES.
+RESULT_BASE (or inherited RESULT_ROOT) is a parent directory, not a reusable run.
+Every invocation creates a unique child directory, including host and topology.
+MICRO_BATCH_SIZE, RESPONSE_MINI_BATCH_SIZE, GLOBAL_PROMPT_BATCH_SIZE,
+MAX_NUM_SEQS, KV_CACHE_MEMORY_BYTES, WEIGHT_SYNC_TRANSPORT, WEIGHT_BUCKET_MB
+are also supported. GLOBAL_PROMPT_BATCH_SIZE keeps workload fixed across TP.
+Missing images load from IMAGE_ARCHIVE (default shared images/a3-runtime.tar.gz).
+A stopped image-reference container is retained; no NPU is used by that container.
 Default shared root: /mnt/share/zjy. Results stay on this host.
 EOF
 }
@@ -46,6 +56,8 @@ export TRAIN_TP=${TRAIN_TP:-4} TRAIN_EP=${TRAIN_EP:-4} TRAIN_SP=${TRAIN_SP:-fals
 export ROLLOUT_TP=${ROLLOUT_TP:-4} ROLLOUT_EP=${ROLLOUT_EP:-4} ROLLOUT_SP=${ROLLOUT_SP:-false}
 export MAX_PROMPT=${MAX_PROMPT:-512} MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-1024}
 export MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096} EP_CAPACITY=${EP_CAPACITY:-4096}
+export MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1} MAX_NUM_SEQS=${MAX_NUM_SEQS:-2}
+export WEIGHT_SYNC_TRANSPORT=${WEIGHT_SYNC_TRANSPORT:-auto}
 export PROMPTS_PER_RANK=${PROMPTS_PER_RANK:-1} CANDIDATES=${CANDIDATES:-2}
 # This entry always runs direct GSM8K, without inheriting a Codex runner/profile.
 export RUNNER=internal
@@ -55,6 +67,16 @@ while (( $# )); do
     case "$1" in
         --help|-h) usage; exit 0 ;;
         --dry-run) dry_run=true; shift ;;
+        --train-tp|--train-ep|--train-sp|--rollout-tp|--rollout-ep|--rollout-sp|--micro-batch|--prompts|--candidates|--transport)
+            (( $# >= 2 )) || { printf 'Missing value for %s\n' "$1" >&2; exit 2; }
+            case "$1" in
+                --train-tp) export TRAIN_TP=$2 ;; --train-ep) export TRAIN_EP=$2 ;;
+                --train-sp) export TRAIN_SP=$2 ;; --rollout-tp) export ROLLOUT_TP=$2 ;;
+                --rollout-ep) export ROLLOUT_EP=$2 ;; --rollout-sp) export ROLLOUT_SP=$2 ;;
+                --micro-batch) export MICRO_BATCH_SIZE=$2 ;; --prompts) export PROMPTS_PER_RANK=$2 ;;
+                --candidates) export CANDIDATES=$2 ;; --transport) export WEIGHT_SYNC_TRANSPORT=$2 ;;
+            esac
+            shift 2 ;;
         --steps|--tp|--ep|--sp|--layers)
             (( $# >= 2 )) || { printf 'Missing value for %s\n' "$1" >&2; exit 2; }
             case "$1" in
@@ -77,11 +99,19 @@ for name in TRAIN_SP ROLLOUT_SP; do
         printf '%s must be true or false\n' "$name" >&2; exit 2;
     }
 done
-export RESULT_ROOT=${RESULT_ROOT:-/home/z00988596/results/consistency/$(hostname)/$(date +%Y%m%d-%H%M%S)-gsm8k-$$}
+result_base=${RESULT_BASE:-${RESULT_ROOT:-/home/z00988596/results/consistency}}
+run_name="$(hostname)-$(date +%Y%m%d-%H%M%S)-tp${TRAIN_TP}-ep${TRAIN_EP}-rtp${ROLLOUT_TP}-rep${ROLLOUT_EP}"
+export RESULT_ROOT="${result_base}/${run_name}-$$"
+if ! $dry_run; then
+    mkdir -p -- "$result_base"
+    RESULT_ROOT=$(mktemp -d "${result_base}/${run_name}-XXXXXX")
+    export RESULT_ROOT
+fi
 image_id_file=${IMAGE_ID_FILE:-${SHARED_ROOT}/images/a3-runtime.id}
 for name in IMAGE MODEL_ROOT DATA_ROOT DEVICES RUNNER MODEL_LAYERS STEPS \
     TRAIN_TP TRAIN_EP TRAIN_SP ROLLOUT_TP ROLLOUT_EP ROLLOUT_SP \
-    MAX_PROMPT MAX_NEW_TOKENS MAX_MODEL_LEN EP_CAPACITY PROMPTS_PER_RANK CANDIDATES RESULT_ROOT; do
+    MAX_PROMPT MAX_NEW_TOKENS MAX_MODEL_LEN EP_CAPACITY PROMPTS_PER_RANK CANDIDATES MICRO_BATCH_SIZE MAX_NUM_SEQS \
+    WEIGHT_SYNC_TRANSPORT RESULT_ROOT; do
     printf '%s=%q\n' "$name" "${!name}"
 done
 printf 'IMAGE_ID_FILE=%q\n' "$image_id_file"
@@ -91,8 +121,25 @@ if [[ -z ${EXPECTED_IMAGE_ID:-} ]]; then
         printf 'Missing image ID file: %s; set IMAGE_ID_FILE or EXPECTED_IMAGE_ID\n' "$image_id_file" >&2
         exit 1
     }
-    EXPECTED_IMAGE_ID=$(cat -- "$image_id_file")
+    EXPECTED_IMAGE_ID=$(tr -d '\r\n' < "$image_id_file")
     export EXPECTED_IMAGE_ID
 fi
+[[ $EXPECTED_IMAGE_ID =~ ^sha256:[0-9a-f]{64}$ ]] || { echo 'Invalid expected image ID' >&2; exit 1; }
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    archive=${IMAGE_ARCHIVE:-${SHARED_ROOT}/images/a3-runtime.tar.gz}
+    [[ -r $archive ]] || { printf 'Missing image and archive: %s\n' "$archive" >&2; exit 1; }
+    docker load -i "$archive"
+fi
+actual=$(docker image inspect "$IMAGE" --format '{{.Id}}')
+[[ $actual == "$EXPECTED_IMAGE_ID" ]] || { echo 'Image ID differs from expected ID' >&2; exit 1; }
+keep="hyper-rl-image-keep-${actual#sha256:}"
+if docker container inspect "$keep" >/dev/null 2>&1; then
+    [[ $(docker container inspect "$keep" --format '{{.Image}}') == "$actual" ]] || {
+        echo 'Image-reference container points to another image' >&2; exit 1;
+    }
+else
+    docker create --name "$keep" --entrypoint /bin/true "$actual" >/dev/null
+fi
+printf 'IMAGE_REFERENCE_CONTAINER=%s\n' "$keep"
 # Reuse the existing launcher: image/device guards, read-only inputs and reports.
 exec bash "${repo_root}/hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_docker.sh"

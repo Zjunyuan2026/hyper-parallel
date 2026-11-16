@@ -31,6 +31,29 @@ CONFIGURE = runpy.run_path(str(ROOT / "scripts/configure_run.py"))["configure"]
 class ConfigureRunTests(unittest.TestCase):
     """Keep task selection and token/transport budgets independent of topology."""
 
+    def test_fixed_global_batch_across_tp_and_explicit_transport(self) -> None:
+        """Changing TP preserves an explicitly selected global prompt workload."""
+        for tp in (1, 2, 4):
+            env = {"RUN_MODEL_PATH": "/models/Qwen3-30B-A3B", "TRAIN_TP": str(tp),
+                   "GLOBAL_PROMPT_BATCH_SIZE": "16", "CANDIDATES": "4", "MICRO_BATCH_SIZE": "2",
+                   "WEIGHT_SYNC_TRANSPORT": "hccl", "MAX_NUM_SEQS": "4", "WEIGHT_BUCKET_MB": "64"}
+            with self.subTest(tp=tp), patch.dict(os.environ, env, clear=True):
+                result = CONFIGURE(yaml.safe_load((ROOT / "configs/qwen3_moe_4l_rl.yaml").read_text()), 16)
+                self.assertEqual(result["train"]["prompt_batch_size"] * (16 // tp), 16)
+                self.assertEqual(result["train"]["micro_batch_size"], 2)
+                self.assertEqual(result["rollout"]["vllm"]["weight_sync"]["transport"], "hccl")
+                self.assertEqual(result["rollout"]["vllm"]["max_num_seqs"], 4)
+
+    def test_invalid_batch_and_transport(self) -> None:
+        """Reject uneven global work, invalid micro-batches and unknown transports."""
+        for values in ({"GLOBAL_PROMPT_BATCH_SIZE": "3"}, {"MICRO_BATCH_SIZE": "3"},
+                       {"WEIGHT_SYNC_TRANSPORT": "fallback"}):
+            with self.subTest(values=values), patch.dict(
+                os.environ, {"RUN_MODEL_PATH": "/models/full", **values}, clear=True,
+            ):
+                with self.assertRaises(ValueError):
+                    CONFIGURE(yaml.safe_load((ROOT / "configs/qwen3_moe_4l_rl.yaml").read_text()), 16)
+
     def test_single_turn_removes_external_harness_settings(self) -> None:
         """A reused Codex recipe must not retain a harness or tool parser."""
         config = yaml.safe_load((ROOT / "configs/qwen3_moe_4l_rl.yaml").read_text())

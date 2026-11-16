@@ -1584,6 +1584,7 @@ def build_vllm_engine(
         data_parallel_size=int(vllm_config.get("data_parallel_size", 1)),
         bucket_size_bytes=normalized_weight_sync.bucket_size_bytes,
         strategy=normalized_weight_sync.strategy,
+        transport=normalized_weight_sync.transport,
     )
     return VLLMGenerationEngine(
         model,

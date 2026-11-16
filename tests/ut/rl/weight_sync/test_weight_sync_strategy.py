@@ -79,3 +79,22 @@ def test_removed_fallback_configuration_is_rejected() -> None:
             model_family="qwen3",
             rollout_tp=1,
         )
+
+
+@pytest.mark.parametrize("transport_name", ["ipc", "hccl"])
+def test_colocated_explicit_transport(transport_name):
+    """An explicit transport never silently falls back to the deployment default."""
+    config = resolve_weight_sync_config(
+        {"transport": transport_name}, deployment="colocated", model_family="qwen3", rollout_tp=4,
+    )
+    result = build_weight_publisher("colocated", _rollout_model(), transport=config.transport)
+    assert result.transport.name == transport_name, f"expected={transport_name}, actual={result.transport.name}"
+
+
+@pytest.mark.parametrize("transport_name", ["invalid", "ipc"])
+def test_reject_invalid_disjoint_transport(transport_name):
+    """Unknown names and cross-device IPC fail before runtime allocation."""
+    with pytest.raises(ValueError):
+        resolve_weight_sync_config(
+            {"transport": transport_name}, deployment="disjoint", model_family="qwen3", rollout_tp=4,
+        )

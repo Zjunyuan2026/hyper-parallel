@@ -303,7 +303,7 @@ class WeightPublisher:
 def build_weight_publisher(
     deployment: str, model: VLLMModelRegistration, *, tensor_parallel_size: int = 1,
     data_parallel_size: int = 1, bucket_size_bytes: int = 128 * 2**20,
-    strategy: str = "full_gather",
+    strategy: str = "full_gather", transport: str = "auto",
 ) -> WeightPublisher:
     """Compose one data strategy with the deployment transport."""
     validate_weight_sync_support(
@@ -313,6 +313,12 @@ def build_weight_publisher(
     if data_parallel_size <= 0 or bucket_size_bytes <= 0:
         raise ValueError("Weight-sync DP size and bucket bytes must be positive")
     source = WeightSource(model, bucket_size_bytes)
-    transport_type = IPCWeightTransport if deployment == "colocated" else HCCLWeightTransport
+    if transport not in ("auto", "ipc", "hccl"):
+        raise ValueError("Weight transport must be auto, ipc or hccl")
+    if transport == "ipc" and deployment != "colocated":
+        raise ValueError("IPC weight transport requires colocated deployment")
+    selected_transport = ("ipc" if deployment == "colocated" else "hccl") if transport == "auto" else transport
+    logger.info("Weight publication transport=%s deployment=%s", selected_transport, deployment)
+    transport_type = IPCWeightTransport if selected_transport == "ipc" else HCCLWeightTransport
     transport = transport_type(data_parallel_size=data_parallel_size, tensor_parallel_size=tensor_parallel_size)
     return WeightPublisher(source, transport)

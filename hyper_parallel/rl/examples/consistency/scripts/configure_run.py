@@ -59,10 +59,27 @@ def configure(config: dict, world: int) -> dict:
     train["model_init_cpu_threads"] = integer("MODEL_INIT_THREADS", 8)
     accelerator["activation_checkpoint"] = "full"
     train["prompt_batch_size"] = integer("PROMPTS_PER_RANK", 1)
-    train["micro_batch_size"] = 1
+    global_prompts = os.environ.get("GLOBAL_PROMPT_BATCH_SIZE")
+    dp_size = world // train_tp
+    if global_prompts is not None:
+        global_prompts = integer("GLOBAL_PROMPT_BATCH_SIZE", 1)
+        if global_prompts % dp_size:
+            raise ValueError("GLOBAL_PROMPT_BATCH_SIZE must be divisible by training DP size")
+        train["prompt_batch_size"] = global_prompts // dp_size
+    train["micro_batch_size"] = integer("MICRO_BATCH_SIZE", 1)
     candidates = integer("CANDIDATES", 2)
     config["rollout"]["num_return_sequences"] = candidates
-    train["response_mini_batch_size"] = candidates
+    train["response_mini_batch_size"] = integer("RESPONSE_MINI_BATCH_SIZE", candidates)
+    responses = train["prompt_batch_size"] * candidates
+    mini = train["response_mini_batch_size"]
+    if responses % mini or mini % train["micro_batch_size"]:
+        raise ValueError("Responses per rank must divide into mini-batches and mini-batches into micro-batches")
+    transport = os.environ.get("WEIGHT_SYNC_TRANSPORT", "auto")
+    if transport not in ("auto", "ipc", "hccl"):
+        raise ValueError("WEIGHT_SYNC_TRANSPORT must be auto, ipc or hccl")
+    inference["weight_sync"].update(transport=transport, bucket_size_mb=integer("WEIGHT_BUCKET_MB", 128))
+    inference["max_num_seqs"] = integer("MAX_NUM_SEQS", 2)
+    inference["kv_cache_memory_bytes"] = integer("KV_CACHE_MEMORY_BYTES", 536870912)
     config["data"]["max_train_samples"] = max(4, world // train_tp * train["prompt_batch_size"])
     config["logging"]["log_steps"] = 1
     config["logging"]["log_samples"] = 2
