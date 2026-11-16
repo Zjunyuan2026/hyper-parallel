@@ -218,6 +218,45 @@ def _join_hccl_group(
     )
 
 
+
+def init_colocated_packed_weight_group(
+    worker: Any, *, group_id: str, master_address: str, master_port: int,
+    world_size: int, receiver_devices: list, producer_device: Any,
+) -> dict[str, Any]:
+    """Join only the receiver subset whose devices differ from the producer."""
+    topology = _rollout_worker_topology(worker)
+    physical = topology["physical_device_id"]
+    if (producer_device in receiver_devices or len(set(receiver_devices)) != len(receiver_devices)
+            or world_size != 1 + len(receiver_devices)):
+        raise ValueError("Colocated HCCL group must have a unique device for every rank")
+    active = physical in receiver_devices
+    rank = 1 + receiver_devices.index(physical) if active else -1
+    if active:
+        _join_hccl_group(
+            worker, attribute="_rl_packed_weight_groups", group_id=group_id,
+            master_address=master_address, master_port=master_port,
+            receiver_rank=rank, world_size=world_size,
+        )
+    return {"joined": active, "group_rank": rank, "dp_rank": topology["dp_rank"],
+            "tp_rank": topology["tp_rank"], "physical_device_id": physical}
+
+
+def receive_colocated_packed_weights(
+    worker: Any, *, group_id: str, receiver_devices: list, metadata: list,
+    total_bytes: int, policy_version: int,
+) -> dict[str, Any]:
+    """Keep inactive workers out of the collective while preserving full acknowledgement coverage."""
+    topology = _rollout_worker_topology(worker)
+    physical = topology["physical_device_id"]
+    _validate_update(worker, policy_version, transport="Colocated HCCL")
+    if physical not in receiver_devices:
+        return _receive_ack(topology, 0, physical_device_id=physical)
+    reply = receive_packed_weights(
+        worker, group_id=group_id, metadata=metadata, total_bytes=total_bytes, policy_version=policy_version,
+    )
+    return {**reply, "physical_device_id": physical}
+
+
 def _target_tp_rank(value: int, tensor_parallel_size: int) -> int:
     """Validate and return one direct destination TP rank."""
     target = int(value)
@@ -748,6 +787,8 @@ def _patch_dp_weight_rpc() -> None:
         "get_policy_version",
         "get_unified_numerical_policy",
         "receive_ipc_packed_weights",
+        "init_colocated_packed_weight_group",
+        "receive_colocated_packed_weights",
     ))
 
     async def collective_rpc_async(
@@ -775,6 +816,8 @@ def install_vllm_weight_sync_hooks(*, private_lifecycle: bool = True) -> None:
     for name, method in (
         ("get_unified_numerical_policy", get_unified_numerical_policy),
         ("init_packed_weight_group", init_packed_weight_group),
+        ("init_colocated_packed_weight_group", init_colocated_packed_weight_group),
+        ("receive_colocated_packed_weights", receive_colocated_packed_weights),
         ("receive_ipc_packed_weights", receive_ipc_packed_weights),
         ("receive_packed_weights", receive_packed_weights),
     ):

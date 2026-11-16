@@ -30,6 +30,7 @@ import torch.distributed as dist
 
 from rl.weight_sync.config import validate_weight_sync_support
 from rl.weight_sync.hccl import HCCLWeightTransport
+from rl.weight_sync.colocated_hccl import ColocatedHCCLWeightTransport
 from rl.weight_sync.ipc import IPCContext, IPCWeightTransport
 from rl.weight_sync.model_adapter import alias_tied_embeddings, build_model_weight_adapter
 from rl.weight_sync.packed_weight import (
@@ -315,14 +316,12 @@ def build_weight_publisher(
     source = WeightSource(model, bucket_size_bytes)
     if transport not in ("auto", "ipc", "hccl"):
         raise ValueError("Weight transport must be auto, ipc or hccl")
-    if transport == "hccl" and deployment == "colocated":
-        raise ValueError(
-            "Colocated HCCL weight transfer is unsupported: Actor and rollout share a device; use ipc"
-        )
     if transport == "ipc" and deployment != "colocated":
         raise ValueError("IPC weight transport requires colocated deployment")
     selected_transport = ("ipc" if deployment == "colocated" else "hccl") if transport == "auto" else transport
     logger.info("Weight publication transport=%s deployment=%s", selected_transport, deployment)
     transport_type = IPCWeightTransport if selected_transport == "ipc" else HCCLWeightTransport
+    if selected_transport == "hccl" and deployment == "colocated":
+        transport_type = ColocatedHCCLWeightTransport
     transport = transport_type(data_parallel_size=data_parallel_size, tensor_parallel_size=tensor_parallel_size)
     return WeightPublisher(source, transport)

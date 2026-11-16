@@ -21,6 +21,7 @@ from rl.workers.engine.model import ModelRegistration, resolve_vllm_model
 import rl.weight_sync.transfer as weight_sync
 from rl.weight_sync.config import resolve_weight_sync_config
 from rl.weight_sync.transfer import build_weight_publisher
+from rl.weight_sync.colocated_hccl import ColocatedHCCLWeightTransport
 
 
 def _rollout_model():
@@ -100,14 +101,13 @@ def test_reject_invalid_disjoint_transport(transport_name):
         )
 
 
-def test_colocated_hccl_rejected_at_config_and_factory():
-    """A producer cannot join all colocated receivers on a unique device."""
-    with pytest.raises(ValueError, match="Actor and rollout share a device"):
-        resolve_weight_sync_config(
-            {"transport": "hccl"}, deployment="colocated", model_family="qwen3", rollout_tp=4,
-        )
-    with pytest.raises(ValueError, match="Actor and rollout share a device"):
-        build_weight_publisher("colocated", _rollout_model(), transport="hccl")
+def test_colocated_hccl_uses_device_unique_routes():
+    """Colocated HCCL uses the dedicated route planner, not the disjoint group."""
+    config = resolve_weight_sync_config(
+        {"transport": "hccl"}, deployment="colocated", model_family="qwen3", rollout_tp=4,
+    )
+    result = build_weight_publisher("colocated", _rollout_model(), transport=config.transport)
+    assert isinstance(result.transport, ColocatedHCCLWeightTransport), f"actual={type(result.transport)}"
 
 
 def test_disjoint_explicit_hccl_preserved():

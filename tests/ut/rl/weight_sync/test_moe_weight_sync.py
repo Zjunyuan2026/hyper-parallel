@@ -135,9 +135,10 @@ class TestMoEWeightSync(unittest.TestCase):
             vllm_worker._patch_dp_weight_rpc()
             self.assertIs(Client.collective_rpc_async, installed)
             client = Client()
-            results = asyncio.run(client.collective_rpc_async("get_policy_version"))
-            self.assertEqual(results, [{'engine': 0, 'method': "get_policy_version"},
-                                       {'engine': 1, 'method': "get_policy_version"}])
+            for method in ("get_policy_version", "init_colocated_packed_weight_group",
+                           "receive_colocated_packed_weights"):
+                results = asyncio.run(client.collective_rpc_async(method))
+                self.assertEqual(results, [{'engine': 0, 'method': method}, {'engine': 1, 'method': method}])
             self.assertEqual(asyncio.run(client.collective_rpc_async("other")), ["original", "other"])
 
     def test_native_expert_map_rejects_duplicate_local_ids(self) -> None:
