@@ -5,6 +5,44 @@ A3 单节点、8 卡双 die（16 个逻辑设备）的分批执行顺序见
 
 ## GSM8K 单轮生成与 A3 入口
 
+### 共享区 A3 一条命令启动
+
+在仓库根目录执行 [run_a3.sh](../../../../run_a3.sh)：
+
+```bash
+bash run_a3.sh
+```
+
+默认加载完整 Qwen3-30B-A3B，运行两步 GSM8K，使用全部 16 个逻辑设备；训练和推理均为
+TP4、EP4、SP 关闭，不接入 Codex。模型读取 `/mnt/share/zjy/models/Qwen3-30B-A3B`，
+数据读取 `/mnt/share/zjy/datasets/gsm8k/prepared`；输入在容器中只读挂载。
+镜像使用 `hyper-rl:consistency-v0.30.0-cann9.2.1-a3-runtime-arm64`，需要提前在本机导入。
+通过共享文件 `/mnt/share/zjy/images/a3-runtime.id` 校验镜像身份，缺失或不匹配时停止。
+结果保存到本机 `/home/z00988596/results/consistency/<主机名>/<时间>-gsm8k-<进程号>`。
+
+```bash
+# 只查看配置，不启动容器、不占用设备
+bash run_a3.sh --dry-run
+
+# 修改步数，以及训练和推理共同的 TP/EP/SP
+bash run_a3.sh --steps 10 --tp 2 --ep 8 --sp true
+
+# 单独改变推理并行组合，训练仍为默认 TP4/EP4/SP=false
+ROLLOUT_TP=2 ROLLOUT_EP=8 bash run_a3.sh
+
+# 四层预检；默认 --layers 0 表示完整模型
+bash run_a3.sh --layers 4
+
+# 修改输出长度，并同步扩大上下文与 EP 容量
+MAX_NEW_TOKENS=4096 MAX_MODEL_LEN=8192 EP_CAPACITY=8192 bash run_a3.sh
+```
+
+`SHARED_ROOT`、`MODEL_ROOT`、`DATA_ROOT`、`DEVICES`、`RESULT_ROOT` 和采样数量等可通过环境变量覆盖；
+运行 `bash run_a3.sh --help` 查看用法。快捷入口忽略继承的 `PROFILE` 并固定 `RUNNER=internal`。
+默认每个训练 DP rank 一题、每题两个候选，为两步小批量验证，不代表完整 GSM8K 评测。
+原有镜像校验、设备空闲检查、严格一致性检查、reward/梯度/耗时日志继续由原启动器执行。
+`--dry-run` 只展示参数，不验证并行组合或证明 A3 实机通过。
+
 ### 普通 Git 传递依赖
 
 仓库内的 `wheels/` 保存V4补丁和 `runtime/` 中的PEFT、Accelerate wheel，使用普通Git二进制文件，
