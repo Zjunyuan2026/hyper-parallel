@@ -81,7 +81,7 @@ def test_removed_fallback_configuration_is_rejected() -> None:
         )
 
 
-@pytest.mark.parametrize("transport_name", ["ipc", "hccl"])
+@pytest.mark.parametrize("transport_name", ["ipc"])
 def test_colocated_explicit_transport(transport_name):
     """An explicit transport never silently falls back to the deployment default."""
     config = resolve_weight_sync_config(
@@ -98,3 +98,22 @@ def test_reject_invalid_disjoint_transport(transport_name):
         resolve_weight_sync_config(
             {"transport": transport_name}, deployment="disjoint", model_family="qwen3", rollout_tp=4,
         )
+
+
+def test_colocated_hccl_rejected_at_config_and_factory():
+    """A producer cannot join all colocated receivers on a unique device."""
+    with pytest.raises(ValueError, match="Actor and rollout share a device"):
+        resolve_weight_sync_config(
+            {"transport": "hccl"}, deployment="colocated", model_family="qwen3", rollout_tp=4,
+        )
+    with pytest.raises(ValueError, match="Actor and rollout share a device"):
+        build_weight_publisher("colocated", _rollout_model(), transport="hccl")
+
+
+def test_disjoint_explicit_hccl_preserved():
+    """The existing separate-device HCCL route remains available."""
+    config = resolve_weight_sync_config(
+        {"transport": "hccl"}, deployment="disjoint", model_family="qwen3", rollout_tp=4,
+    )
+    result = build_weight_publisher("disjoint", _rollout_model(), transport=config.transport)
+    assert result.transport.name == "hccl", f"actual={result.transport.name}"

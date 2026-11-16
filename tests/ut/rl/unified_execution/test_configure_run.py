@@ -36,12 +36,12 @@ class ConfigureRunTests(unittest.TestCase):
         for tp in (1, 2, 4):
             env = {"RUN_MODEL_PATH": "/models/Qwen3-30B-A3B", "TRAIN_TP": str(tp),
                    "GLOBAL_PROMPT_BATCH_SIZE": "16", "CANDIDATES": "4", "MICRO_BATCH_SIZE": "2",
-                   "WEIGHT_SYNC_TRANSPORT": "hccl", "MAX_NUM_SEQS": "4", "WEIGHT_BUCKET_MB": "64"}
+                   "WEIGHT_SYNC_TRANSPORT": "ipc", "MAX_NUM_SEQS": "4", "WEIGHT_BUCKET_MB": "64"}
             with self.subTest(tp=tp), patch.dict(os.environ, env, clear=True):
                 result = CONFIGURE(yaml.safe_load((ROOT / "configs/qwen3_moe_4l_rl.yaml").read_text()), 16)
                 self.assertEqual(result["train"]["prompt_batch_size"] * (16 // tp), 16)
                 self.assertEqual(result["train"]["micro_batch_size"], 2)
-                self.assertEqual(result["rollout"]["vllm"]["weight_sync"]["transport"], "hccl")
+                self.assertEqual(result["rollout"]["vllm"]["weight_sync"]["transport"], "ipc")
                 self.assertEqual(result["rollout"]["vllm"]["max_num_seqs"], 4)
 
     def test_invalid_batch_and_transport(self) -> None:

@@ -38,8 +38,15 @@ class A3EntryTests(unittest.TestCase):
 
     def test_independent_train_rollout_options(self) -> None:
         result = subprocess.run(["bash", str(ROOT / "run_a3.sh"), "--dry-run", "--train-tp", "2",
-                                 "--rollout-tp", "4", "--train-ep", "8", "--transport", "hccl"],
+                                 "--rollout-tp", "4", "--train-ep", "8", "--transport", "ipc"],
                                 capture_output=True, text=True, check=True)
         self.assertIn("TRAIN_TP=2\n", result.stdout)
         self.assertIn("ROLLOUT_TP=4\n", result.stdout)
         self.assertIn("TRAIN_EP=8\n", result.stdout)
+
+    def test_colocated_hccl_fails_before_docker_or_result_creation(self) -> None:
+        """Reject the shared-device HCCL topology before starting a costly run."""
+        result = subprocess.run(["bash", str(ROOT / "run_a3.sh"), "--transport", "hccl"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Actor and rollout share a device", result.stderr)

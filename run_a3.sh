@@ -18,7 +18,7 @@ Usage: bash run_a3.sh [--steps N] [--tp N] [--ep N] [--sp true|false]
                       [--layers N] [--train-tp N] [--rollout-tp N]
                       [--train-ep N] [--rollout-ep N] [--train-sp BOOL] [--rollout-sp BOOL]
                       [--micro-batch N] [--prompts N] [--candidates N]
-                      [--transport auto|ipc|hccl] [--dry-run]
+                      [--transport auto|ipc] [--dry-run]
 
 Defaults: full Qwen3-30B-A3B, 2 steps, TP4/EP4/SP=false, all 16 logical devices.
 --tp/--ep/--sp set both training and rollout; --layers 0 selects the full model.
@@ -99,6 +99,10 @@ for name in TRAIN_SP ROLLOUT_SP; do
         printf '%s must be true or false\n' "$name" >&2; exit 2;
     }
 done
+if [[ $WEIGHT_SYNC_TRANSPORT == hccl ]]; then
+    printf 'Colocated HCCL weight transfer is unsupported: Actor and rollout share a device; use --transport ipc\n' >&2
+    exit 2
+fi
 result_base=${RESULT_BASE:-${RESULT_ROOT:-/home/z00988596/results/consistency}}
 run_name="$(hostname)-$(date +%Y%m%d-%H%M%S)-tp${TRAIN_TP}-ep${TRAIN_EP}-rtp${ROLLOUT_TP}-rep${ROLLOUT_EP}"
 export RESULT_ROOT="${result_base}/${run_name}-$$"

@@ -389,9 +389,10 @@ and retains a stopped image-reference container without allocating NPU resources
 This mitigates deletion by image GC; it does not resolve node disk pressure or
 protect against forced administrative deletion. It never prunes images or changes kubelet.
 
-For the A3 IPC storage error, `--transport hccl` explicitly selects the existing
-HCCL receiver with a locally allocated buffer; `--transport ipc` keeps same-device
-IPC. There is no automatic fallback. HCCL selection is an alternative requiring
-A3 device acceptance, not a proven root-cause fix for IPC. Default `auto` retains
-IPC for colocated execution. Failure messages now include the logical weight name.
-Keep full logs and generated configuration when validating on both nodes.
+Colocated runs accept `--transport ipc` or the equivalent default `auto`.
+`--transport hccl` is rejected before Docker startup: the existing HCCL route
+adds one Actor producer to every rollout worker, so the producer and one receiver
+share a device. This route is retained only for disjoint deployments with separate
+devices. It is not an A3 IPC workaround. No automatic transport fallback occurs.
+The original A3 IPC storage error remains unresolved; preserve full logs and the
+logical weight name in failure messages when validating on both nodes.
