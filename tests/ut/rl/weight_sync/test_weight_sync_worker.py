@@ -249,9 +249,13 @@ def test_worker_receives_ipc_packed_weights_through_model_loader(
             current_stream=lambda: SimpleNamespace(synchronize=lambda: events.append("sync"))
         ),
     )
+    monkeypatch.setattr(
+        worker_module, "copy_malloc_ipc",
+        lambda _args, _key: source.view(torch.uint8).view(-1).clone(),
+    )
     worker = _receive_worker()
     payload = {
-        "ipc_handles": {"host-4": [None] * 7 + [b"test-handle", 16] + [None] * 6},
+        "ipc_handles": {"host-4": [None] * 7 + [b"\x01c" + b"x" * 65, 16] + [None] * 6},
         "metadata": _packed_metadata(),
         "total_bytes": 16,
         "worker_topology": [{
