@@ -107,6 +107,7 @@ docker run --rm --name "${container}" --privileged --network=host --shm-size="${
     "${portable_options[@]}" "${extra_wheels[@]}" -e "DEVICE_COUNT=${device_count}" -e "MODEL_LAYERS=${model_layers}" \
     -e "TZ=${TZ:-Asia/Shanghai}" \
     -e "RUN_TIMEOUT=${RUN_TIMEOUT:-14400}" -e PYTHONUNBUFFERED=1 \
+    -e HYPER_RL_DIAGNOSTICS_DIR=/results/run \
     -e "ASCEND_RT_VISIBLE_DEVICES=${devices}" -e PYTHONDONTWRITEBYTECODE=1 \
     -e HCCL_DETERMINISTIC=true -e OMP_NUM_THREADS=1 -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
     -e VLLM_HOST_IP=127.0.0.1 -e GLOO_SOCKET_IFNAME=lo \

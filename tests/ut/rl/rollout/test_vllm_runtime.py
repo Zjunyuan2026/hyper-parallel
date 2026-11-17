@@ -63,6 +63,59 @@ def _settings(collect_log_probs: bool = True) -> GenerationSettings:
     )
 
 
+def test_http_timeout_diagnostic_precedes_cancellation_and_preserves_exception(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any,
+) -> None:
+    """The failing parent records active siblings before dispatcher cleanup starts."""
+    monkeypatch.setenv("HYPER_RL_DIAGNOSTICS_DIR", str(tmp_path))
+    monkeypatch.setenv("RANK", "0")
+    (tmp_path / "progress-rank0.json").write_text('{"step": 1}')
+    client = vllm_module.VLLMHTTPClient(None, "http://127.0.0.1:8100", "qwen", 600)
+    original = RuntimeError("TimeoutError: TimeoutError(); request_timeout=600s")
+    cancelled = []
+
+    async def request(_method: str, _route: str, payload: dict) -> dict:
+        token = payload["prompt"][0][0]
+        if token == 1:
+            return {"choices": [{"index": 0, "token_ids": [9], "finish_reason": "stop"}]}
+        if token == 2:
+            await asyncio.sleep(0.01)
+            raise original
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.append((tmp_path / "rollout-failure.json").exists())
+            raise
+        return {}
+
+    monkeypatch.setattr(client, "_request_async", request)
+    settings = _settings(collect_log_probs=False)
+    requests = client._completion_requests([[1], [2], [3]], settings, 3, False)
+    with pytest.raises(RuntimeError) as caught:
+        asyncio.run(client._dispatch_completion_requests(requests, 3, settings, 3))
+    assert caught.value is original
+    assert cancelled == [True]
+    report = json.loads((tmp_path / "rollout-failure.json").read_text())
+    assert report["counts"] == {"completed": 1, "failed": 1, "waiting": 1}
+
+
+def test_async_timeout_retains_empty_exception_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Empty asyncio timeout text remains distinguishable from other transport failures."""
+    class Response:
+        async def __aenter__(self) -> Any:
+            raise asyncio.TimeoutError()
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+    client = vllm_module.VLLMHTTPClient(None, "http://127.0.0.1:8100", "qwen", 600)
+    client._async_session = SimpleNamespace(request=lambda *_args, **_kwargs: Response())
+    monkeypatch.setattr(vllm_module, "_load_aiohttp", lambda: SimpleNamespace(ClientError=OSError))
+    with pytest.raises(RuntimeError, match="TimeoutError.*request_timeout=600s") as caught:
+        asyncio.run(client._request_async("POST", "v1/completions", {}))
+    assert isinstance(caught.value.__cause__, asyncio.TimeoutError)
+
+
 def test_vllm_completion_preserves_payload_and_choice_order() -> None:
     """Completion payload settings and out-of-order choices retain token logprobs."""
     client = vllm_module._VLLMHTTPClient(None, "http://127.0.0.1:8100", "qwen", 1)

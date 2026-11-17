@@ -41,6 +41,7 @@ from rl.workers.engine.model import (
     resolve_vllm_model,
 )
 from rl.rollout.base import GenerationRequest, GenerationResult
+from rl.rollout.diagnostics import RolloutDiagnostics
 from rl.rollout.router_capture import (
     RouterCaptureSpec,
     decode_router_trace,
@@ -132,6 +133,9 @@ class VLLMHTTPClient(VLLMWeightSyncClientMixin):
         self._async_session: Optional[Any] = None
         self._async_connection_limit = 0
         self._async_startup_error: Optional[BaseException] = None
+        self._diagnostics = RolloutDiagnostics(self._base_url, request_timeout)
+        if process is not None and self._diagnostics.directory is not None:
+            self._diagnostics.register_server(process.pid)
 
     async def _create_async_session(self, connection_limit: int) -> None:
         """Create the persistent generation transport on its owning event loop."""
@@ -250,7 +254,10 @@ class VLLMHTTPClient(VLLMWeightSyncClientMixin):
                 body = await response.read()
                 status = response.status
         except (aiohttp.ClientError, asyncio.TimeoutError) as error:
-            raise RuntimeError(f"vLLM HTTP {method} {route} failed: {error}") from error
+            raise RuntimeError(
+                f"vLLM HTTP {method} {route} failed: {type(error).__name__}: {error!r}; "
+                f"request_timeout={self._request_timeout}s"
+            ) from error
         if status >= 400:
             message = body.decode("utf-8", errors="replace")
             raise RuntimeError(
@@ -458,13 +465,17 @@ class VLLMHTTPClient(VLLMWeightSyncClientMixin):
             settings,
             request.num_choices,
         )
-        result = await self._request_async("POST", "v1/completions", payload)
-        return self._completion_records_from_response(
-            request.prompts,
-            request.num_choices,
-            settings,
-            result,
-        )
+        identifier = self._diagnostics.admit(request, settings.max_new_tokens)
+        try:
+            result = await self._request_async("POST", "v1/completions", payload)
+            records = self._completion_records_from_response(
+                request.prompts, request.num_choices, settings, result,
+            )
+        except Exception as error:
+            self._diagnostics.finish(identifier, error)
+            raise
+        self._diagnostics.finish(identifier)
+        return records
 
     @staticmethod
     def _completion_requests(
@@ -536,6 +547,7 @@ class VLLMHTTPClient(VLLMWeightSyncClientMixin):
         child_capacity: int,
     ) -> list[_CompletionRecord]:
         """Run a child-bounded rolling pool and restore stable output row order."""
+        self._diagnostics.start_batch(len(requests))
         results: list[Optional[_CompletionRecord]] = [None] * row_count
         pending = deque(requests)
         active: dict[asyncio.Task, _CompletionRequest] = {}
@@ -628,6 +640,7 @@ class VLLMHTTPClient(VLLMWeightSyncClientMixin):
 
     def close(self) -> None:
         """Terminate the server and all EngineCore descendants."""
+        self._diagnostics.close()
         runtime_error = None
         try:
             self._close_async_runtime()
