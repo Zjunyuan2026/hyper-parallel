@@ -114,13 +114,13 @@ def configure(config: dict, world: int) -> dict:
         config["data"]["prompt_instruction"] = 'Let\'s think step by step and output the final answer after "####".'
         # Bound Qwen3 reasoning explicitly for the short consistency benchmark.
         config["data"]["chat_template_kwargs"] = {"enable_thinking": False}
-        context = integer("MAX_MODEL_LEN", 4096)
+        context = integer("MAX_MODEL_LEN", 256)
         inference.update(enable_auto_tool_choice=False, tool_call_parser=None)
-    config["data"]["max_prompt_length"] = integer("MAX_PROMPT", 512)
-    config["rollout"]["max_new_tokens"] = integer("MAX_NEW_TOKENS", 1024 if runner == "internal" else 128)
+    config["data"]["max_prompt_length"] = integer("MAX_PROMPT", 128 if runner == "internal" else 512)
+    config["rollout"]["max_new_tokens"] = integer("MAX_NEW_TOKENS", 32 if runner == "internal" else 128)
     if config["data"]["max_prompt_length"] + config["rollout"]["max_new_tokens"] > context:
         raise ValueError("MAX_PROMPT + MAX_NEW_TOKENS must not exceed MAX_MODEL_LEN")
-    inference.update(max_model_len=context, max_num_batched_tokens=integer("PREFILL_TOKENS", 512))
+    inference.update(max_model_len=context, max_num_batched_tokens=integer("PREFILL_TOKENS", 128 if runner == "internal" else 512))
     capacity = integer("EP_CAPACITY", context)
     for rule in train["plan_overrides"]:
         implementation = rule.get("replace", {}).get("implementation", {})

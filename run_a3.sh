@@ -21,6 +21,7 @@ Usage: bash run_a3.sh [--steps N] [--tp N] [--ep N] [--sp true|false]
                       [--transport auto|ipc] [--dry-run]
 
 Defaults: full Qwen3-30B-A3B, 2 steps, TP4/EP4/SP=false, all 16 logical devices.
+Each candidate generates at most 32 tokens for consistency validation.
 --tp/--ep/--sp set both training and rollout; --layers 0 selects the full model.
 --dry-run prints settings without starting Docker or accessing devices.
 
@@ -55,8 +56,9 @@ export MODEL_LAYERS=${MODEL_LAYERS:-0}
 export STEPS=${STEPS:-2}
 export TRAIN_TP=${TRAIN_TP:-4} TRAIN_EP=${TRAIN_EP:-4} TRAIN_SP=${TRAIN_SP:-false}
 export ROLLOUT_TP=${ROLLOUT_TP:-4} ROLLOUT_EP=${ROLLOUT_EP:-4} ROLLOUT_SP=${ROLLOUT_SP:-false}
-export MAX_PROMPT=${MAX_PROMPT:-512} MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-1024}
-export MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096} EP_CAPACITY=${EP_CAPACITY:-4096}
+export MAX_PROMPT=${MAX_PROMPT:-128} MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-32}
+export MAX_MODEL_LEN=${MAX_MODEL_LEN:-256} EP_CAPACITY=${EP_CAPACITY:-256}
+export PREFILL_TOKENS=${PREFILL_TOKENS:-128}
 export MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1} MAX_NUM_SEQS=${MAX_NUM_SEQS:-2}
 export GENERATION_TIMEOUT=${GENERATION_TIMEOUT:-1800}
 export WEIGHT_SYNC_TRANSPORT=${WEIGHT_SYNC_TRANSPORT:-auto}
@@ -117,7 +119,7 @@ image_id_file=${IMAGE_ID_FILE:-${SHARED_ROOT}/images/a3-runtime.id}
 for name in IMAGE MODEL_ROOT DATA_ROOT DEVICES RUNNER MODEL_LAYERS STEPS \
     TRAIN_TP TRAIN_EP TRAIN_SP ROLLOUT_TP ROLLOUT_EP ROLLOUT_SP \
     MAX_PROMPT MAX_NEW_TOKENS MAX_MODEL_LEN EP_CAPACITY PROMPTS_PER_RANK CANDIDATES MICRO_BATCH_SIZE MAX_NUM_SEQS \
-    WEIGHT_SYNC_TRANSPORT GENERATION_TIMEOUT RESULT_ROOT; do
+    WEIGHT_SYNC_TRANSPORT GENERATION_TIMEOUT PREFILL_TOKENS RESULT_ROOT; do
     printf '%s=%q\n' "$name" "${!name}"
 done
 printf 'IMAGE_ID_FILE=%q\n' "$image_id_file"

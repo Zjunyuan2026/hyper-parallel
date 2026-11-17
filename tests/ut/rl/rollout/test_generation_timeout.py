@@ -110,6 +110,8 @@ class TestGenerationTimeout(unittest.TestCase):
             result = subprocess.run(["bash", str(root / "run_a3.sh"), "--dry-run"],
                                     env=env, text=True, capture_output=True, check=True)
             self.assertIn(f"GENERATION_TIMEOUT={expected}\n", result.stdout)
+            if "MAX_NEW_TOKENS" not in env:
+                self.assertIn("MAX_NEW_TOKENS=32\n", result.stdout)
 
     def test_recipe_keeps_control_timeout_and_sampling_settings(self) -> None:
         root = Path(__file__).resolve().parents[4]
@@ -118,4 +120,19 @@ class TestGenerationTimeout(unittest.TestCase):
             config = configure(yaml.safe_load(path.read_text()), 16)
         self.assertEqual(config["rollout"]["vllm"]["generation_timeout"], 1800)
         self.assertEqual(config["rollout"]["vllm"]["request_timeout"], 600)
+        self.assertEqual(config["rollout"]["max_new_tokens"], 32)
+        self.assertEqual(config["data"]["max_prompt_length"], 128)
+        self.assertEqual(config["rollout"]["vllm"]["max_model_len"], 256)
+        self.assertEqual(config["rollout"]["vllm"]["max_num_batched_tokens"], 128)
+        capacities = [rule["replace"]["implementation"]["capacity"]
+                      for rule in config["train"]["plan_overrides"]
+                      if "capacity" in rule.get("replace", {}).get("implementation", {})]
+        self.assertEqual(capacities, [256])
+
+    def test_explicit_long_generation_remains_available(self) -> None:
+        root = Path(__file__).resolve().parents[4]
+        path = root / "hyper_parallel/rl/examples/consistency/configs/qwen3_moe_4l_rl.yaml"
+        with patch.dict(os.environ, {"RUN_MODEL_PATH": "/models/full", "MAX_NEW_TOKENS": "1024",
+                                   "MAX_MODEL_LEN": "4096", "EP_CAPACITY": "4096"}, clear=True):
+            config = configure(yaml.safe_load(path.read_text()), 16)
         self.assertEqual(config["rollout"]["max_new_tokens"], 1024)

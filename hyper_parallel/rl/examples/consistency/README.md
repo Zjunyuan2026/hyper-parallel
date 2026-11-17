@@ -39,7 +39,12 @@ MAX_NEW_TOKENS=4096 MAX_MODEL_LEN=8192 EP_CAPACITY=8192 bash run_a3.sh
 
 `SHARED_ROOT`、`MODEL_ROOT`、`DATA_ROOT`、`DEVICES`、`RESULT_ROOT` 和采样数量等可通过环境变量覆盖；
 运行 `bash run_a3.sh --help` 查看用法。快捷入口忽略继承的 `PROFILE` 并固定 `RUNNER=internal`。
-默认每个训练 DP rank 一题、每题两个候选，为两步小批量验证，不代表完整 GSM8K 评测。
+默认每个训练 DP rank 一题、每题两个候选，每个候选最多生成 32 token。
+16 设备 TP4 时共四题、八个候选；目标是严格训推一致性与两步 RL 流程，不要求数学题答对。
+这是两步小批量验证，不代表完整 GSM8K 评测。继承的 `MAX_NEW_TOKENS` 会覆盖默认值；
+从长输出实验切换时请显式设置 `MAX_PROMPT=128 MAX_NEW_TOKENS=32 MAX_MODEL_LEN=256`，
+并设置 `EP_CAPACITY=256 PREFILL_TOKENS=128`。固定容量 EP 使用该容量填充通信缓冲区，
+短序列验收不需要保留 4096 行的容量。
 原有镜像校验、设备空闲检查、严格一致性检查、reward/梯度/耗时日志继续由原启动器执行。
 `--dry-run` 只展示参数，不验证并行组合或证明 A3 实机通过。
 
@@ -94,10 +99,11 @@ export RUNNER=internal
 export DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 export MODEL_LAYERS=0
 export STEPS=2
-export MAX_PROMPT=512
-export MAX_NEW_TOKENS=1024
-export MAX_MODEL_LEN=4096
-export EP_CAPACITY=4096
+export MAX_PROMPT=128
+export MAX_NEW_TOKENS=32
+export MAX_MODEL_LEN=256
+export EP_CAPACITY=256
+export PREFILL_TOKENS=128
 export RESULT_ROOT="/home/z00988596/results/consistency/$(date +%Y%m%d-%H%M%S)-gsm8k-internal-full"
 
 TRAIN_TP=4 TRAIN_EP=4 TRAIN_SP=false \
@@ -117,7 +123,8 @@ ROLLOUT_TP=4 ROLLOUT_EP=4 ROLLOUT_SP=false \
 查看 `CONSISTENCY_CHECK`、`STEP_SUMMARY`、原始 reward、梯度范数和计时；阶段日志为 `rollout_generate`。
 两步只验证运行与采样 token 的训推一致性，不代表 GSM8K 全测试集准确率。
 同题候选奖励完全相同时，GRPO 优势和梯度可能为零；不会伪造奖励或强制产生非零梯度。
-短输出若频繁未生成最终答案，可以增大 `MAX_NEW_TOKENS`，并同步检查上下文预算。
+一致性验收不以最终答案或数学奖励为通过条件，不必为解题完整性增大输出长度。
+需要另做长序列或解题能力实验时，可显式增大 `MAX_NEW_TOKENS` 并检查上下文预算。
 
 ### A3 十六设备迁移
 
@@ -379,8 +386,8 @@ size only: independent sampled trajectories are not a cross-topology replay test
 | `PROMPTS_PER_RANK`, `CANDIDATES` | Prompts per training DP rank / responses per prompt; 1 / 2 |
 | `MICRO_BATCH_SIZE`, `RESPONSE_MINI_BATCH_SIZE` | Training micro-batch / mini-batch; 1 / candidates |
 | `MAX_NUM_SEQS`, `KV_CACHE_MEMORY_BYTES` | Inference concurrency / KV bytes; 2 / 536870912 |
-| `MAX_PROMPT`, `MAX_NEW_TOKENS`, `MAX_MODEL_LEN` | 512 / 1024 / 4096 |
-| `EP_CAPACITY`, `PREFILL_TOKENS` | Fixed EP capacity / prefill tokens; 4096 / 512 |
+| `MAX_PROMPT`, `MAX_NEW_TOKENS`, `MAX_MODEL_LEN` | 128 / 32 / 256 |
+| `EP_CAPACITY`, `PREFILL_TOKENS` | Fixed EP capacity / prefill tokens; 256 / 128 |
 | `WEIGHT_SYNC_TRANSPORT`, `WEIGHT_BUCKET_MB` | auto / 128; strategy remains full_gather |
 | `IMAGE_ID_FILE`, `IMAGE_ARCHIVE` | Expected ID / exported image archive under shared images |
 
