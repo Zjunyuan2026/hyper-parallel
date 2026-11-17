@@ -36,7 +36,8 @@ EP_CAPACITY, PREFILL_TOKENS, PROMPTS_PER_RANK, CANDIDATES.
 RESULT_BASE (or inherited RESULT_ROOT) is a parent directory, not a reusable run.
 Every invocation creates a unique child directory, including host and topology.
 MICRO_BATCH_SIZE, RESPONSE_MINI_BATCH_SIZE, GLOBAL_PROMPT_BATCH_SIZE,
-MAX_NUM_SEQS, KV_CACHE_MEMORY_BYTES, WEIGHT_SYNC_TRANSPORT, WEIGHT_BUCKET_MB
+MAX_NUM_SEQS, KV_CACHE_MEMORY_BYTES, WEIGHT_SYNC_TRANSPORT, WEIGHT_BUCKET_MB,
+GENERATION_TIMEOUT (seconds; default 1800, generation only)
 are also supported. GLOBAL_PROMPT_BATCH_SIZE keeps workload fixed across TP.
 Missing images load from IMAGE_ARCHIVE (default shared images/a3-runtime.tar.gz).
 A stopped image-reference container is retained; no NPU is used by that container.
@@ -57,6 +58,7 @@ export ROLLOUT_TP=${ROLLOUT_TP:-4} ROLLOUT_EP=${ROLLOUT_EP:-4} ROLLOUT_SP=${ROLL
 export MAX_PROMPT=${MAX_PROMPT:-512} MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-1024}
 export MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096} EP_CAPACITY=${EP_CAPACITY:-4096}
 export MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1} MAX_NUM_SEQS=${MAX_NUM_SEQS:-2}
+export GENERATION_TIMEOUT=${GENERATION_TIMEOUT:-1800}
 export WEIGHT_SYNC_TRANSPORT=${WEIGHT_SYNC_TRANSPORT:-auto}
 export PROMPTS_PER_RANK=${PROMPTS_PER_RANK:-1} CANDIDATES=${CANDIDATES:-2}
 # This entry always runs direct GSM8K, without inheriting a Codex runner/profile.
@@ -90,7 +92,7 @@ while (( $# )); do
         *) printf 'Unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
 done
-for name in STEPS TRAIN_TP TRAIN_EP ROLLOUT_TP ROLLOUT_EP; do
+for name in STEPS TRAIN_TP TRAIN_EP ROLLOUT_TP ROLLOUT_EP GENERATION_TIMEOUT; do
     [[ ${!name} =~ ^[1-9][0-9]*$ ]] || { printf '%s must be positive\n' "$name" >&2; exit 2; }
 done
 [[ $MODEL_LAYERS =~ ^[0-9]+$ ]] || { printf 'MODEL_LAYERS must be nonnegative\n' >&2; exit 2; }
@@ -115,7 +117,7 @@ image_id_file=${IMAGE_ID_FILE:-${SHARED_ROOT}/images/a3-runtime.id}
 for name in IMAGE MODEL_ROOT DATA_ROOT DEVICES RUNNER MODEL_LAYERS STEPS \
     TRAIN_TP TRAIN_EP TRAIN_SP ROLLOUT_TP ROLLOUT_EP ROLLOUT_SP \
     MAX_PROMPT MAX_NEW_TOKENS MAX_MODEL_LEN EP_CAPACITY PROMPTS_PER_RANK CANDIDATES MICRO_BATCH_SIZE MAX_NUM_SEQS \
-    WEIGHT_SYNC_TRANSPORT RESULT_ROOT; do
+    WEIGHT_SYNC_TRANSPORT GENERATION_TIMEOUT RESULT_ROOT; do
     printf '%s=%q\n' "$name" "${!name}"
 done
 printf 'IMAGE_ID_FILE=%q\n' "$image_id_file"

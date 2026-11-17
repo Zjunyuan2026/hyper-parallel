@@ -98,7 +98,7 @@ fi
 for option in TRAIN_TP TRAIN_EP TRAIN_SP ROLLOUT_TP ROLLOUT_EP ROLLOUT_SP STEPS RUNNER \
     MODEL_INIT_THREADS PROMPTS_PER_RANK CANDIDATES MAX_PROMPT MAX_MODEL_LEN MAX_NEW_TOKENS EP_CAPACITY PREFILL_TOKENS \
     MICRO_BATCH_SIZE RESPONSE_MINI_BATCH_SIZE GLOBAL_PROMPT_BATCH_SIZE MAX_NUM_SEQS \
-    KV_CACHE_MEMORY_BYTES WEIGHT_SYNC_TRANSPORT WEIGHT_BUCKET_MB; do
+    KV_CACHE_MEMORY_BYTES WEIGHT_SYNC_TRANSPORT WEIGHT_BUCKET_MB GENERATION_TIMEOUT; do
     if [[ -v "${option}" ]]; then portable_options+=(-e "${option}=${!option}"); fi
 done
 printf 'RUN_PLAN world=%s devices=%s layers=%s config=%s results=%s\n' "${device_count}" "${devices}" "${model_layers}" "${config}" "${result_root}"

@@ -78,6 +78,8 @@ def configure(config: dict, world: int) -> dict:
     if transport not in ("auto", "ipc", "hccl"):
         raise ValueError("WEIGHT_SYNC_TRANSPORT must be auto, ipc or hccl")
     inference["weight_sync"].update(transport=transport, bucket_size_mb=integer("WEIGHT_BUCKET_MB", 128))
+    if "GENERATION_TIMEOUT" in os.environ:
+        inference["generation_timeout"] = integer("GENERATION_TIMEOUT", 1800)
     inference["max_num_seqs"] = integer("MAX_NUM_SEQS", 2)
     inference["kv_cache_memory_bytes"] = integer("KV_CACHE_MEMORY_BYTES", 536870912)
     config["data"]["max_train_samples"] = max(4, world // train_tp * train["prompt_batch_size"])

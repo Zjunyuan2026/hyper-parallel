@@ -38,6 +38,14 @@ Requests must carry a committed policy version. After pausing admission, wait fo
 Token IDs, raw logprobs, worker version, and optional routing traces return together; tool/observation tokens do not become model actions.
 The sampler fix restores RNG offsets for discarded requests during partial prefill; it does not recreate the deleted consistency-model path.
 
+`rollout.vllm.generation_timeout` optionally sets the total HTTP deadline for each
+generation request, including server queueing, prefill and decode. It defaults to
+`request_timeout` when omitted. HTTP control calls retain `request_timeout`.
+The A3 two-step launcher sets a finite 1800-second generation budget by default;
+override it with `GENERATION_TIMEOUT`. This accommodates slow complete responses,
+but does not recover a stalled worker. Timeouts fail the batch without retrying,
+dropping candidates or modifying sampled-token and probability contracts.
+
 ## Policy Lifecycle
 
 Rollout wakes only after training releases shard and optimizer residency. Publication failure neither wakes the KV cache nor commits a version.

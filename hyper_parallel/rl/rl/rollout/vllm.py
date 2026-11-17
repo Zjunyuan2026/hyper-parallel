@@ -16,6 +16,7 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import signal
 import socket
@@ -120,12 +121,17 @@ class VLLMHTTPClient(VLLMWeightSyncClientMixin):
         model_name: str,
         request_timeout: float,
         router_capture_spec: Optional[RouterCaptureSpec] = None,
+        generation_timeout: Optional[float] = None,
     ) -> None:
         """Bind a persistent HTTP client and optional owned process to one endpoint."""
         self._process = process
         self._base_url = base_url.rstrip("/")
         self._model_name = model_name
         self._request_timeout = request_timeout
+        timeout = request_timeout if generation_timeout is None else generation_timeout
+        if isinstance(timeout, bool) or not math.isfinite(float(timeout)) or float(timeout) <= 0:
+            raise ValueError("vLLM generation_timeout must be finite and positive")
+        self._generation_timeout = float(timeout)
         self._router_capture_spec = router_capture_spec
         self._async_runtime_lock = threading.Lock()
         self._async_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -133,7 +139,7 @@ class VLLMHTTPClient(VLLMWeightSyncClientMixin):
         self._async_session: Optional[Any] = None
         self._async_connection_limit = 0
         self._async_startup_error: Optional[BaseException] = None
-        self._diagnostics = RolloutDiagnostics(self._base_url, request_timeout)
+        self._diagnostics = RolloutDiagnostics(self._base_url, self._generation_timeout)
         if process is not None and self._diagnostics.directory is not None:
             self._diagnostics.register_server(process.pid)
 
@@ -146,7 +152,7 @@ class VLLMHTTPClient(VLLMWeightSyncClientMixin):
             keepalive_timeout=60.0,
             force_close=False,
         )
-        timeout = aiohttp.ClientTimeout(total=self._request_timeout)
+        timeout = aiohttp.ClientTimeout(total=self._generation_timeout)
         self._async_session = aiohttp.ClientSession(
             connector=connector,
             timeout=timeout,
@@ -256,7 +262,7 @@ class VLLMHTTPClient(VLLMWeightSyncClientMixin):
         except (aiohttp.ClientError, asyncio.TimeoutError) as error:
             raise RuntimeError(
                 f"vLLM HTTP {method} {route} failed: {type(error).__name__}: {error!r}; "
-                f"request_timeout={self._request_timeout}s"
+                f"request_timeout={self._generation_timeout:g}s (generation budget)"
             ) from error
         if status >= 400:
             message = body.decode("utf-8", errors="replace")
@@ -1066,6 +1072,7 @@ class VLLMGenerationEngine:
             self._model.name,
             request_timeout=float(self._config.get("request_timeout", 600)),
             router_capture_spec=self._router_capture_spec,
+            generation_timeout=self._config.get("generation_timeout"),
         )
         try:
             client.wait_ready(float(self._config.get("startup_timeout", 300)))
@@ -1083,6 +1090,7 @@ class VLLMGenerationEngine:
             self._model.name,
             request_timeout=float(self._config.get("request_timeout", 600)),
             router_capture_spec=self._router_capture_spec,
+            generation_timeout=self._config.get("generation_timeout"),
         )
 
     def _ensure_client(self) -> Any:
