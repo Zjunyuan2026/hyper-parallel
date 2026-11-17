@@ -21,7 +21,6 @@ from rl.workers.engine.model import ModelRegistration, resolve_vllm_model
 import rl.weight_sync.transfer as weight_sync
 from rl.weight_sync.config import resolve_weight_sync_config
 from rl.weight_sync.transfer import build_weight_publisher
-from rl.weight_sync.colocated_hccl import ColocatedHCCLWeightTransport
 
 
 def _rollout_model():
@@ -101,19 +100,13 @@ def test_reject_invalid_disjoint_transport(transport_name):
         )
 
 
-def test_colocated_hccl_uses_device_unique_routes():
-    """Colocated HCCL uses the dedicated route planner, not the disjoint group."""
-    config = resolve_weight_sync_config(
-        {"transport": "hccl"}, deployment="colocated", model_family="qwen3", rollout_tp=4,
-    )
-    result = build_weight_publisher("colocated", _rollout_model(), transport=config.transport)
-    assert isinstance(result.transport, ColocatedHCCLWeightTransport), f"actual={type(result.transport)}"
-
-
-def test_disjoint_explicit_hccl_preserved():
-    """The existing separate-device HCCL route remains available."""
-    config = resolve_weight_sync_config(
-        {"transport": "hccl"}, deployment="disjoint", model_family="qwen3", rollout_tp=4,
-    )
-    result = build_weight_publisher("disjoint", _rollout_model(), transport=config.transport)
-    assert result.transport.name == "hccl", f"actual={result.transport.name}"
+def test_colocated_hccl_rejected_without_changing_disjoint_hccl():
+    """Restore PR1533 selection while allowing explicit IPC in the A3 launcher."""
+    with pytest.raises(ValueError, match="uses IPC"):
+        resolve_weight_sync_config(
+            {"transport": "hccl"}, deployment="colocated", model_family="qwen3", rollout_tp=4,
+        )
+    with pytest.raises(ValueError, match="uses IPC"):
+        build_weight_publisher("colocated", _rollout_model(), transport="hccl")
+    publisher = build_weight_publisher("disjoint", _rollout_model(), transport="hccl")
+    assert publisher.transport.name == "hccl", f"actual={publisher.transport.name}"

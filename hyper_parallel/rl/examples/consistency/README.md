@@ -389,12 +389,10 @@ and retains a stopped image-reference container without allocating NPU resources
 This mitigates deletion by image GC; it does not resolve node disk pressure or
 protect against forced administrative deletion. It never prunes images or changes kubelet.
 
-Colocated runs default to IPC (`auto`). Explicit `--transport hccl` uses two
-device-unique routes (at least two devices): Actor 0 sends to every receiver except the one on its device;
-Actor 1 sends to that remaining receiver. Each communicator has a unique device
-for every rank. Trainer ranks stage each bucket before both routes execute in
-sequence, and every worker must acknowledge exactly once across the two routes.
-No IPC storage handles or automatic transport fallback are used in this mode.
-The earlier producer-plus-all-workers group is retained only for disjoint deployments.
-This addresses the duplicate-device topology; A3 hardware acceptance is still required.
-Keep the original IPC storage error separate from HCCL initialization failures.
+Colocated A3 runs use `--transport ipc`, or the equivalent default `auto`.
+Training collectives and packed-buffer broadcast still use the configured HCCL
+backend; only the same-device Actor-to-vLLM handoff uses IPC. This follows the
+PR1533 deployment selection. Explicit colocated HCCL is rejected before Docker
+startup. The experimental two-route HCCL implementation has been removed.
+Disjoint deployments retain the original HCCL weight transport.
+Keep the verified full-model TP4/EP4 recipe before changing parallel layouts.

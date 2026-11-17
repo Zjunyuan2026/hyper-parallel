@@ -59,10 +59,6 @@ def _rpc_with_collective(
             results = request.result(timeout=timeout)
     # Every local failure must be exchanged before peers enter the next collective.
     except Exception as caught:  # pylint: disable=broad-exception-caught
-        logger.exception(
-            "HCCL initialization or transfer failed: method=%s group=%s trainer_rank=%s",
-            method, kwargs["group_id"], rank,
-        )
         error = caught
     finally:
         if executor is not None:

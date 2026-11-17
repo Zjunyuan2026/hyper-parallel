@@ -44,8 +44,9 @@ class A3EntryTests(unittest.TestCase):
         self.assertIn("ROLLOUT_TP=4\n", result.stdout)
         self.assertIn("TRAIN_EP=8\n", result.stdout)
 
-    def test_colocated_hccl_can_be_selected_explicitly(self) -> None:
-        """The explicit choice reaches the device-unique route implementation."""
+    def test_colocated_hccl_is_rejected_before_docker(self) -> None:
+        """Keep the verified IPC route and reject accidental transport changes."""
         result = subprocess.run(["bash", str(ROOT / "run_a3.sh"), "--transport", "hccl", "--dry-run"],
-                                capture_output=True, text=True, check=True)
-        self.assertIn("WEIGHT_SYNC_TRANSPORT=hccl", result.stdout)
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("recipe uses IPC", result.stderr)
