@@ -18,12 +18,15 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+import logging
+import weakref
 from typing import Any
 
 import torch
 from torch import nn
 
 from rl.weight_sync.model_adapter import expert_weight_slices
+from rl.weight_sync.storage_diagnostics import describe_weight_failure
 from hyper_parallel.components.checkpoint.conversion_ops import ConcatenateWithSections, InterleaveQKV
 from hyper_parallel.components.checkpoint.load_groups import (
     local_target_tensor,
@@ -57,6 +60,8 @@ class LogicalWeightLoader:
 
     def __init__(self, model: nn.Module) -> None:
         """Index the model parameters and replacement-owned conversions."""
+        self._model_ref = weakref.ref(model)
+        self._load_stage = "idle"
         self.parameters = dict(model.named_parameters(remove_duplicate=False))
         logical_shapes = getattr(model, "_rl_logical_parameter_shapes", {})
         self.shapes = {}
@@ -219,22 +224,29 @@ class LogicalWeightLoader:
             expected = tuple(reversed(destination.region[1][1:]))
         if tuple(value.shape) != expected:
             raise ValueError(f"Unified weight shape mismatch for {name}: {tuple(value.shape)} != {expected}")
+        self._load_stage = "source_to_device"
         value = value.to(device=parameter.device, dtype=parameter.dtype)
         aliases = self.required[id(parameter)]
+        self._load_stage = "target_to_local"
         local = local_target_tensor(parameter)
         if destination.region is not None:
             if destination.local_region is not None:
+                self._load_stage = "expert_copy"
                 local[destination.local_region].copy_(value.transpose(-1, -2).unsqueeze(0))
             self.seen.add(name)
             return destination.name
         if destination.rows is None:
+            self._load_stage = "shard_source_for_target"
             value = shard_for_target(destination.name, value, parameter)
         if destination.rows is None and self.seen.intersection(aliases):
+            self._load_stage = "compare_alias"
             if not torch.equal(local, value):
                 raise ValueError(f"Conflicting tied Qwen3 weight aliases: {name}")
         elif destination.rows is None:
+            self._load_stage = "copy_target"
             local.copy_(value)
         else:
+            self._load_stage = "copy_converted_rows"
             self._copy_rows(destination.name, destination.rows, value)
         self.seen.add(name)
         return destination.name
@@ -248,8 +260,21 @@ class LogicalWeightLoader:
         loaded: set[str] = set()
         for name, value in weights:
             try:
+                self._load_stage = "validate"
                 destination_name = self._load_weight(name, value)
             except RuntimeError as error:
+                try:
+                    destination = self.destinations.get(name)
+                    target_name = None if destination is None else destination.name
+                    target = None if target_name is None else self.parameters[target_name]
+                    model = self._model_ref()
+                    current = None if model is None or target_name is None else model.get_parameter(target_name)
+                    details = describe_weight_failure(
+                        name, self._load_stage, value, target, current, local_target_tensor,
+                    )
+                    logging.getLogger(__name__).error("IPC_WEIGHT_DIAG %s", details)
+                except Exception as diagnostic_error:  # pylint: disable=broad-exception-caught
+                    logging.getLogger(__name__).warning("IPC_WEIGHT_DIAG unavailable: %r", diagnostic_error)
                 raise RuntimeError(
                     f"Logical weight load failed: name={name}, shape={tuple(value.shape)}, "
                     f"device={value.device}, dtype={value.dtype}, offset={value.storage_offset()}; {error}"
