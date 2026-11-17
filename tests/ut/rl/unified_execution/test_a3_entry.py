@@ -49,4 +49,4 @@ class A3EntryTests(unittest.TestCase):
         result = subprocess.run(["bash", str(ROOT / "run_a3.sh"), "--transport", "hccl", "--dry-run"],
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 2)
-        self.assertIn("recipe uses IPC", result.stderr)
+        self.assertIn("use --transport ipc", result.stderr)

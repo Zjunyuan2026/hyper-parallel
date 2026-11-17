@@ -99,8 +99,8 @@ for name in TRAIN_SP ROLLOUT_SP; do
         printf '%s must be true or false\n' "$name" >&2; exit 2;
     }
 done
-if [[ $WEIGHT_SYNC_TRANSPORT != auto && $WEIGHT_SYNC_TRANSPORT != ipc ]]; then
-    printf 'This colocated recipe uses IPC; select --transport ipc or auto\n' >&2
+if [[ $WEIGHT_SYNC_TRANSPORT == hccl ]]; then
+    printf 'Colocated HCCL weight transfer is unsupported: Actor and rollout share a device; use --transport ipc\n' >&2
     exit 2
 fi
 result_base=${RESULT_BASE:-${RESULT_ROOT:-/home/z00988596/results/consistency}}

@@ -316,7 +316,9 @@ def build_weight_publisher(
     if transport not in ("auto", "ipc", "hccl"):
         raise ValueError("Weight transport must be auto, ipc or hccl")
     if transport == "hccl" and deployment == "colocated":
-        raise ValueError("Colocated weight publication uses IPC; use transport=ipc or auto")
+        raise ValueError(
+            "Colocated HCCL weight transfer is unsupported: Actor and rollout share a device; use ipc"
+        )
     if transport == "ipc" and deployment != "colocated":
         raise ValueError("IPC weight transport requires colocated deployment")
     selected_transport = ("ipc" if deployment == "colocated" else "hccl") if transport == "auto" else transport

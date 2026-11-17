@@ -82,7 +82,9 @@ def resolve_weight_sync_config(
     if transport not in ("auto", "ipc", "hccl"):
         raise ValueError("weight_sync.transport must be auto, ipc or hccl")
     if transport == "hccl" and deployment == "colocated":
-        raise ValueError("Colocated weight publication uses IPC; use transport=ipc or auto")
+        raise ValueError(
+            "Colocated HCCL weight transfer is unsupported: Actor and rollout share a device; use ipc"
+        )
     if transport == "ipc" and deployment != "colocated":
         raise ValueError("IPC weight transport requires colocated deployment")
     strategy = str(config.get("strategy", "full_gather"))
