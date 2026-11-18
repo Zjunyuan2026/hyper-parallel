@@ -33,7 +33,6 @@ from typing import Any, Mapping, Optional
 import torch  # pylint: disable=forbidden-backend-import
 from safetensors import safe_open
 
-from rl.weight_sync.acl_ipc import copy_malloc_ipc, malloc_ipc_key
 from rl.workers.engine.model import (
     NATIVE_QWEN3_ARCHITECTURE,
     NATIVE_QWEN3_MOE_ARCHITECTURE,
@@ -344,19 +343,8 @@ def _import_ipc_buffer(handles: Mapping[Any, Any], physical_npu_id: Any) -> Any:
             f"IPC handle not found for {physical_npu_id}; available={list(handles)}"
         )
     rebuild_args = list(handles[physical_npu_id])
-    if len(rebuild_args) != 15 or rebuild_args[7] is None or int(rebuild_args[8]) <= 0:
-        raise ValueError(
-            f"Invalid NPU IPC storage: device={physical_npu_id}, args={len(rebuild_args)}, "
-            f"handle_missing={len(rebuild_args) < 8 or rebuild_args[7] is None}"
-        )
     rebuild_args[6] = torch.accelerator.current_device_index()
-    key = malloc_ipc_key(rebuild_args)
-    if key is not None:
-        return copy_malloc_ipc(rebuild_args, key)
-    tensor = rebuild_npu_tensor(*rebuild_args)
-    if tensor.numel() and not tensor.data_ptr():
-        raise RuntimeError("NPU expandable IPC import returned a null data pointer")
-    return tensor
+    return rebuild_npu_tensor(*rebuild_args)
 
 
 
