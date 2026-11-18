@@ -35,7 +35,6 @@ class WeightSyncConfig:
 
     strategy: str
     bucket_size_bytes: int
-    transport: str = "auto"
 
 
 def validate_weight_sync_support(
@@ -72,21 +71,12 @@ def resolve_weight_sync_config(
 ) -> WeightSyncConfig:
     """Normalize defaults once and validate the public strategy contract."""
     config = dict(value or {})
-    unexpected = sorted(set(config) - {"strategy", "bucket_size_mb", "transport"})
+    unexpected = sorted(set(config) - {"strategy", "bucket_size_mb"})
     if unexpected:
         raise ValueError(
             "Unsupported rollout.vllm.weight_sync field(s): "
             + ", ".join(unexpected)
         )
-    transport = str(config.get("transport", "auto"))
-    if transport not in ("auto", "ipc", "hccl"):
-        raise ValueError("weight_sync.transport must be auto, ipc or hccl")
-    if transport == "hccl" and deployment == "colocated":
-        raise ValueError(
-            "Colocated HCCL weight transfer is unsupported: Actor and rollout share a device; use ipc"
-        )
-    if transport == "ipc" and deployment != "colocated":
-        raise ValueError("IPC weight transport requires colocated deployment")
     strategy = str(config.get("strategy", "full_gather"))
     bucket_size_mb = int(config.get("bucket_size_mb", 128))
     if bucket_size_mb <= 0:
@@ -100,5 +90,4 @@ def resolve_weight_sync_config(
     return WeightSyncConfig(
         strategy=strategy,
         bucket_size_bytes=bucket_size_mb * 2**20,
-        transport=transport,
     )

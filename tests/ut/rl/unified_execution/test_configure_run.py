@@ -41,7 +41,7 @@ class ConfigureRunTests(unittest.TestCase):
                 result = CONFIGURE(yaml.safe_load((ROOT / "configs/qwen3_moe_4l_rl.yaml").read_text()), 16)
                 self.assertEqual(result["train"]["prompt_batch_size"] * (16 // tp), 16)
                 self.assertEqual(result["train"]["micro_batch_size"], 2)
-                self.assertEqual(result["rollout"]["vllm"]["weight_sync"]["transport"], "ipc")
+                self.assertNotIn("transport", result["rollout"]["vllm"]["weight_sync"])
                 self.assertEqual(result["rollout"]["vllm"]["max_num_seqs"], 4)
 
     def test_invalid_batch_and_transport(self) -> None:
@@ -84,16 +84,16 @@ class ConfigureRunTests(unittest.TestCase):
         self.assertEqual(config["rollout"]["vllm"]["max_model_len"], 4096)
         self.assertEqual(config["data"]["max_prompt_length"], 768)
         self.assertEqual(config["rollout"]["max_new_tokens"], 2048)
-        capacities = [rule["replace"]["implementation"]["capacity"] for rule in config["train"]["plan_overrides"]
+        capacities = [rule["replace"]["implementation"]["mc2_capacity"] for rule in config["train"]["plan_overrides"]
                       if rule.get("replace", {}).get("implementation", {}).get("_target_", "").endswith(
-                          "fixed_capacity_ep_compute_fn")]
-        self.assertEqual(capacities, [4096])
+                          "unified_ep_compute_fn")]
+        self.assertEqual(capacities, [256])
 
     def test_invalid_budgets_fail_before_model_startup(self) -> None:
-        """Reject requests that exceed context or the fixed EP transport capacity."""
+        """Reject invalid context budgets and unsupported MC2 options."""
         for overrides in ({"MAX_PROMPT": "512", "MAX_NEW_TOKENS": "1024", "MAX_MODEL_LEN": "1024"},
-                          {"EP_CAPACITY": "2048", "MAX_MODEL_LEN": "4096"},
-                          {"EP_CAPACITY": "4096", "PREFILL_TOKENS": "8192"}):
+                          {"MC2_CAPACITY": "257"},
+                          {"INFERENCE_EP_BACKEND": "unsupported"}):
             with self.subTest(overrides=overrides):
                 with patch.dict(os.environ, {"RUN_MODEL_PATH": "/models/full", **overrides}, clear=True):
                     with self.assertRaises(ValueError):
@@ -106,6 +106,44 @@ class ConfigureRunTests(unittest.TestCase):
         self.assertEqual(config["agentic"]["runner"], "codex")
         self.assertIn("codex", config["agentic"])
         self.assertTrue(config["rollout"]["vllm"]["enable_auto_tool_choice"])
+
+    def test_cp_pcp_topology_and_global_batch(self) -> None:
+        """CP peers share samples while PCP replicas each receive publication."""
+        env = {"RUN_MODEL_PATH": "/models/full", "TRAIN_TP": "2", "TRAIN_CP": "2",
+               "ROLLOUT_TP": "2", "ROLLOUT_PCP": "2", "TRAIN_EP": "2", "ROLLOUT_EP": "4",
+               "GLOBAL_PROMPT_BATCH_SIZE": "8", "INFERENCE_EP_BACKEND": "allgather"}
+        with patch.dict(os.environ, env, clear=True):
+            config = CONFIGURE(yaml.safe_load((ROOT / "configs/qwen3_moe_4l_cp_rl.yaml").read_text()), 16)
+        self.assertEqual(config["train"]["accelerator"]["cp"], 2)
+        self.assertEqual(config["train"]["accelerator"]["activation_checkpoint"], "off")
+        self.assertEqual(config["train"]["accelerator"]["dp_shard"], 4)
+        self.assertEqual(config["train"]["prompt_batch_size"], 2)
+        self.assertEqual(config["rollout"]["vllm"]["context_parallel_size"], 2)
+        self.assertEqual(config["rollout"]["vllm"]["data_parallel_size"], 4)
+        self.assertEqual(config["rollout"]["vllm"]["decode_context_parallel_size"], 1)
+        implementations = [r.get("replace", {}).get("implementation", {}) for r in config["train"]["plan_overrides"]]
+        self.assertIn("allgather", [i.get("inference_backend") for i in implementations])
+
+    def test_context_recipe_defaults_and_larger_batches(self) -> None:
+        """Keep native recipe CP defaults; MC2 capacity is not a sequence limit."""
+        env = {"RUN_MODEL_PATH": "/models/full", "MAX_MODEL_LEN": "1024", "PREFILL_TOKENS": "512"}
+        with patch.dict(os.environ, env, clear=True):
+            config = CONFIGURE(yaml.safe_load((ROOT / "configs/qwen3_moe_4l_cp_rl.yaml").read_text()), 4)
+        self.assertEqual(config["train"]["accelerator"]["tp"], 2)
+        self.assertEqual(config["train"]["accelerator"]["cp"], 2)
+        self.assertEqual(config["train"]["accelerator"]["activation_checkpoint"], "off")
+        self.assertEqual(config["rollout"]["vllm"]["context_parallel_size"], 2)
+        self.assertEqual(config["rollout"]["vllm"]["max_num_batched_tokens"], 512)
+
+    def test_invalid_context_topology_or_missing_recipe(self) -> None:
+        """Reject unsupported CP sizes and incomplete CP attention bindings."""
+        for overrides in ({"TRAIN_CP": "3"}, {"TRAIN_CP": "4", "TRAIN_TP": "2"},
+                          {"ROLLOUT_PCP": "3"}, {"TRAIN_CP": "2", "TRAIN_TP": "2"}):
+            with self.subTest(overrides=overrides), patch.dict(
+                os.environ, {"RUN_MODEL_PATH": "/models/full", **overrides}, clear=True,
+            ):
+                with self.assertRaises(ValueError):
+                    CONFIGURE(yaml.safe_load((ROOT / "configs/qwen3_moe_4l_rl.yaml").read_text()), 4)
 
 
 if __name__ == "__main__":

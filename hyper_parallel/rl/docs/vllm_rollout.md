@@ -6,7 +6,7 @@
 
 Native-vLLM remains the default. Optional unified execution registers HP Qwen3 Dense and MoE models,
 reusing the training builder, replacement plan and supported parallel strategies.
-Shared V4 attention, Level 3, PIK and fixed-capacity EP retain paged KV, prefix caching, chunked prefill
+Shared V4 attention, Level 3, PIK and graph-capable unified EP retain paged KV, prefix caching, chunked prefill
 and `FULL_AND_PIECEWISE` graphs. See [Unified Execution](../rl/unified_execution/README.md) for recipes and scope.
 The plugin entry point is `rl.rollout.vllm_plugin:install_runtime_hooks`, which installs weight synchronization, tool evidence, partial service, and required sampling fixes.
 Version-sensitive private lifecycle hooks must match supported vLLM/vLLM-Ascend combinations; unknown versions fail explicitly.
@@ -37,14 +37,6 @@ Configuration validation distinguishes colocated device mappings from disjoint d
 Requests must carry a committed policy version. After pausing admission, wait for active requests to finish or pause them through the partial protocol before updating parameters.
 Token IDs, raw logprobs, worker version, and optional routing traces return together; tool/observation tokens do not become model actions.
 The sampler fix restores RNG offsets for discarded requests during partial prefill; it does not recreate the deleted consistency-model path.
-
-`rollout.vllm.generation_timeout` optionally sets the total HTTP deadline for each
-generation request, including server queueing, prefill and decode. It defaults to
-`request_timeout` when omitted. HTTP control calls retain `request_timeout`.
-The A3 two-step launcher sets a finite 1800-second generation budget by default;
-override it with `GENERATION_TIMEOUT`. This accommodates slow complete responses,
-but does not recover a stalled worker. Timeouts fail the batch without retrying,
-dropping candidates or modifying sampled-token and probability contracts.
 
 ## Policy Lifecycle
 

@@ -42,25 +42,37 @@ def configure(config: dict, world: int) -> dict:
     train = config["train"]
     accelerator = train["accelerator"]
     inference = config["rollout"]["vllm"]
-    train_tp, rollout_tp = integer("TRAIN_TP", 4), integer("ROLLOUT_TP", 2)
-    train_ep, rollout_ep = integer("TRAIN_EP", 4), integer("ROLLOUT_EP", 4)
-    if train_tp not in (1, 2, 4) or rollout_tp not in (1, 2, 4):
-        raise ValueError("This recipe supports TP1/TP2/TP4 only")
-    if any(world % size for size in (train_tp, rollout_tp, train_ep, rollout_ep)):
-        raise ValueError("Each TP/EP size must divide the selected device count")
+    train_tp = integer("TRAIN_TP", accelerator["tp"])
+    rollout_tp = integer("ROLLOUT_TP", inference["tensor_parallel_size"])
+    train_cp = integer("TRAIN_CP", accelerator.get("cp", 1))
+    rollout_pcp = integer("ROLLOUT_PCP", inference.get("context_parallel_size", 1))
+    train_ep = integer("TRAIN_EP", accelerator["ep"])
+    rollout_ep = integer("ROLLOUT_EP", inference["expert_parallel_size"])
+    if any(size not in (1, 2, 4) for size in (train_tp, rollout_tp, train_cp, rollout_pcp)):
+        raise ValueError("This recipe supports TP/CP/PCP sizes 1, 2 or 4 only")
+    if world < 1 or any(world % size for size in (
+        train_tp * train_cp, rollout_tp * rollout_pcp, train_ep, rollout_ep,
+    )):
+        raise ValueError("TP x CP, TP x PCP and each EP size must divide the selected device count")
     if 128 % train_ep or 128 % rollout_ep:
         raise ValueError("EP must divide the model's 128 experts")
-    accelerator.update(tp=train_tp, dp_shard=world // train_tp, ep=train_ep,
+    if train_cp > 1 and not any(
+        rule.get("when") == "cp" for rule in train["plan_overrides"]
+    ):
+        raise ValueError("TRAIN_CP > 1 requires the CP/PCP consistency recipe")
+    accelerator.update(tp=train_tp, dp_shard=world // (train_tp * train_cp), ep=train_ep,
                        edp_shard=world // train_ep if train_ep > 1 else 1,
-                       sequence_parallel=boolean("TRAIN_SP", True), cp=1, pp=1)
-    inference.update(tensor_parallel_size=rollout_tp, data_parallel_size=world // rollout_tp,
-                     expert_parallel_size=rollout_ep, sequence_parallel=boolean("ROLLOUT_SP", False))
+                       sequence_parallel=boolean("TRAIN_SP", accelerator["sequence_parallel"]), cp=train_cp, pp=1)
+    inference.update(tensor_parallel_size=rollout_tp, data_parallel_size=world // (rollout_tp * rollout_pcp),
+                     context_parallel_size=rollout_pcp, decode_context_parallel_size=1,
+                     expert_parallel_size=rollout_ep,
+                     sequence_parallel=boolean("ROLLOUT_SP", inference.get("sequence_parallel", False)))
     train["max_steps"] = integer("STEPS", 2)
     train["model_init_cpu_threads"] = integer("MODEL_INIT_THREADS", 8)
-    accelerator["activation_checkpoint"] = "full"
+    accelerator["activation_checkpoint"] = "full" if train_cp == 1 else "off"
     train["prompt_batch_size"] = integer("PROMPTS_PER_RANK", 1)
     global_prompts = os.environ.get("GLOBAL_PROMPT_BATCH_SIZE")
-    dp_size = world // train_tp
+    dp_size = world // (train_tp * train_cp)
     if global_prompts is not None:
         global_prompts = integer("GLOBAL_PROMPT_BATCH_SIZE", 1)
         if global_prompts % dp_size:
@@ -75,14 +87,15 @@ def configure(config: dict, world: int) -> dict:
     if responses % mini or mini % train["micro_batch_size"]:
         raise ValueError("Responses per rank must divide into mini-batches and mini-batches into micro-batches")
     transport = os.environ.get("WEIGHT_SYNC_TRANSPORT", "auto")
-    if transport not in ("auto", "ipc", "hccl"):
-        raise ValueError("WEIGHT_SYNC_TRANSPORT must be auto, ipc or hccl")
-    inference["weight_sync"].update(transport=transport, bucket_size_mb=integer("WEIGHT_BUCKET_MB", 128))
+    if transport not in ("auto", "ipc"):
+        raise ValueError("Colocated weight synchronization requires auto or ipc")
+    inference["weight_sync"].pop("transport", None)
+    inference["weight_sync"]["bucket_size_mb"] = integer("WEIGHT_BUCKET_MB", 128)
     if "GENERATION_TIMEOUT" in os.environ:
-        inference["generation_timeout"] = integer("GENERATION_TIMEOUT", 1800)
+        inference["request_timeout"] = integer("GENERATION_TIMEOUT", 1800)
     inference["max_num_seqs"] = integer("MAX_NUM_SEQS", 2)
     inference["kv_cache_memory_bytes"] = integer("KV_CACHE_MEMORY_BYTES", 536870912)
-    config["data"]["max_train_samples"] = max(4, world // train_tp * train["prompt_batch_size"])
+    config["data"]["max_train_samples"] = max(4, dp_size * train["prompt_batch_size"])
     config["logging"]["log_steps"] = 1
     config["logging"]["log_samples"] = 2
     config["model"]["weights_path"] = os.environ["RUN_MODEL_PATH"]
@@ -121,13 +134,15 @@ def configure(config: dict, world: int) -> dict:
     if config["data"]["max_prompt_length"] + config["rollout"]["max_new_tokens"] > context:
         raise ValueError("MAX_PROMPT + MAX_NEW_TOKENS must not exceed MAX_MODEL_LEN")
     inference.update(max_model_len=context, max_num_batched_tokens=integer("PREFILL_TOKENS", 128 if runner == "internal" else 512))
-    capacity = integer("EP_CAPACITY", context)
+    # Legacy EP_CAPACITY bounded every input; the new limit applies only to MC2.
+    capacity = integer("MC2_CAPACITY", min(integer("EP_CAPACITY", 256), 256))
+    backend = os.environ.get("INFERENCE_EP_BACKEND", "auto")
+    if capacity > 256 or backend not in ("auto", "mc2", "allgather"):
+        raise ValueError("MC2_CAPACITY must be <= 256 and INFERENCE_EP_BACKEND must be auto, mc2 or allgather")
     for rule in train["plan_overrides"]:
         implementation = rule.get("replace", {}).get("implementation", {})
-        if implementation.get("_target_", "").endswith("fixed_capacity_ep_compute_fn"):
-            implementation["capacity"] = capacity
-    if capacity < context or capacity < inference["max_num_batched_tokens"]:
-        raise ValueError("EP_CAPACITY must cover a training sequence and inference prefill rows")
+        if implementation.get("_target_", "").endswith("unified_ep_compute_fn"):
+            implementation.update(mc2_capacity=capacity, inference_backend=backend)
     return config
 
 

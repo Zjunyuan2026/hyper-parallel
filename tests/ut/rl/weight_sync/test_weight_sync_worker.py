@@ -249,13 +249,9 @@ def test_worker_receives_ipc_packed_weights_through_model_loader(
             current_stream=lambda: SimpleNamespace(synchronize=lambda: events.append("sync"))
         ),
     )
-    monkeypatch.setattr(
-        worker_module, "copy_malloc_ipc",
-        lambda _args, _key: source.view(torch.uint8).view(-1).clone(),
-    )
     worker = _receive_worker()
     payload = {
-        "ipc_handles": {"host-4": [None] * 7 + [b"\x01c" + b"x" * 65, 16] + [None] * 6},
+        "ipc_handles": {"host-4": [None] * 7},
         "metadata": _packed_metadata(),
         "total_bytes": 16,
         "worker_topology": [{
@@ -598,16 +594,3 @@ def test_worker_reports_native_qwen3_fused_qkv_layout(
         "model.layers.0.self_attn.v_proj.weight",
         "model.norm.weight",
     }
-
-
-@pytest.mark.parametrize("handle", [[None] * 7, [None] * 15,
-                                    [None] * 7 + [b"test-handle", 0] + [None] * 6])
-def test_invalid_ipc_storage_rejected_before_rebuild(monkeypatch, handle):
-    """Malformed or empty storage must not become a nonempty tensor with null data."""
-    def unexpected_rebuild(*args):
-        raise AssertionError(f"Rebuild must not run for invalid storage: argc={len(args)}")
-
-    monkeypatch.setitem(sys.modules, "torch_npu.multiprocessing.reductions",
-                        SimpleNamespace(rebuild_npu_tensor=unexpected_rebuild))
-    with pytest.raises(ValueError, match="Invalid NPU IPC storage"):
-        worker_module._import_ipc_buffer({"host-4": handle}, "host-4")

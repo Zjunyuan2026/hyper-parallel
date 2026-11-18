@@ -16,7 +16,6 @@
 import asyncio
 import json
 import logging
-import math
 import os
 import signal
 import socket
@@ -35,14 +34,13 @@ import torch
 import torch.distributed as dist
 
 from rl.data.contracts import RouterTrace, resize_router_trace
-from rl.unified_execution.batch_invariant import verify_batch_invariant
+from rl.unified_execution.core.batch_invariant import verify_batch_invariant
 from rl.workers.engine.model import (
     ModelRegistration,
     VLLMModelRegistration,
     resolve_vllm_model,
 )
 from rl.rollout.base import GenerationRequest, GenerationResult
-from rl.rollout.diagnostics import RolloutDiagnostics
 from rl.rollout.router_capture import (
     RouterCaptureSpec,
     decode_router_trace,
@@ -52,13 +50,14 @@ from rl.rollout.router_capture import (
 from rl.rollout.topology import (
     VLLMRolloutTopology,
     resolve_vllm_rollout_topology,
+    model_parallel_size,
     worker_tensor_parallel_size,
 )
 from rl.weight_sync.sync import ActorRolloutWeightSync, PolicySnapshot, synchronize_error, synchronized_call
 from rl.weight_sync.vllm_client import VLLMWeightSyncClientMixin
 from rl.weight_sync.transfer import WeightPublisher, build_weight_publisher
 from rl.weight_sync.config import resolve_weight_sync_config
-from rl.unified_execution.contract import parse_unified_payload
+from rl.unified_execution.core.contract import parse_unified_payload
 
 _DISTRIBUTED_ENVIRONMENT_VARIABLES = (
     "RANK",
@@ -121,17 +120,12 @@ class VLLMHTTPClient(VLLMWeightSyncClientMixin):
         model_name: str,
         request_timeout: float,
         router_capture_spec: Optional[RouterCaptureSpec] = None,
-        generation_timeout: Optional[float] = None,
     ) -> None:
         """Bind a persistent HTTP client and optional owned process to one endpoint."""
         self._process = process
         self._base_url = base_url.rstrip("/")
         self._model_name = model_name
         self._request_timeout = request_timeout
-        timeout = request_timeout if generation_timeout is None else generation_timeout
-        if isinstance(timeout, bool) or not math.isfinite(float(timeout)) or float(timeout) <= 0:
-            raise ValueError("vLLM generation_timeout must be finite and positive")
-        self._generation_timeout = float(timeout)
         self._router_capture_spec = router_capture_spec
         self._async_runtime_lock = threading.Lock()
         self._async_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -139,9 +133,6 @@ class VLLMHTTPClient(VLLMWeightSyncClientMixin):
         self._async_session: Optional[Any] = None
         self._async_connection_limit = 0
         self._async_startup_error: Optional[BaseException] = None
-        self._diagnostics = RolloutDiagnostics(self._base_url, self._generation_timeout)
-        if process is not None and self._diagnostics.directory is not None:
-            self._diagnostics.register_server(process.pid)
 
     async def _create_async_session(self, connection_limit: int) -> None:
         """Create the persistent generation transport on its owning event loop."""
@@ -152,7 +143,7 @@ class VLLMHTTPClient(VLLMWeightSyncClientMixin):
             keepalive_timeout=60.0,
             force_close=False,
         )
-        timeout = aiohttp.ClientTimeout(total=self._generation_timeout)
+        timeout = aiohttp.ClientTimeout(total=self._request_timeout)
         self._async_session = aiohttp.ClientSession(
             connector=connector,
             timeout=timeout,
@@ -260,10 +251,7 @@ class VLLMHTTPClient(VLLMWeightSyncClientMixin):
                 body = await response.read()
                 status = response.status
         except (aiohttp.ClientError, asyncio.TimeoutError) as error:
-            raise RuntimeError(
-                f"vLLM HTTP {method} {route} failed: {type(error).__name__}: {error!r}; "
-                f"request_timeout={self._generation_timeout:g}s (generation budget)"
-            ) from error
+            raise RuntimeError(f"vLLM HTTP {method} {route} failed: {error}") from error
         if status >= 400:
             message = body.decode("utf-8", errors="replace")
             raise RuntimeError(
@@ -471,17 +459,13 @@ class VLLMHTTPClient(VLLMWeightSyncClientMixin):
             settings,
             request.num_choices,
         )
-        identifier = self._diagnostics.admit(request, settings.max_new_tokens)
-        try:
-            result = await self._request_async("POST", "v1/completions", payload)
-            records = self._completion_records_from_response(
-                request.prompts, request.num_choices, settings, result,
-            )
-        except Exception as error:
-            self._diagnostics.finish(identifier, error)
-            raise
-        self._diagnostics.finish(identifier)
-        return records
+        result = await self._request_async("POST", "v1/completions", payload)
+        return self._completion_records_from_response(
+            request.prompts,
+            request.num_choices,
+            settings,
+            result,
+        )
 
     @staticmethod
     def _completion_requests(
@@ -553,7 +537,6 @@ class VLLMHTTPClient(VLLMWeightSyncClientMixin):
         child_capacity: int,
     ) -> list[_CompletionRecord]:
         """Run a child-bounded rolling pool and restore stable output row order."""
-        self._diagnostics.start_batch(len(requests))
         results: list[Optional[_CompletionRecord]] = [None] * row_count
         pending = deque(requests)
         active: dict[asyncio.Task, _CompletionRequest] = {}
@@ -646,7 +629,6 @@ class VLLMHTTPClient(VLLMWeightSyncClientMixin):
 
     def close(self) -> None:
         """Terminate the server and all EngineCore descendants."""
-        self._diagnostics.close()
         runtime_error = None
         try:
             self._close_async_runtime()
@@ -796,7 +778,7 @@ class VLLMGenerationEngine:
         request_rank: int,
         request_size: int,
     ) -> None:
-        """Assign one HTTP request owner per Trainer TP group."""
+        """Assign one HTTP owner per supplied Trainer TP or flattened TP x CP group."""
         if tp_size <= 1:
             raise ValueError("Trainer TP request ownership requires tp_size > 1")
         if not 0 <= tp_rank < tp_size:
@@ -955,6 +937,11 @@ class VLLMGenerationEngine:
             if self._config.get(key) is not None:
                 command.extend((option, str(self._config[key])))
         additional_config = {}
+        if int(self._config.get("context_parallel_size", 1)) > 1:
+            command.extend(("--prefill-context-parallel-size", str(self._config["context_parallel_size"]),
+                            "--decode-context-parallel-size", "1"))
+            # HP continues owning embedding/LM-head weights and their TP layouts.
+            additional_config["enable_pcp_embedding_lmhead_weight_sharding"] = False
         if self._deployment == "colocated":
             command.append("--enable-sleep-mode")
             additional_config["weight_nz_mode"] = 0
@@ -992,6 +979,8 @@ class VLLMGenerationEngine:
                 and os.environ.get("VLLM_BATCH_INVARIANT") == "1"):
             raise ValueError("Unified Level 3 conflicts with inherited VLLM_BATCH_INVARIANT=1")
         server_environment = os.environ.copy()
+        if int(self._config.get("context_parallel_size", 1)) > 1:
+            server_environment["VLLM_USE_V2_MODEL_RUNNER"] = "1"
         for variable in _DISTRIBUTED_ENVIRONMENT_VARIABLES:
             server_environment.pop(variable, None)
         server_environment.pop("HYPER_RL_CONSISTENCY_PROFILE", None)
@@ -1033,7 +1022,7 @@ class VLLMGenerationEngine:
         local_state = verify_batch_invariant(policy)
         expected_state = {name: value for name, value in local_state.items() if name not in ("pid", "device")}
         results = client.collective_rpc("get_unified_numerical_policy")
-        expected_count = int(self._config.get("data_parallel_size", 1)) * worker_tensor_parallel_size(self._config)
+        expected_count = int(self._config.get("data_parallel_size", 1)) * model_parallel_size(self._config)
         if not isinstance(results, list) or len(results) != expected_count:
             raise RuntimeError(f"Unified numerical policy requires {expected_count} worker snapshots; got {results!r}")
         for index, result in enumerate(results):
@@ -1072,7 +1061,6 @@ class VLLMGenerationEngine:
             self._model.name,
             request_timeout=float(self._config.get("request_timeout", 600)),
             router_capture_spec=self._router_capture_spec,
-            generation_timeout=self._config.get("generation_timeout"),
         )
         try:
             client.wait_ready(float(self._config.get("startup_timeout", 300)))
@@ -1090,7 +1078,6 @@ class VLLMGenerationEngine:
             self._model.name,
             request_timeout=float(self._config.get("request_timeout", 600)),
             router_capture_spec=self._router_capture_spec,
-            generation_timeout=self._config.get("generation_timeout"),
         )
 
     def _ensure_client(self) -> Any:
@@ -1602,10 +1589,11 @@ def build_vllm_engine(
         deployment,
         rollout_model,
         tensor_parallel_size=rollout_tp,
-        data_parallel_size=int(vllm_config.get("data_parallel_size", 1)),
+        # Publication addresses each PCP replica; TP still describes weight shards.
+        data_parallel_size=(int(vllm_config.get("data_parallel_size", 1))
+                            * int(vllm_config.get("context_parallel_size", 1))),
         bucket_size_bytes=normalized_weight_sync.bucket_size_bytes,
         strategy=normalized_weight_sync.strategy,
-        transport=normalized_weight_sync.transport,
     )
     return VLLMGenerationEngine(
         model,

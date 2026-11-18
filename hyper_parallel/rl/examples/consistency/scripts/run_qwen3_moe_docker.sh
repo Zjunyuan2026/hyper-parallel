@@ -22,7 +22,11 @@ data_root=${DATA_ROOT:-${workspace_root}/data/gsm8k}
 result_root=${RESULT_ROOT:-/tmp/hyper-rl-consistency}
 v4_wheel=${V4_WHEEL:-${repo_root}/wheels/flash_attn_npu-0.5.0+hpbi1-cp312-cp312-linux_aarch64.whl}
 v4_wheel_sha256=${V4_WHEEL_SHA256:-5ef04a872b1be2c812bb0c36c17ba4776a4b5f9b9eabb24eab0a56a139a497c9}
-config=${CONFIG:-${script_dir}/../configs/qwen3_moe_4l_rl.yaml}
+default_config=${script_dir}/../configs/qwen3_moe_4l_rl.yaml
+if (( ${TRAIN_CP:-1} > 1 || ${ROLLOUT_PCP:-1} > 1 )); then
+    default_config=${script_dir}/../configs/qwen3_moe_4l_cp_rl.yaml
+fi
+config=${CONFIG:-${default_config}}
 devices=${DEVICES:-0,1,2,3}
 [[ "${devices}" =~ ^[0-9]+(,[0-9]+)*$ ]] || { printf 'DEVICES must list NPU IDs\n' >&2; exit 1; }
 IFS=',' read -r -a device_list <<<"${devices}"
@@ -95,10 +99,10 @@ if [[ -d "${extra_wheels_dir}" ]]; then
     extra_wheels_dir=$(realpath "${extra_wheels_dir}")
     extra_wheels=(-v "${extra_wheels_dir}:/runtime-wheels:ro")
 fi
-for option in TRAIN_TP TRAIN_EP TRAIN_SP ROLLOUT_TP ROLLOUT_EP ROLLOUT_SP STEPS RUNNER \
+for option in TRAIN_TP TRAIN_CP TRAIN_EP TRAIN_SP ROLLOUT_TP ROLLOUT_PCP ROLLOUT_EP ROLLOUT_SP STEPS RUNNER \
     MODEL_INIT_THREADS PROMPTS_PER_RANK CANDIDATES MAX_PROMPT MAX_MODEL_LEN MAX_NEW_TOKENS EP_CAPACITY PREFILL_TOKENS \
     MICRO_BATCH_SIZE RESPONSE_MINI_BATCH_SIZE GLOBAL_PROMPT_BATCH_SIZE MAX_NUM_SEQS \
-    KV_CACHE_MEMORY_BYTES WEIGHT_SYNC_TRANSPORT WEIGHT_BUCKET_MB GENERATION_TIMEOUT; do
+    KV_CACHE_MEMORY_BYTES WEIGHT_SYNC_TRANSPORT WEIGHT_BUCKET_MB GENERATION_TIMEOUT MC2_CAPACITY INFERENCE_EP_BACKEND; do
     if [[ -v "${option}" ]]; then portable_options+=(-e "${option}=${!option}"); fi
 done
 printf 'RUN_PLAN world=%s devices=%s layers=%s config=%s results=%s\n' "${device_count}" "${devices}" "${model_layers}" "${config}" "${result_root}"
@@ -109,6 +113,7 @@ docker run --rm --name "${container}" --privileged --network=host --shm-size="${
     -e "RUN_TIMEOUT=${RUN_TIMEOUT:-14400}" -e PYTHONUNBUFFERED=1 \
     -e HYPER_RL_DIAGNOSTICS_DIR=/results/run \
     -e "ASCEND_RT_VISIBLE_DEVICES=${devices}" -e PYTHONDONTWRITEBYTECODE=1 \
+    -e "HCCL_BUFFSIZE=${HCCL_BUFFSIZE:-512}" \
     -e HCCL_DETERMINISTIC=true -e OMP_NUM_THREADS=1 -e VLLM_WORKER_MULTIPROC_METHOD=spawn \
     -e VLLM_HOST_IP=127.0.0.1 -e GLOO_SOCKET_IFNAME=lo \
     -e "HCCL_SOCKET_IFNAME=${HCCL_SOCKET_IFNAME:-lo}" \

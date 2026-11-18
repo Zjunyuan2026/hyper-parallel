@@ -65,11 +65,12 @@ class TestConsistencyExample(unittest.TestCase):
                   "logging": {"log_steps": 1}, "rollout": {"vllm": {}}}
         for complete, retained in ((True, True), (False, True), (True, False)):
             trainer = SimpleNamespace(state=SimpleNamespace(global_step=0),
-                                      targets=SimpleNamespace(prepare=lambda *_: (None, _metrics())),
-                                      _tracker=SimpleNamespace(log=lambda *args, **kwargs: None),
-                                      rollout_manager=SimpleNamespace(generate=lambda *args: None),
-                                      actor=SimpleNamespace(update=lambda *args: None),
-                                      publication=SimpleNamespace(publish=lambda *args: None))
+                                      targets=SimpleNamespace(prepare=lambda *_: (None, _metrics())))
+
+            trainer.rollout_manager = SimpleNamespace(generate=lambda *args: None)
+            trainer.actor = SimpleNamespace(update=lambda *args: None)
+            trainer.publication = SimpleNamespace(publish=lambda *args: None)
+            trainer._tracker = SimpleNamespace(log=lambda *args, **kwargs: None)
 
             def _train(complete=complete, retained=retained, trainer=trainer):
                 for step in range(1, 3):
