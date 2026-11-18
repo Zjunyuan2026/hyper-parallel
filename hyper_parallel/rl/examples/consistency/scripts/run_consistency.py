@@ -30,6 +30,7 @@ import yaml
 from rl.config.loader import load_config
 from rl.trainer.build import build_trainer
 from rl.trainer.distributed import run_synchronized
+from examples.consistency.scripts.learning_check import LearningObserver
 
 
 def check_metrics(metrics: dict[str, float]) -> dict[str, float]:
@@ -72,6 +73,13 @@ def run(config: dict[str, Any], report_path: Path) -> None:
     phases.next_step = lambda: trainer.state.global_step + 1
     prepare = trainer.targets.prepare
     checks = []
+    gate = config["train"].get("learning_gate", {})
+    learning = None
+    if gate.get("enabled", False):
+        if requested_steps < 2:
+            raise ValueError("Real learning acceptance requires at least two steps")
+        learning = LearningObserver(trainer, report_path.parent, float(gate.get("min_gradient_norm", 0)))
+        learning.install()
 
     def _checked_prepare(rollout, collect_diagnostics, timings):
         if rollout.rollout_log_probs is None:
@@ -79,6 +87,8 @@ def run(config: dict[str, Any], report_path: Path) -> None:
         experience, metrics = prepare(rollout, collect_diagnostics, timings)
         observed = check_metrics_on_all_ranks(metrics)
         checks.append({"step": trainer.state.global_step + 1, **observed})
+        if learning is not None:
+            learning.verified_probabilities(trainer.state.global_step + 1)
         if int(os.environ.get("RANK", "0")) == 0:
             logging.info("CONSISTENCY_CHECK %s", json.dumps(checks[-1]))
         return experience, metrics
@@ -99,10 +109,13 @@ def run(config: dict[str, Any], report_path: Path) -> None:
     if (trainer.state.global_step != requested_steps
             or [check["step"] for check in checks] != list(range(1, requested_steps + 1))):
         raise RuntimeError("The normal RL loop did not complete and verify every requested update")
+    if learning is not None and (not learning.records or not learning.records[0]["next_step_logp_verified"]):
+        raise RuntimeError("Updated policy was not verified in the following rollout")
     if int(os.environ.get("RANK", "0")) == 0:
         report = {"passed": True, "requested_steps": requested_steps,
                   "completed_steps": trainer.state.global_step, "checks": checks,
                   "metrics": observer.rows,
+                  "learning_checks": learning.records if learning is not None else [],
                   "training": config["train"]["accelerator"],
                   "rollout": config["rollout"]["vllm"],
                   "scope": "sampled-token log probabilities before each optimizer update"}

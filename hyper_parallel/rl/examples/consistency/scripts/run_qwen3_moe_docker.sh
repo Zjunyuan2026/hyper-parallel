@@ -102,7 +102,7 @@ fi
 for option in TRAIN_TP TRAIN_CP TRAIN_EP TRAIN_SP ROLLOUT_TP ROLLOUT_PCP ROLLOUT_EP ROLLOUT_SP STEPS RUNNER \
     MODEL_INIT_THREADS PROMPTS_PER_RANK CANDIDATES MAX_PROMPT MAX_MODEL_LEN MAX_NEW_TOKENS EP_CAPACITY PREFILL_TOKENS \
     MICRO_BATCH_SIZE RESPONSE_MINI_BATCH_SIZE GLOBAL_PROMPT_BATCH_SIZE MAX_NUM_SEQS \
-    KV_CACHE_MEMORY_BYTES WEIGHT_SYNC_TRANSPORT WEIGHT_BUCKET_MB GENERATION_TIMEOUT MC2_CAPACITY INFERENCE_EP_BACKEND; do
+    KV_CACHE_MEMORY_BYTES WEIGHT_SYNC_TRANSPORT WEIGHT_BUCKET_MB GENERATION_TIMEOUT MC2_CAPACITY INFERENCE_EP_BACKEND REQUIRE_LEARNING LEARNING_PROMPT_ROWS; do
     if [[ -v "${option}" ]]; then portable_options+=(-e "${option}=${!option}"); fi
 done
 printf 'RUN_PLAN world=%s devices=%s layers=%s config=%s results=%s\n' "${device_count}" "${devices}" "${model_layers}" "${config}" "${result_root}"
@@ -166,6 +166,11 @@ docker run --rm --name "${container}" --privileged --network=host --shm-size="${
                 --source /models/Qwen3-30B-A3B --output "$RUN_MODEL_PATH" --layers "$MODEL_LAYERS" --reuse
         fi
         phase=configuration
+        if [[ "${REQUIRE_LEARNING:-false}" == true && -n "${LEARNING_PROMPT_ROWS:-}" ]]; then
+            python hyper_parallel/rl/examples/consistency/scripts/select_learning_prompts.py \
+                --source /data/gsm8k/train.parquet --rows "$LEARNING_PROMPT_ROWS" \
+                --output /results/run/learning-data/train.parquet --minimum-rows "$(( DEVICE_COUNT * 2 ))"
+        fi
         python hyper_parallel/rl/examples/consistency/scripts/configure_run.py \
             /run-config.yaml /results/run/generated-config.yaml --world "$DEVICE_COUNT"
         phase=train

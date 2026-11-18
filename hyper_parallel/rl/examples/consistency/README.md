@@ -308,3 +308,44 @@ git switch A3_hyper_rl
 
 ??????? Git ???????A3 ??????
 [A3 ????](A3_OPS_REPAIR.md)?????????? [A3 ????](A3_TEST_GUIDE.md)?
+
+## Real GSM8K learning acceptance
+
+Use this mode to verify an actual optimizer update, weight publication, and the next rollout's exact
+sampled-token log probabilities. It keeps the strict GSM8K scorer and the recipe learning rate.
+No alternating or synthetic rewards are injected. Ordinary runs remain forward-consistency checks.
+
+Select original prepared training rows and allow complete answers:
+
+```bash
+export MAX_PROMPT=512 MAX_NEW_TOKENS=1536 MAX_MODEL_LEN=2048
+export PREFILL_TOKENS=128 MC2_CAPACITY=256
+export MAX_NUM_SEQS=4 KV_CACHE_MEMORY_BYTES=1073741824
+export MICRO_BATCH_SIZE=1 RESPONSE_MINI_BATCH_SIZE=8 PROMPTS_PER_RANK=1
+unset GLOBAL_PROMPT_BATCH_SIZE
+export LEARNING_PROMPT_ROWS=4483,310
+
+bash run_a3.sh --layers 0 --steps 2 --candidates 8 --transport ipc \
+  --train-tp 4 --train-ep 4 --train-sp false \
+  --rollout-tp 4 --rollout-ep 4 --rollout-sp false \
+  --require-learning
+```
+
+These zero-based row indices refer to the checked 7473-row prepared GSM8K training set.
+The selector preserves original questions and labels, records source/subset hashes, and repeats selected
+records only to supply distributed batches. The subset is an acceptance fixture, not an accuracy
+benchmark. Inspect the source questions if your prepared dataset uses a different row order.
+
+`--require-learning` enables the existing learning gate for the first step and records bounded owned-weight
+probes. A changed probe is positive evidence of an actual parameter update. If all sampled probes remain
+unchanged, the check fails without claiming that every unsampled value was inspected.
+At least one group must produce nonzero advantages, the reported gradient must be finite and positive,
+and an actual weight change must be witnessed. Publication must complete before the following rollout
+passes the unchanged strict zero-logp-difference gate. The second step may naturally have uniform rewards;
+the required evidence is the next-policy probability check after a nonzero first update.
+
+Inspect `run/learning-step*-rank*.json`, `run/steps.jsonl`, and `run/consistency.json`.
+The first learning record must have `publication_completed: true` and `next_step_logp_verified: true`.
+Natural sampling is not guaranteed to reproduce mixed rewards on every device or topology. A uniform
+first group fails clearly; it is never replaced by fabricated rewards. Strict GSM8K scoring can give zero
+for a mathematically correct answer whose final format does not match `#### NUMBER`.

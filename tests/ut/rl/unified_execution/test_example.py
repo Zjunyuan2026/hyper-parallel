@@ -98,6 +98,29 @@ class TestConsistencyExample(unittest.TestCase):
                             run(config, report)
                         self.assertFalse(report.exists(), "A failed run must not leave a success report")
 
+    def test_learning_report_rejects_missing_optimizer_observations(self):
+        """A completed loop counter alone cannot claim an actual learned policy."""
+        trainer = SimpleNamespace(state=SimpleNamespace(global_step=0),
+                                  targets=SimpleNamespace(prepare=lambda *_: (None, _metrics())),
+                                  rollout_manager=SimpleNamespace(generate=lambda *_: None),
+                                  actor=SimpleNamespace(update=lambda *_: None),
+                                  publication=SimpleNamespace(publish=lambda *_: None),
+                                  _tracker=SimpleNamespace(log=lambda *args, **kwargs: None))
+        def train():
+            for step in (1, 2):
+                trainer.targets.prepare(SimpleNamespace(rollout_log_probs=object()), True, {})
+                trainer.state.global_step = step
+        trainer.train = train
+        config = {"train": {"max_steps": 2, "accelerator": {}, "learning_gate": {"enabled": True}},
+                  "logging": {"log_steps": 1}, "rollout": {"vllm": {}}}
+        module = "hyper_parallel.rl.examples.consistency.scripts.run_consistency."
+        with TemporaryDirectory() as directory, patch(module + "build_trainer", return_value=trainer), \
+             patch(module + "run_synchronized", side_effect=lambda name, callback: callback()):
+            report = Path(directory) / "consistency.json"
+            with self.assertRaisesRegex(RuntimeError, "Updated policy"):
+                run(config, report)
+            self.assertFalse(report.exists())
+
     def test_nonzero_rank_uses_global_verdict_without_local_metrics(self):
         """Nonzero ranks receive empty metrics but must share rank zero's failure."""
         with patch.dict("os.environ", {"RANK": "1"}), patch("rl.trainer.distributed.dist") as distributed:

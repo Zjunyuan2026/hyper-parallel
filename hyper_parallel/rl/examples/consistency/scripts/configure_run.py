@@ -143,6 +143,13 @@ def configure(config: dict, world: int) -> dict:
         implementation = rule.get("replace", {}).get("implementation", {})
         if implementation.get("_target_", "").endswith("unified_ep_compute_fn"):
             implementation.update(mc2_capacity=capacity, inference_backend=backend)
+    if boolean("REQUIRE_LEARNING", False):
+        if runner != "internal" or train["max_steps"] < 2 or candidates < 2:
+            raise ValueError("Real learning acceptance requires internal GSM8K, >=2 steps and >=2 candidates")
+        train["learning_gate"].update(enabled=True, min_gradient_norm=1e-12,
+                                      require_mixed_rewards=True, max_step=1)
+        if os.environ.get("LEARNING_PROMPT_ROWS"):
+            config["data"]["train_path"] = "/results/run/learning-data/train.parquet"
     return config
 
 
