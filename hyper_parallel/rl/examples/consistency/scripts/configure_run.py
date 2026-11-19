@@ -95,7 +95,12 @@ def configure(config: dict, world: int) -> dict:
         inference["request_timeout"] = integer("GENERATION_TIMEOUT", 1800)
     inference["max_num_seqs"] = integer("MAX_NUM_SEQS", 2)
     inference["kv_cache_memory_bytes"] = integer("KV_CACHE_MEMORY_BYTES", 536870912)
-    config["data"]["max_train_samples"] = max(4, dp_size * train["prompt_batch_size"])
+    full_dataset = boolean("FULL_DATASET", False)
+    if full_dataset and os.environ.get("LEARNING_PROMPT_ROWS"):
+        raise ValueError("Full dataset mode requires LEARNING_PROMPT_ROWS to be unset")
+    config["data"]["max_train_samples"] = None if full_dataset else max(4, dp_size * train["prompt_batch_size"])
+    if full_dataset:
+        config["data"]["shuffle"] = True
     config["logging"]["log_steps"] = 1
     config["logging"]["log_samples"] = 2
     config["model"]["weights_path"] = os.environ["RUN_MODEL_PATH"]
@@ -168,7 +173,9 @@ def main() -> None:
           "interaction=", config["agentic"]["interaction_mode"], "data=", config["data"]["train_path"],
           "max_prompt=", config["data"]["max_prompt_length"],
           "max_new_tokens=", config["rollout"]["max_new_tokens"],
-          "max_model_len=", config["rollout"]["vllm"]["max_model_len"], flush=True)
+          "max_model_len=", config["rollout"]["vllm"]["max_model_len"],
+          "max_train_samples=", config["data"]["max_train_samples"],
+          "shuffle=", config["data"]["shuffle"], flush=True)
     print("CONFIG_READY", args.destination, "training=", config["train"]["accelerator"],
           "rollout=", config["rollout"]["vllm"], flush=True)
 

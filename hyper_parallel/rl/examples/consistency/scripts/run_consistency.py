@@ -56,7 +56,7 @@ def check_metrics_on_all_ranks(metrics: dict[str, float]) -> dict[str, float]:
     )
 
 
-def run(config: dict[str, Any], report_path: Path) -> None:
+def run(config: dict[str, Any], report_path: Path, *, track_updates: bool = False) -> None:
     """Observe production diagnostics without changing tokens, rewards or numerical paths."""
     requested_steps = config["train"]["max_steps"]
     if isinstance(requested_steps, bool) or not isinstance(requested_steps, int) or requested_steps < 1:
@@ -75,10 +75,12 @@ def run(config: dict[str, Any], report_path: Path) -> None:
     checks = []
     gate = config["train"].get("learning_gate", {})
     learning = None
-    if gate.get("enabled", False):
-        if requested_steps < 2:
+    require_learning = bool(gate.get("enabled", False))
+    if require_learning or track_updates:
+        if require_learning and requested_steps < 2:
             raise ValueError("Real learning acceptance requires at least two steps")
-        learning = LearningObserver(trainer, report_path.parent, float(gate.get("min_gradient_norm", 0)))
+        learning = LearningObserver(trainer, report_path.parent, float(gate.get("min_gradient_norm", 0)),
+                                    require_first_update=require_learning)
         learning.install()
 
     def _checked_prepare(rollout, collect_diagnostics, timings):
@@ -109,8 +111,10 @@ def run(config: dict[str, Any], report_path: Path) -> None:
     if (trainer.state.global_step != requested_steps
             or [check["step"] for check in checks] != list(range(1, requested_steps + 1))):
         raise RuntimeError("The normal RL loop did not complete and verify every requested update")
-    if learning is not None and (not learning.records or not learning.records[0]["next_step_logp_verified"]):
+    if require_learning and (not learning.records or not learning.records[0]["next_step_logp_verified"]):
         raise RuntimeError("Updated policy was not verified in the following rollout")
+    if learning is not None and len(learning.records) != requested_steps:
+        raise RuntimeError("Missing optimizer update observation records")
     if int(os.environ.get("RANK", "0")) == 0:
         report = {"passed": True, "requested_steps": requested_steps,
                   "completed_steps": trainer.state.global_step, "checks": checks,
@@ -191,6 +195,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config")
     parser.add_argument("--report", type=Path, default=Path("/results/run/consistency.json"))
+    parser.add_argument("--track-updates", action="store_true",
+                        default=os.environ.get("TRACK_UPDATES", "false") == "true")
     args, overrides = parser.parse_known_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
     started = time.monotonic()
@@ -207,7 +213,7 @@ def main() -> None:
                 args.report.with_name(name).unlink(missing_ok=True)
         logging.info("RUN_START rank=%d topology=%s rollout=%s", rank,
                      config["train"]["accelerator"], config["rollout"]["vllm"])
-        run(config, args.report)
+        run(config, args.report, track_updates=args.track_updates)
         summary.update(passed=True, stage="completed")
     except BaseException as error:
         summary.update(error_type=type(error).__name__, error=str(error), traceback=traceback.format_exc())

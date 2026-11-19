@@ -349,3 +349,73 @@ The first learning record must have `publication_completed: true` and `next_step
 Natural sampling is not guaranteed to reproduce mixed rewards on every device or topology. A uniform
 first group fails clearly; it is never replaced by fabricated rewards. Strict GSM8K scoring can give zero
 for a mathematically correct answer whose final format does not match `#### NUMBER`.
+
+## Full-source 50-step GSM8K run
+
+The short preset uses the full prepared training split as a shuffled source and keeps the original
+GSM8K scoring rule. It does not select only the earlier two acceptance questions.
+
+Run from the repository root with the previously validated A3 image/model/data configuration:
+
+```bash
+git pull --ff-only origin A3_hyper_rl
+# Check the new all-different topology before the longer run:
+bash run_a3_gsm8k50.sh --steps 2
+# Start a fresh50-step run from the original model:
+bash run_a3_gsm8k50.sh
+```
+
+| Setting | Training | Rollout |
+| --- | --- | --- |
+| TP | 4 | 2 |
+| DP | 2 | 8 |
+| SP | true | false |
+| EP | 4 | 8 |
+| CP / PCP | CP2 | PCP1 |
+
+The preset requires16 logical devices. All five parallel settings differ; DCP stays1.
+This new topology still requires target A3 acceptance. A CPU configuration check is not device validation.
+
+Defaults are50 steps,4 prompts per training DP rank,4 candidates per prompt, micro-batch1,
+and response mini-batch16. With policy-update epochs1, this is one optimizer mini-batch per training step.
+The run processes400 source prompt rows and generates1600 candidate answers. All7473 source rows remain
+available to the shuffled loader;400 rows are used in this run, not the entire dataset.
+
+For a smaller run, use `bash run_a3_gsm8k50.sh --prompts 2` (200 prompt rows and800 answers over50 steps).
+`--steps` and `--candidates` can also be overridden. Workload defaults deliberately override old smoke-test
+`STEPS`, `PROMPTS_PER_RANK`, `CANDIDATES`, and response mini-batch settings.
+Other existing environment settings, including image identity checks, remain in effect.
+The preset clears the earlier `LEARNING_PROMPT_ROWS` filter and `GLOBAL_PROMPT_BATCH_SIZE`.
+
+Generation defaults to1024 output tokens,512 prompt tokens and4096 total-context tokens.
+The measured prepared dataset has7473 rows and a maximum239 prompt tokens with the configured template.
+The preset timeout defaults to28800 seconds and can be changed with `RUN_TIMEOUT`. Runtime is not guaranteed;
+measure this topology and batch size before estimating the full run.
+
+Every requested step retains the unchanged strict sampled-token logp gate. `--track-updates` records
+parameter-change witnesses, gradient norms, publications and subsequent probability checks.
+Uniform-reward groups and genuine zero gradients are recorded normally; nonfinite evidence still fails.
+This differs from `--require-learning`, which requires a nonzero first-step update and is not enabled
+by the full-source preset. Neither mode injects rewards or changes the recipe learning rate.
+
+After training, CPU-only Matplotlib automatically writes the following files under the run directory:
+
+- `run/plots/reward.png` and `.svg`: raw training reward mean and population standard deviation.
+- `run/plots/loss.png` and `.svg`: signed total, policy and KL losses when present.
+- `run/plots/consistency.png` and `.svg`: exact maximum and mean logp differences.
+- `run/plots/training-curves.png` and `.svg`: the three-panel overview with actual topology.
+- `run/plots/plot-summary.json`: completion state, invalid/missing evidence and update witnesses.
+
+Missing measurements are not replaced by zeros. Failed or partial runs are marked accordingly.
+Plots of completed steps do not certify missing later steps. These are training-batch rewards, not held-out
+GSM8K accuracy, and a50-step run is not by itself evidence of convergence.
+
+To regenerate plots in a Python environment with Matplotlib and PyYAML:
+
+```bash
+python hyper_parallel/rl/examples/consistency/scripts/plot_training.py /path/to/results/run
+```
+
+The preset retains the example's default `save_final: false`: logs and figures are saved, but model and
+optimizer checkpoints are not. Use an explicit recipe enabling `train.checkpoint.save_final` if persisted
+training weights are required; account for model and optimizer-state storage.

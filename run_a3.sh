@@ -18,7 +18,7 @@ Usage: bash run_a3.sh [--steps N] [--tp N] [--ep N] [--sp true|false]
                       [--layers N] [--train-tp N] [--rollout-tp N]
                       [--train-ep N] [--rollout-ep N] [--train-sp BOOL] [--rollout-sp BOOL]
                       [--micro-batch N] [--prompts N] [--candidates N]
-                      [--transport auto|ipc] [--train-cp N] [--rollout-pcp N] [--require-learning] [--dry-run]
+                      [--transport auto|ipc] [--train-cp N] [--rollout-pcp N] [--require-learning] [--full-data] [--track-updates] [--plot] [--dry-run]
 
 Defaults: full Qwen3-30B-A3B, 2 steps, TP4/EP4/SP=false, all 16 logical devices.
 Each candidate generates at most 32 tokens for consistency validation.
@@ -40,7 +40,11 @@ MICRO_BATCH_SIZE, RESPONSE_MINI_BATCH_SIZE, GLOBAL_PROMPT_BATCH_SIZE,
 MAX_NUM_SEQS, KV_CACHE_MEMORY_BYTES, WEIGHT_SYNC_TRANSPORT, WEIGHT_BUCKET_MB,
 GENERATION_TIMEOUT (HTTP request timeout; default 1800),
 MC2_CAPACITY (1..256), INFERENCE_EP_BACKEND (auto|mc2|allgather),
-REQUIRE_LEARNING (true|false), LEARNING_PROMPT_ROWS (original GSM8K row indices)
+REQUIRE_LEARNING, FULL_DATASET, TRACK_UPDATES, PLOT_TRAINING (true|false),
+LEARNING_PROMPT_ROWS (original GSM8K row indices).
+--full-data loads and shuffles the complete training split; 50 steps need not cover one epoch.
+--track-updates records actual updates without requiring a nonzero first step.
+--plot writes reward, loss and strict logp-difference plots to run/plots.
 are also supported. GLOBAL_PROMPT_BATCH_SIZE keeps workload fixed across TP.
 Missing images load from IMAGE_ARCHIVE (default shared images/a3-runtime.tar.gz).
 A stopped image-reference container is retained; no NPU is used by that container.
@@ -68,6 +72,8 @@ export WEIGHT_SYNC_TRANSPORT=${WEIGHT_SYNC_TRANSPORT:-auto}
 export PROMPTS_PER_RANK=${PROMPTS_PER_RANK:-1} CANDIDATES=${CANDIDATES:-2}
 # This entry always runs direct GSM8K, without inheriting a Codex runner/profile.
 export REQUIRE_LEARNING=${REQUIRE_LEARNING:-false}
+export FULL_DATASET=${FULL_DATASET:-false} TRACK_UPDATES=${TRACK_UPDATES:-false}
+export PLOT_TRAINING=${PLOT_TRAINING:-false}
 export RUNNER=internal
 unset PROFILE
 dry_run=false
@@ -76,6 +82,9 @@ while (( $# )); do
         --help|-h) usage; exit 0 ;;
         --dry-run) dry_run=true; shift ;;
         --require-learning) export REQUIRE_LEARNING=true; shift ;;
+        --full-data) export FULL_DATASET=true; shift ;;
+        --track-updates) export TRACK_UPDATES=true; shift ;;
+        --plot) export PLOT_TRAINING=true; shift ;;
         --train-cp|--rollout-pcp|--train-tp|--train-ep|--train-sp|--rollout-tp|--rollout-ep|--rollout-sp|--micro-batch|--prompts|--candidates|--transport)
             (( $# >= 2 )) || { printf 'Missing value for %s\n' "$1" >&2; exit 2; }
             case "$1" in
@@ -104,13 +113,17 @@ for name in STEPS TRAIN_TP TRAIN_CP TRAIN_EP ROLLOUT_TP ROLLOUT_PCP ROLLOUT_EP G
     [[ ${!name} =~ ^[1-9][0-9]*$ ]] || { printf '%s must be positive\n' "$name" >&2; exit 2; }
 done
 [[ $MODEL_LAYERS =~ ^[0-9]+$ ]] || { printf 'MODEL_LAYERS must be nonnegative\n' >&2; exit 2; }
-for name in TRAIN_SP ROLLOUT_SP REQUIRE_LEARNING; do
+for name in TRAIN_SP ROLLOUT_SP REQUIRE_LEARNING FULL_DATASET TRACK_UPDATES PLOT_TRAINING; do
     [[ ${!name} == true || ${!name} == false ]] || {
         printf '%s must be true or false\n' "$name" >&2; exit 2;
     }
 done
 if [[ $WEIGHT_SYNC_TRANSPORT != auto && $WEIGHT_SYNC_TRANSPORT != ipc ]]; then
     printf 'Colocated HCCL weight transfer is unsupported: Actor and rollout share a device; use --transport ipc\n' >&2
+    exit 2
+fi
+if [[ $FULL_DATASET == true && -n "${LEARNING_PROMPT_ROWS:-}" ]]; then
+    printf 'Full dataset mode requires LEARNING_PROMPT_ROWS to be unset\n' >&2
     exit 2
 fi
 result_base=${RESULT_BASE:-${RESULT_ROOT:-/home/z00988596/results/consistency}}
@@ -125,8 +138,12 @@ image_id_file=${IMAGE_ID_FILE:-${SHARED_ROOT}/images/a3-runtime.id}
 for name in IMAGE MODEL_ROOT DATA_ROOT DEVICES RUNNER MODEL_LAYERS STEPS \
     TRAIN_TP TRAIN_CP TRAIN_EP TRAIN_SP ROLLOUT_TP ROLLOUT_PCP ROLLOUT_EP ROLLOUT_SP \
     MAX_PROMPT MAX_NEW_TOKENS MAX_MODEL_LEN EP_CAPACITY PROMPTS_PER_RANK CANDIDATES MICRO_BATCH_SIZE MAX_NUM_SEQS \
-    WEIGHT_SYNC_TRANSPORT GENERATION_TIMEOUT PREFILL_TOKENS REQUIRE_LEARNING RESULT_ROOT; do
+    WEIGHT_SYNC_TRANSPORT GENERATION_TIMEOUT PREFILL_TOKENS REQUIRE_LEARNING FULL_DATASET TRACK_UPDATES PLOT_TRAINING RESULT_ROOT; do
     printf '%s=%q\n' "$name" "${!name}"
+done
+for name in RESPONSE_MINI_BATCH_SIZE GLOBAL_PROMPT_BATCH_SIZE KV_CACHE_MEMORY_BYTES RUN_TIMEOUT \
+    MC2_CAPACITY INFERENCE_EP_BACKEND; do
+    if [[ -v "$name" ]]; then printf "%s=%q\n" "$name" "${!name}"; fi
 done
 printf 'IMAGE_ID_FILE=%q\n' "$image_id_file"
 if $dry_run; then exit 0; fi

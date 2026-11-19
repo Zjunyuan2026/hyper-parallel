@@ -102,7 +102,7 @@ fi
 for option in TRAIN_TP TRAIN_CP TRAIN_EP TRAIN_SP ROLLOUT_TP ROLLOUT_PCP ROLLOUT_EP ROLLOUT_SP STEPS RUNNER \
     MODEL_INIT_THREADS PROMPTS_PER_RANK CANDIDATES MAX_PROMPT MAX_MODEL_LEN MAX_NEW_TOKENS EP_CAPACITY PREFILL_TOKENS \
     MICRO_BATCH_SIZE RESPONSE_MINI_BATCH_SIZE GLOBAL_PROMPT_BATCH_SIZE MAX_NUM_SEQS \
-    KV_CACHE_MEMORY_BYTES WEIGHT_SYNC_TRANSPORT WEIGHT_BUCKET_MB GENERATION_TIMEOUT MC2_CAPACITY INFERENCE_EP_BACKEND REQUIRE_LEARNING LEARNING_PROMPT_ROWS; do
+    KV_CACHE_MEMORY_BYTES WEIGHT_SYNC_TRANSPORT WEIGHT_BUCKET_MB GENERATION_TIMEOUT MC2_CAPACITY INFERENCE_EP_BACKEND REQUIRE_LEARNING LEARNING_PROMPT_ROWS FULL_DATASET TRACK_UPDATES PLOT_TRAINING; do
     if [[ -v "${option}" ]]; then portable_options+=(-e "${option}=${!option}"); fi
 done
 printf 'RUN_PLAN world=%s devices=%s layers=%s config=%s results=%s\n' "${device_count}" "${devices}" "${model_layers}" "${config}" "${result_root}"
@@ -157,6 +157,9 @@ docker run --rm --name "${container}" --privileged --network=host --shm-size="${
             [[ "$(codex --version)" == "codex-cli 0.152.1" ]]
             export SHELL=/bin/bash
         fi
+        if [[ "${PLOT_TRAINING:-false}" == true ]]; then
+            python -c "from matplotlib.figure import Figure"
+        fi
         phase=checkpoint
         printf "PHASE checkpoint %s\n" "$(date -Is)"
         export RUN_MODEL_PATH=/models/Qwen3-30B-A3B
@@ -175,9 +178,27 @@ docker run --rm --name "${container}" --privileged --network=host --shm-size="${
             /run-config.yaml /results/run/generated-config.yaml --world "$DEVICE_COUNT"
         phase=train
         printf "PHASE train %s\n" "$(date -Is)"
+        set +e
         timeout --signal=TERM --kill-after=60s "$RUN_TIMEOUT" \
             python -m torch.distributed.run --standalone --local-addr=127.0.0.1 --nproc_per_node="$DEVICE_COUNT" \
             --log-dir /results/run/torchrun --redirects 3 --tee 3 \
             hyper_parallel/rl/examples/consistency/scripts/run_consistency.py /results/run/generated-config.yaml \
             --report /results/run/consistency.json "$@" 2>&1 | tee /results/run/train.log
+        train_status=("${PIPESTATUS[@]}")
+        set -e
+        printf "TRAIN_EXIT code=%s\n" "${train_status[0]}"
+        plot_code=0
+        if [[ "${PLOT_TRAINING:-false}" == true && -s /results/run/steps.jsonl ]]; then
+            phase=plot
+            set +e
+            python hyper_parallel/rl/examples/consistency/scripts/plot_training.py /results/run \
+                > /results/run/plot.log 2>&1
+            plot_code=$?
+            set -e
+            cat /results/run/plot.log
+            printf "PLOT_EXIT code=%s\n" "$plot_code"
+        fi
+        if (( train_status[0] != 0 )); then phase=train; exit "${train_status[0]}"; fi
+        if (( train_status[1] != 0 )); then phase=train_log; exit "${train_status[1]}"; fi
+        exit "$plot_code"
     ' hyper-rl-consistency "$@"

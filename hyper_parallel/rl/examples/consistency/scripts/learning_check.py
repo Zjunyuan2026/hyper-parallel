@@ -36,13 +36,15 @@ def parameter_samples(model: Any) -> dict[str, torch.Tensor]:
 
 
 class LearningObserver:
-    """Require first-step learning and retain publication/next-step consistency evidence."""
+    """Observe updates and retain publication/next-step consistency evidence."""
 
-    def __init__(self, trainer: Any, directory: Path, minimum_gradient: float) -> None:
+    def __init__(self, trainer: Any, directory: Path, minimum_gradient: float,
+                 *, require_first_update: bool = True) -> None:
         """Bind observation state to one ordinary trainer and evidence directory."""
         self.trainer = trainer
         self.directory = directory
         self.minimum_gradient = minimum_gradient
+        self.require_first_update = require_first_update
         self.records: list[dict[str, Any]] = []
 
     def install(self) -> None:
@@ -56,14 +58,16 @@ class LearningObserver:
             advantages = experience.advantages
             mask = experience.action_mask[:, 1:].bool()
             valid = advantages[mask]
-            nonzero = bool(valid.numel() and torch.isfinite(valid).all() and torch.any(valid != 0))
+            finite_advantages = bool(torch.isfinite(valid).all())
+            nonzero = bool(valid.numel() and finite_advantages and torch.any(valid != 0))
             metrics = update(experience)
             after = parameter_samples(self.trainer.actor.actor_model)
             changed_names = [name for name, value in before.items() if not torch.equal(value, after[name])]
             gradient = float(metrics.gradient_norm)
             evidence = torch.tensor(
                 [int(nonzero), int(bool(changed_names)),
-                 int(math.isfinite(gradient) and gradient > self.minimum_gradient)],
+                 int(math.isfinite(gradient) and gradient > self.minimum_gradient),
+                 int(math.isfinite(gradient) and gradient >= 0 and finite_advantages)],
                 dtype=torch.int64, device=self.trainer.device)
             dist.all_reduce(evidence, op=dist.ReduceOp.SUM)
             record = {
@@ -72,13 +76,17 @@ class LearningObserver:
                 "ranks_with_nonzero_advantages": int(evidence[0]),
                 "ranks_with_weight_changes": int(evidence[1]),
                 "ranks_with_positive_finite_gradient": int(evidence[2]),
+                "ranks_with_finite_update_evidence": int(evidence[3]),
                 "publication_completed": False, "next_step_logp_verified": False,
                 "weight_probe": "up to 1024 values per owned parameter; positive change witness",
             }
             self.records.append(record)
             self.save(record)
-            if step == 1 and (not bool(evidence[0]) or not bool(evidence[1])
-                              or int(evidence[2]) != dist.get_world_size()):
+            if int(evidence[3]) != dist.get_world_size():
+                raise RuntimeError("Nonfinite real learning check failed; see learning-step*-rank*.json")
+            if (self.require_first_update and step == 1
+                    and (not bool(evidence[0]) or not bool(evidence[1])
+                         or int(evidence[2]) != dist.get_world_size())):
                 raise RuntimeError("First-step real learning check failed; see learning-step1-rank*.json")
             return metrics
 

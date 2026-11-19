@@ -121,6 +121,31 @@ class RealLearningChecks(unittest.TestCase):
                 self.trainer.publication.publish(1)
             self.assertFalse(self.observer.records[0]["publication_completed"])
 
+    def test_tracking_allows_uniform_reward_zero_gradient_steps(self) -> None:
+        """Full-source training records legitimate zero updates without fabricating rewards."""
+        with TemporaryDirectory() as directory:
+            observer = learning_check.LearningObserver(
+                self.trainer, Path(directory), 0, require_first_update=False)
+            self.experience.advantages.zero_()
+            observer.install()
+            result = self.trainer.actor.update(self.experience)
+            self.assertEqual(result.gradient_norm, 0)
+            self.assertFalse(observer.records[0]["local_weights_changed"])
+            self.trainer.publication.publish(1)
+            observer.verified_probabilities(2)
+            self.assertTrue(observer.records[0]["next_step_logp_verified"])
+
+    def test_tracking_still_rejects_nonfinite_gradients(self) -> None:
+        """Observation mode is not permission to ignore numerical failures."""
+        with TemporaryDirectory() as directory:
+            self.trainer.actor.update = lambda experience: SimpleNamespace(gradient_norm=float("nan"))
+            observer = learning_check.LearningObserver(
+                self.trainer, Path(directory), 0, require_first_update=False)
+            observer.install()
+            with self.assertRaisesRegex(RuntimeError, "Nonfinite"):
+                self.trainer.actor.update(self.experience)
+
+
 class RealPromptSelectionTests(unittest.TestCase):
     """Keep real labels private and unchanged while materializing an acceptance subset."""
 
