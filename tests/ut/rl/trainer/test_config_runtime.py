@@ -582,6 +582,36 @@ def test_colocated_resident_dense_grpo_retains_topology_guards(validation_config
         validate_config(validation_config, build_algorithm(validation_config["algorithm"]))
 
 
+@pytest.mark.parametrize("opt_in,implementation,offload,accepted", [
+    (False, "unified", False, False),
+    (True, "unified", False, True),
+    (True, "native", False, False),
+    (True, "unified", True, False),
+    ("true", "unified", False, False),
+])
+def test_experimental_resident_moe_keeps_explicit_boundary(
+    monkeypatch, opt_in, implementation, offload, accepted,
+):
+    """Only explicit unified MoE residency reaches the existing topology validator."""
+    calls = []
+    monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda: torch.device("npu"))
+    monkeypatch.setattr(config_module, "_validate_vllm_basics", lambda _: ("colocated", 8, 2))
+    monkeypatch.setattr(config_module, "_trainer_world_size", lambda _: 16)
+    monkeypatch.setattr(config_module, "_validate_colocated_vllm", lambda *args: calls.append("topology"))
+    monkeypatch.setattr(config_module, "_validate_vllm_limits", lambda _: None)
+    monkeypatch.setattr(config_module, "resolve_vllm_model", lambda *args: SimpleNamespace(family="qwen3_moe"))
+    monkeypatch.setattr(config_module, "resolve_weight_sync_config", lambda *args, **kwargs: None)
+    rollout = {"vllm": {"model_implementation": implementation}}
+    accelerator = {"tp": 4, "cpu_offload": offload, "experimental_moe_device_residency": opt_in}
+    if accepted:
+        config_module._validate_vllm(rollout, accelerator, SimpleNamespace(family="qwen3_moe"))
+        assert calls == ["topology"]
+    else:
+        with pytest.raises(ValueError, match="device.residen"):
+            config_module._validate_vllm(rollout, accelerator, SimpleNamespace(family="qwen3_moe"))
+        assert not calls
+
+
 @pytest.mark.parametrize("training_offload", [False, True])
 def test_rollout_offload_keeps_training_offload_independent(validation_config, training_offload):
     """Stage residency does not rewrite the selected training CPU policy."""

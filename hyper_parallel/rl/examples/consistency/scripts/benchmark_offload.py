@@ -78,24 +78,28 @@ def summarize(directory: Path, exit_code: int, steps: int) -> dict:
 
 
 def check_full_moe_support(root: Path) -> None:
-    """Reject this fixed MoE/TP4 preset while its runtime explicitly forbids it.
+    """Require the explicit experimental runtime path before launching the preset.
 
     Inspect the checkout without importing Torch or requiring a host RL install.
     Runtime validation remains authoritative and is never bypassed.
     """
     validator = root / "hyper_parallel/rl/rl/config/validate.py"
     tree = ast.parse(validator.read_text(encoding="utf-8"))
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Raise) and node.exc is not None:
-            messages = [part.value for part in ast.walk(node.exc)
-                        if isinstance(part, ast.Constant) and isinstance(part.value, str)]
-            if any("device-resident training currently requires Qwen3 dense with TP1" in text
-                   for text in messages):
-                raise ValueError(
-                    "This checkout rejects CPU_OFFLOAD=false for colocated full MoE/TP4. "
-                    "No benchmark was launched. Device-resident MoE support must be implemented "
-                    "and validated before this comparison can run; do not remove the runtime guard."
-                )
+    options = [node.value for node in ast.walk(tree) if isinstance(node, ast.Constant)]
+    if "experimental_moe_device_residency" not in options:
+        raise ValueError("This checkout has no experimental MoE device-residency path; update the checkout first")
+
+
+def matching_workloads(results: dict) -> bool:
+    """Compare effective configs, allowing only the two residency switches to differ."""
+    configs = []
+    for mode in ("cpu_offload", "device_resident"):
+        paths = list(Path(results[mode]["directory"]).glob("*/run/config.yaml"))
+        if len(paths) != 1:
+            return False
+        configs.append([line for line in paths[0].read_text(encoding="utf-8").splitlines()
+                        if not line.strip().startswith(("cpu_offload:", "experimental_moe_device_residency:"))])
+    return configs[0] == configs[1]
 
 
 def main() -> None:
@@ -105,6 +109,8 @@ def main() -> None:
     parser.add_argument("--result-base", type=Path, default=Path.cwd() / "offload-results")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--summarize", type=Path, help="Inspect an existing mode directory without training")
+    parser.add_argument("--mode", choices=("both", "cpu_offload", "device_resident"), default="both")
+    parser.add_argument("--baseline", type=Path, help="Reuse a successful CPU-offload mode directory")
     args = parser.parse_args()
     if args.summarize is not None:
         result = summarize(args.summarize.resolve(), 0, args.steps)
@@ -113,18 +119,28 @@ def main() -> None:
     if args.steps < 3:
         parser.error("Use at least three steps to separate initialization from steady steps")
     root = Path(__file__).resolve().parents[5]
-    try:
-        check_full_moe_support(root)
-    except ValueError as error:
-        parser.error(str(error))
+    if args.mode != "cpu_offload":
+        try:
+            check_full_moe_support(root)
+        except ValueError as error:
+            parser.error(str(error))
+    if args.baseline and args.mode != "device_resident":
+        parser.error("--baseline requires --mode device_resident")
+    results = {}
+    if args.baseline:
+        results["cpu_offload"] = summarize(args.baseline.resolve(), 0, args.steps)
+        if not results["cpu_offload"]["passed"]:
+            parser.error("The supplied baseline has no complete successful consistency evidence")
     base = args.result_base.resolve()
     if not args.dry_run:
         base.mkdir(parents=True, exist_ok=True)
         base = Path(tempfile.mkdtemp(prefix="comparison-", dir=base))
-    results = {}
     for mode, enabled in (("cpu_offload", "true"), ("device_resident", "false")):
+        if args.mode not in ("both", mode):
+            continue
         directory = base / mode
-        env = {**os.environ, "CPU_OFFLOAD": enabled, "RESULT_BASE": str(directory)}
+        env = {**os.environ, "CPU_OFFLOAD": enabled, "RESULT_BASE": str(directory),
+               "EXPERIMENTAL_MOE_DEVICE_RESIDENCY": "true" if enabled == "false" else "false"}
         command = ["bash", str(root / "run_a3_gsm8k50.sh"), "--steps", str(args.steps)]
         if args.dry_run:
             command.append("--dry-run")
@@ -138,15 +154,18 @@ def main() -> None:
         print(json.dumps(results[mode], indent=2), flush=True)
     if args.dry_run:
         return
-    if all(result["passed"] for result in results.values()):
+    if (len(results) == 2 and all(result["passed"] for result in results.values())
+            and matching_workloads(results)):
         baseline = results["cpu_offload"]["mean_seconds"]["perf/time_per_step"]
         resident = results["device_resident"]["mean_seconds"]["perf/time_per_step"]
         results["resident_speedup"] = baseline / resident
         results["note"] = "Compare generated token counts too; repeat in reverse order for cache effects"
+    elif len(results) == 2 and all(result["passed"] for result in results.values()):
+        results["note"] = "Effective workloads differ or config evidence is missing; no speedup calculated"
     destination = base / "comparison.json"
     destination.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
     print("\nOFFLOAD_COMPARISON", json.dumps(results, indent=2), "\nSaved:", destination, flush=True)
-    if not all(results[mode]["passed"] for mode in ("cpu_offload", "device_resident")):
+    if not all(result["passed"] for result in results.values() if isinstance(result, dict)):
         raise SystemExit(1)
 
 

@@ -1082,6 +1082,23 @@ def test_trainer_releases_colocated_training_state_for_rollout(
     ]
 
 
+def test_resident_optimizer_keeps_parameters_and_moments_on_target_device():
+    """Residency checks accept scalar CPU steps but reject misplaced weights or moments."""
+    parameter = torch.nn.Parameter(torch.ones(4))
+    optimizer = SimpleNamespace(
+        param_groups=[{"params": [parameter]}],
+        state={parameter: {"step": torch.tensor(1), "exp_avg": torch.zeros(4)}},
+    )
+    TrainingResidency.validate_optimizer_device_residency(optimizer, torch.device("cpu"))
+    optimizer.state[parameter]["exp_avg"] = torch.empty(4, device="meta")
+    with pytest.raises(RuntimeError, match="optimizer state"):
+        TrainingResidency.validate_optimizer_device_residency(optimizer, torch.device("cpu"))
+    optimizer.state.clear()
+    optimizer.param_groups[0]["params"] = [torch.nn.Parameter(torch.empty(4, device="meta"))]
+    with pytest.raises(RuntimeError, match="optimizer parameter"):
+        TrainingResidency.validate_optimizer_device_residency(optimizer, torch.device("cpu"))
+
+
 class _CPUOffloadRole(torch.nn.Module, HSDPModule):
     """Expose real HSDP storage lifecycle with CPU-only local computation."""
 

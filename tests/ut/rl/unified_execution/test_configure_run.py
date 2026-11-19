@@ -31,6 +31,17 @@ CONFIGURE = runpy.run_path(str(ROOT / "scripts/configure_run.py"))["configure"]
 class ConfigureRunTests(unittest.TestCase):
     """Keep task selection and token/transport budgets independent of topology."""
 
+    def test_device_residency_requires_explicit_experimental_switch(self) -> None:
+        """Propagate residency switches without enabling experimental training by default."""
+        for enabled in (False, True):
+            env = {"RUN_MODEL_PATH": "/models/Qwen3-30B-A3B", "CPU_OFFLOAD": "false"}
+            if enabled:
+                env["EXPERIMENTAL_MOE_DEVICE_RESIDENCY"] = "true"
+            with self.subTest(enabled=enabled), patch.dict(os.environ, env, clear=True):
+                config = CONFIGURE(yaml.safe_load((ROOT / "configs/qwen3_moe_4l_cp_rl.yaml").read_text()), 16)
+            self.assertFalse(config["train"]["accelerator"]["cpu_offload"])
+            self.assertEqual(config["train"]["accelerator"]["experimental_moe_device_residency"], enabled)
+
     def test_fixed_global_batch_across_tp_and_explicit_transport(self) -> None:
         """Changing TP preserves an explicitly selected global prompt workload."""
         for tp in (1, 2, 4):

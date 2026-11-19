@@ -435,3 +435,30 @@ above; pulling new code does not automatically redraw older results. Locate reta
 The preset retains the example's default `save_final: false`: logs and figures are saved, but model and
 optimizer checkpoints are not. Use an explicit recipe enabling `train.checkpoint.save_final` if persisted
 training weights are required; account for model and optimizer-state storage.
+
+### Experimental MoE device-resident training
+
+`CPU_OFFLOAD=false` with `EXPERIMENTAL_MOE_DEVICE_RESIDENCY=true` opts into colocated unified
+Qwen3-MoE GRPO device-residency validation. Parameters and optimizer moments stay on the training
+device; existing HSDP resharding, IPC publication, residency checks and strict probability checks remain
+active. This is an experimental path, not a claim of completed A3 hardware acceptance. It does not
+enable `offload_during_rollout`, whose dense TP1 restriction remains. HBM must accommodate training
+shards and optimizer state alongside rollout allocations; allocation failures terminate the run.
+
+Run both five-step cases using the full-model 16-device preset:
+
+```bash
+python3 hyper_parallel/rl/examples/consistency/scripts/benchmark_offload.py
+```
+
+Reuse a successful five-step CPU-offload mode directory and run only the resident case:
+
+```bash
+python3 hyper_parallel/rl/examples/consistency/scripts/benchmark_offload.py \
+    --mode device_resident --baseline /path/to/comparison/cpu_offload
+```
+
+The comparison excludes the first step. It requires successful strict consistency in both runs and
+matching effective configs except for the residency switches. Generated token counts are reported
+separately; differing response lengths or cache effects can affect the ratio. Failed runs print saved
+rank errors and never produce a speedup ratio. Existing baseline files are read without modification.
