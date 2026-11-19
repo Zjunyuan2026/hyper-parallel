@@ -68,6 +68,7 @@ def configure(config: dict, world: int) -> dict:
                      expert_parallel_size=rollout_ep,
                      sequence_parallel=boolean("ROLLOUT_SP", inference.get("sequence_parallel", False)))
     train["max_steps"] = integer("STEPS", 2)
+    accelerator["cpu_offload"] = boolean("CPU_OFFLOAD", accelerator.get("cpu_offload", True))
     train["model_init_cpu_threads"] = integer("MODEL_INIT_THREADS", 8)
     accelerator["activation_checkpoint"] = "full" if train_cp == 1 else "off"
     train["prompt_batch_size"] = integer("PROMPTS_PER_RANK", 1)
