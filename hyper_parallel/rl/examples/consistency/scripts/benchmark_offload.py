@@ -19,6 +19,7 @@ All ordinary image, device and consistency guards remain active.
 """
 
 import argparse
+import ast
 import json
 import math
 import os
@@ -34,6 +35,14 @@ def summarize(directory: Path, exit_code: int, steps: int) -> dict:
     result = {"exit_code": exit_code, "passed": False, "directory": str(directory)}
     if len(reports) != 1:
         result["reason"] = "Missing or ambiguous consistency report; inspect this run locally"
+        failures = []
+        for path in sorted(directory.glob("*/run/failure-rank*.json")):
+            failure = json.loads(path.read_text(encoding="utf-8"))
+            failures.append({key: failure.get(key) for key in
+                             ("rank", "error_type", "error", "last_phase")})
+        if failures:
+            result["failures"] = failures
+            result["reason"] = "Training failed; see the original rank errors below"
         return result
     report = json.loads(reports[0].read_text(encoding="utf-8"))
     checks = report.get("checks", [])
@@ -68,16 +77,46 @@ def summarize(directory: Path, exit_code: int, steps: int) -> dict:
     return result
 
 
+def check_full_moe_support(root: Path) -> None:
+    """Reject this fixed MoE/TP4 preset while its runtime explicitly forbids it.
+
+    Inspect the checkout without importing Torch or requiring a host RL install.
+    Runtime validation remains authoritative and is never bypassed.
+    """
+    validator = root / "hyper_parallel/rl/rl/config/validate.py"
+    tree = ast.parse(validator.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Raise) and node.exc is not None:
+            messages = [part.value for part in ast.walk(node.exc)
+                        if isinstance(part, ast.Constant) and isinstance(part.value, str)]
+            if any("device-resident training currently requires Qwen3 dense with TP1" in text
+                   for text in messages):
+                raise ValueError(
+                    "This checkout rejects CPU_OFFLOAD=false for colocated full MoE/TP4. "
+                    "No benchmark was launched. Device-resident MoE support must be implemented "
+                    "and validated before this comparison can run; do not remove the runtime guard."
+                )
+
+
 def main() -> None:
     """Run each mode sequentially and print a self-contained local comparison."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--steps", type=int, default=5)
     parser.add_argument("--result-base", type=Path, default=Path.cwd() / "offload-results")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--summarize", type=Path, help="Inspect an existing mode directory without training")
     args = parser.parse_args()
+    if args.summarize is not None:
+        result = summarize(args.summarize.resolve(), 0, args.steps)
+        print(json.dumps(result, indent=2), flush=True)
+        raise SystemExit(0 if result["passed"] else 1)
     if args.steps < 3:
         parser.error("Use at least three steps to separate initialization from steady steps")
     root = Path(__file__).resolve().parents[5]
+    try:
+        check_full_moe_support(root)
+    except ValueError as error:
+        parser.error(str(error))
     base = args.result_base.resolve()
     if not args.dry_run:
         base.mkdir(parents=True, exist_ok=True)
