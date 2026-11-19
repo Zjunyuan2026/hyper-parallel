@@ -400,8 +400,9 @@ by the full-source preset. Neither mode injects rewards or changes the recipe le
 
 After training, CPU-only Matplotlib automatically writes the following files under the run directory:
 
-- `run/plots/reward.png` and `.svg`: raw training reward mean and population standard deviation.
-- `run/plots/loss.png` and `.svg`: signed total, policy and KL losses when present.
+- `run/plots/reward.png` and `.svg`: raw reward mean/std overlaid with trailing 5-step means.
+- `run/plots/loss.png` and `.svg`: raw signed total/policy/KL losses overlaid with trailing 5-step means.
+- `run/plots/reward-raw.png` and `.svg`, `loss-raw.png` and `.svg`: separate original curves.
 - `run/plots/consistency.png` and `.svg`: exact maximum and mean logp differences.
 - `run/plots/training-curves.png` and `.svg`: the three-panel overview with actual topology.
 - `run/plots/plot-summary.json`: completion state, invalid/missing evidence and update witnesses.
@@ -414,7 +415,22 @@ To regenerate plots in a Python environment with Matplotlib and PyYAML:
 
 ```bash
 python hyper_parallel/rl/examples/consistency/scripts/plot_training.py /path/to/results/run
+# Optional: use a larger window and keep the default figures in a separate directory.
+python hyper_parallel/rl/examples/consistency/scripts/plot_training.py /path/to/results/run \
+    --smooth-window 10 --output /path/to/results/run/plots-ma10
 ```
+
+Automatic post-training plotting uses the same 5-step default without launcher changes. Each mean uses
+the current and preceding four recorded steps; initial steps use the available prefix. Invalid values
+leave gaps throughout their window. Reward std smoothing averages recorded per-step standard deviations;
+it is not a pooled standard deviation. Consistency metrics and acceptance always use exact raw values.
+Use `--smooth-window 1` for raw-only rendering. No training metrics are modified.
+
+The launcher already passes `/results/run` inside the container, mapped to `${RESULT_ROOT}/run` on the
+host. `run_a3.sh` prints `RESULT_ROOT` for each unique run (default parent:
+`/home/z00988596/results/consistency`). For a finished run, pass that existing run directory to the command
+above; pulling new code does not automatically redraw older results. Locate retained metrics with
+`find /home/z00988596/results/consistency -type f -name steps.jsonl` if using the default parent.
 
 The preset retains the example's default `save_final: false`: logs and figures are saved, but model and
 optimizer checkpoints are not. Use an explicit recipe enabling `train.checkpoint.save_final` if persisted

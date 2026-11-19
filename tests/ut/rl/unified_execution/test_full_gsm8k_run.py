@@ -14,21 +14,35 @@
 # ============================================================================
 """CPU regressions for complete-source sampling, all-different layouts and honest training plots."""
 
+import importlib.util
 import json
 import math
 import os
 from pathlib import Path
 import subprocess
 from tempfile import TemporaryDirectory
+from types import ModuleType
 import unittest
 from unittest.mock import patch
 
 import yaml
-
-from hyper_parallel.rl.examples.consistency.scripts import configure_run, plot_training
+from matplotlib.figure import Figure
 
 ROOT = Path(__file__).resolve().parents[4]
 RECIPE = ROOT / "hyper_parallel/rl/examples/consistency/configs/qwen3_moe_4l_cp_rl.yaml"
+
+
+def load_script(name: str) -> ModuleType:
+    """Load CPU-only plotting/configuration tools without importing the training framework."""
+    path = ROOT / "hyper_parallel/rl/examples/consistency/scripts" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+configure_run = load_script("configure_run")
+plot_training = load_script("plot_training")
 
 
 def metrics(step: int) -> dict:
@@ -97,6 +111,37 @@ class FullSourceRunTests(unittest.TestCase):
 class TrainingPlotTests(unittest.TestCase):
     """Missing steps and missing probabilities must not look like a successful zero-error run."""
 
+    def test_trailing_average_and_invalid_windows(self) -> None:
+        """Use past steps only, retain signed losses and never bridge missing measurements."""
+        self.assertEqual(plot_training.moving_average([1, 2, 3, 4, 5, 6], 5), [1, 1.5, 2, 2.5, 3, 4])
+        self.assertEqual(plot_training.moving_average([-2, -4], 5), [-2, -3])
+        result = plot_training.moving_average([1, math.nan, 3, 4], 2)
+        self.assertEqual(result[0], 1)
+        self.assertTrue(math.isnan(result[1]) and math.isnan(result[2]))
+        self.assertEqual(result[3], 3.5)
+        with self.assertRaises(ValueError):
+            plot_training.moving_average([1], 0)
+
+    def test_reward_loss_overlay_and_exact_consistency(self) -> None:
+        """Keep raw points alongside means while an isolated consistency spike stays exact."""
+        rows = [metrics(step) for step in range(1, 7)]
+        for step, row in enumerate(rows):
+            row["reward/mean"] = step % 2
+        rows[2]["training/rollout_log_probs_diff_max"] = 0.1
+        status = {"requested_steps": 6, "invalid_or_nonzero_steps": [3]}
+        for kind, expected in (("reward", 4), ("loss", 2), ("consistency", 2)):
+            axis = Figure().add_subplot()
+            plot_training.draw_panel(axis, kind, rows, status, 5)
+            self.assertEqual(len(axis.lines), expected)
+            if kind == "consistency":
+                self.assertEqual(list(axis.lines[0].get_ydata()), [0, 0, 0.1, 0, 0, 0])
+                self.assertFalse(any("MA5" in line.get_label() for line in axis.lines))
+            else:
+                self.assertIn("raw", axis.lines[0].get_label())
+                self.assertIn("MA5", axis.lines[1].get_label())
+                key = "reward/mean" if kind == "reward" else "train/total_loss"
+                self.assertEqual(list(axis.lines[0].get_ydata()), [row[key] for row in rows])
+
     def test_missing_values_remain_missing(self) -> None:
         """Keep absent/null/non-numeric metrics distinct from measured zero."""
         for row in ({}, {"value": None}, {"value": "invalid"}):
@@ -148,6 +193,7 @@ class TrainingPlotTests(unittest.TestCase):
             output = path / "plots"
             result = plot_training.render(path, output)
             self.assertFalse(result["accepted"])
-            for name in ("reward", "loss", "consistency", "training-curves"):
+            self.assertEqual(result["smoothing"]["window"], 5)
+            for name in ("reward", "loss", "consistency", "training-curves", "reward-raw", "loss-raw"):
                 self.assertTrue((output / f"{name}.png").read_bytes().startswith(b"\x89PNG"))
-                self.assertIn("PARTIAL", (output / f"{name}.svg").read_text())
+                self.assertIn("PARTIAL", (output / f"{name}.svg").read_text(encoding="utf-8"))

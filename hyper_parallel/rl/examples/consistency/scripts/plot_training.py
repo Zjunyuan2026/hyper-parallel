@@ -90,13 +90,30 @@ def topology_caption(directory: Path) -> str:
             f'SP={rollout.get("sequence_parallel", False)}')
 
 
-def draw_series(axis: Axes, rows: list[dict], fields: tuple[tuple[str, str, str], ...]) -> None:
+def moving_average(values: list[float], window: int) -> list[float]:
+    """Average trailing steps; use available initial steps and preserve invalid-window gaps."""
+    if window < 1:
+        raise ValueError("Smoothing window must be positive")
+    result = []
+    for index in range(len(values)):
+        samples = values[max(0, index - window + 1):index + 1]
+        result.append(sum(samples) / len(samples) if all(math.isfinite(v) for v in samples) else math.nan)
+    return result
+
+
+def draw_series(axis: Axes, rows: list[dict], fields: tuple[tuple[str, str, str], ...],
+                smooth_window: int = 1) -> None:
     """Plot only measured finite series and retain NaN gaps."""
     steps = [row["step"] for row in rows]
     for key, label, color in fields:
         values = [number(row, key) for row in rows]
         if any(math.isfinite(value) for value in values):
-            axis.plot(steps, values, label=label, color=color, linewidth=1.5, marker="o", markersize=3)
+            smoothing = smooth_window > 1
+            axis.plot(steps, values, label=f"{label} (raw)" if smoothing else label, color=color,
+                      linewidth=1, marker="o", markersize=3, alpha=0.3 if smoothing else 1)
+            if smoothing:
+                axis.plot(steps, moving_average(values, smooth_window),
+                          label=f"{label} (trailing MA{smooth_window})", color=color, linewidth=2)
     axis.set_xlabel("Training step")
     axis.xaxis.set_major_locator(MaxNLocator(integer=True))
     axis.grid(alpha=0.22)
@@ -106,17 +123,17 @@ def draw_series(axis: Axes, rows: list[dict], fields: tuple[tuple[str, str, str]
         axis.text(0.5, 0.5, "No finite measurements recorded", transform=axis.transAxes, ha="center")
 
 
-def draw_panel(axis: Axes, kind: str, rows: list[dict], status: dict) -> None:
+def draw_panel(axis: Axes, kind: str, rows: list[dict], status: dict, smooth_window: int = 5) -> None:
     """Render a reward, loss or strict-consistency panel with honest completion boundaries."""
     if kind == "reward":
         draw_series(axis, rows, (("reward/mean", "Reward mean", "#2563eb"),
-                                ("reward/std", "Reward population std", "#64748b")))
+                                ("reward/std", "Reward population std", "#64748b")), smooth_window)
         axis.set_ylabel("GSM8K reward")
         axis.set_ylim(-0.05, 1.05)
     elif kind == "loss":
         draw_series(axis, rows, (("train/total_loss", "Total loss", "#ea580c"),
                                 ("train/policy_loss", "Policy loss", "#7c3aed"),
-                                ("train/kl_loss", "KL loss", "#64748b")))
+                                ("train/kl_loss", "KL loss", "#64748b")), smooth_window)
         axis.set_ylabel("Loss (signed)")
     else:
         draw_series(axis, rows, (("training/rollout_log_probs_diff_max", "Max logp difference", "#059669"),
@@ -138,22 +155,26 @@ def draw_panel(axis: Axes, kind: str, rows: list[dict], status: dict) -> None:
 
 
 
-def _save_figure(output: Path, kind: str, rows: list[dict], status: dict, heading: str) -> None:
+def _save_figure(output: Path, kind: str, rows: list[dict], status: dict, heading: str,
+                 smooth_window: int) -> None:
     """Keep figure lifetime bounded for offline PNG/SVG export."""
     dashboard = kind == "training-curves"
+    panel_kind = kind.removesuffix("-raw")
     figure = Figure(figsize=(11, 10 if dashboard else 4.8), layout="constrained")
     FigureCanvasAgg(figure)
     axes = figure.subplots(3 if dashboard else 1, 1, squeeze=False).flatten()
-    for axis, panel in zip(axes, ("reward", "loss", "consistency") if dashboard else (kind,)):
-        draw_panel(axis, panel, rows, status)
+    for axis, panel in zip(axes, ("reward", "loss", "consistency") if dashboard else (panel_kind,)):
+        draw_panel(axis, panel, rows, status, smooth_window)
     figure.suptitle(heading, fontsize=10, color="#166534" if status["accepted"] else "#b45309")
     for extension in ("png", "svg"):
         figure.savefig(output / f"{kind}.{extension}", dpi=150, facecolor="white")
     figure.clear()
 
 
-def render(directory: Path, output: Path) -> dict:
+def render(directory: Path, output: Path, smooth_window: int = 5) -> dict:
     """Export three standalone figures and a dashboard; retain partial/failing run status."""
+    if smooth_window < 1:
+        raise ValueError("Smoothing window must be positive")
     rows = read_rows(directory / "steps.jsonl")
     status = run_status(directory, rows)
     output.mkdir(parents=True, exist_ok=True)
@@ -161,7 +182,12 @@ def render(directory: Path, output: Path) -> dict:
     heading = (f'{status["status"]}: {len(rows)}/{status["requested_steps"] or "?"} recorded steps\n'
                + caption)
     for kind in ("reward", "loss", "consistency", "training-curves"):
-        _save_figure(output, kind, rows, status, heading)
+        _save_figure(output, kind, rows, status, heading, smooth_window)
+    for kind in ("reward-raw", "loss-raw"):
+        _save_figure(output, kind, rows, status, heading, 1)
+    status["smoothing"] = {"method": "trailing moving average", "window": smooth_window,
+                           "initial_steps": "use available steps", "invalid_values": "retain window gaps",
+                           "panels": ["reward", "loss"], "consistency_smoothed": False}
     observations = []
     for path in directory.glob("learning-step*-rank0.json"):
         record = json.loads(path.read_text(encoding="utf-8"))
@@ -181,9 +207,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_directory", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--smooth-window", type=int, default=5,
+                        help="Trailing mean window for reward/loss (default: 5; 1: raw only)")
     args = parser.parse_args()
+    if args.smooth_window < 1:
+        parser.error("--smooth-window must be positive")
     output = args.output or args.run_directory / "plots"
-    print(json.dumps(render(args.run_directory, output), indent=2))
+    print(json.dumps(render(args.run_directory, output, args.smooth_window), indent=2))
 
 
 if __name__ == "__main__":
