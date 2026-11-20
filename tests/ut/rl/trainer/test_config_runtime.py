@@ -582,17 +582,16 @@ def test_colocated_resident_dense_grpo_retains_topology_guards(validation_config
         validate_config(validation_config, build_algorithm(validation_config["algorithm"]))
 
 
-@pytest.mark.parametrize("opt_in,implementation,offload,accepted", [
-    (False, "unified", False, False),
-    (True, "unified", False, True),
-    (True, "native", False, False),
-    (True, "unified", True, False),
-    ("true", "unified", False, False),
+@pytest.mark.parametrize("implementation,offload,accepted", [
+    ("unified", False, True),
+    ("native", False, False),
+    ("unified", True, True),
+    ("native", True, True),
 ])
-def test_experimental_resident_moe_keeps_explicit_boundary(
-    monkeypatch, opt_in, implementation, offload, accepted,
+def test_resident_moe_keeps_implementation_boundary(
+    monkeypatch, implementation, offload, accepted,
 ):
-    """Only explicit unified MoE residency reaches the existing topology validator."""
+    """Only unified MoE supports residency; both implementations retain CPU offload."""
     calls = []
     monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda: torch.device("npu"))
     monkeypatch.setattr(config_module, "_validate_vllm_basics", lambda _: ("colocated", 8, 2))
@@ -602,7 +601,7 @@ def test_experimental_resident_moe_keeps_explicit_boundary(
     monkeypatch.setattr(config_module, "resolve_vllm_model", lambda *args: SimpleNamespace(family="qwen3_moe"))
     monkeypatch.setattr(config_module, "resolve_weight_sync_config", lambda *args, **kwargs: None)
     rollout = {"vllm": {"model_implementation": implementation}}
-    accelerator = {"tp": 4, "cpu_offload": offload, "experimental_moe_device_residency": opt_in}
+    accelerator = {"tp": 4, "cpu_offload": offload}
     if accepted:
         config_module._validate_vllm(rollout, accelerator, SimpleNamespace(family="qwen3_moe"))
         assert calls == ["topology"]

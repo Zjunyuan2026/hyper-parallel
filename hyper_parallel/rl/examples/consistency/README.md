@@ -438,7 +438,7 @@ training weights are required; account for model and optimizer-state storage.
 
 ### Experimental MoE device-resident training
 
-`CPU_OFFLOAD=false` with `EXPERIMENTAL_MOE_DEVICE_RESIDENCY=true` opts into colocated unified
+`CPU_OFFLOAD=false` opts into colocated unified
 Qwen3-MoE GRPO device-residency validation. Parameters and optimizer moments stay on the training
 device; existing HSDP resharding, IPC publication, residency checks and strict probability checks remain
 active. This is an experimental path, not a claim of completed A3 hardware acceptance. It does not

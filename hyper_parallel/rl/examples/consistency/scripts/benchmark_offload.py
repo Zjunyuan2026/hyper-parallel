@@ -19,7 +19,6 @@ All ordinary image, device and consistency guards remain active.
 """
 
 import argparse
-import ast
 import json
 import math
 import os
@@ -77,19 +76,6 @@ def summarize(directory: Path, exit_code: int, steps: int) -> dict:
     return result
 
 
-def check_full_moe_support(root: Path) -> None:
-    """Require the explicit experimental runtime path before launching the preset.
-
-    Inspect the checkout without importing Torch or requiring a host RL install.
-    Runtime validation remains authoritative and is never bypassed.
-    """
-    validator = root / "hyper_parallel/rl/rl/config/validate.py"
-    tree = ast.parse(validator.read_text(encoding="utf-8"))
-    options = [node.value for node in ast.walk(tree) if isinstance(node, ast.Constant)]
-    if "experimental_moe_device_residency" not in options:
-        raise ValueError("This checkout has no experimental MoE device-residency path; update the checkout first")
-
-
 def matching_workloads(results: dict) -> bool:
     """Compare effective configs, allowing only the two residency switches to differ."""
     configs = []
@@ -119,11 +105,6 @@ def main() -> None:
     if args.steps < 3:
         parser.error("Use at least three steps to separate initialization from steady steps")
     root = Path(__file__).resolve().parents[5]
-    if args.mode != "cpu_offload":
-        try:
-            check_full_moe_support(root)
-        except ValueError as error:
-            parser.error(str(error))
     if args.baseline and args.mode != "device_resident":
         parser.error("--baseline requires --mode device_resident")
     results = {}
@@ -139,8 +120,7 @@ def main() -> None:
         if args.mode not in ("both", mode):
             continue
         directory = base / mode
-        env = {**os.environ, "CPU_OFFLOAD": enabled, "RESULT_BASE": str(directory),
-               "EXPERIMENTAL_MOE_DEVICE_RESIDENCY": "true" if enabled == "false" else "false"}
+        env = {**os.environ, "CPU_OFFLOAD": enabled, "RESULT_BASE": str(directory)}
         command = ["bash", str(root / "run_a3_gsm8k50.sh"), "--steps", str(args.steps)]
         if args.dry_run:
             command.append("--dry-run")

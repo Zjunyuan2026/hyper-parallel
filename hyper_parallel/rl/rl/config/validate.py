@@ -468,17 +468,12 @@ def _validate_vllm(
     deployment, rollout_dp, rollout_tp = _validate_vllm_basics(vllm)
     trainer_world_size = _trainer_world_size(accelerator)
     if deployment == "colocated":
-        experimental_moe = accelerator.get("experimental_moe_device_residency", False)
-        if experimental_moe and (
-            experimental_moe is not True or model_registration.family != "qwen3_moe"
-            or vllm.get("model_implementation", "native") != "unified"
-            or accelerator.get("cpu_offload", False)
-        ):
-            raise ValueError("experimental_moe_device_residency requires unified Qwen3 MoE with cpu_offload=false")
+        resident_moe = (model_registration.family == "qwen3_moe"
+                        and vllm.get("model_implementation", "native") == "unified")
         if not accelerator.get("cpu_offload", False) and (
             model_registration.family != "qwen3" or int(accelerator.get("tp", 1)) != 1
-        ) and not experimental_moe:
-            raise ValueError("Colocated device-resident training currently requires Qwen3 dense with TP1")
+        ) and not resident_moe:
+            raise ValueError("Colocated device-resident training requires Qwen3 dense with TP1 or unified Qwen3 MoE")
         _validate_colocated_vllm(vllm, accelerator, trainer_world_size, rollout_dp, rollout_tp)
     else:
         _validate_disjoint_vllm(vllm, trainer_world_size, rollout_dp)
@@ -795,8 +790,7 @@ def _validate_training_residency(config: Mapping[str, Any], algorithm: RLAlgorit
     """Validate training residency and gradient synchronization switches."""
     train = required_mapping(config, "train")
     accelerator = required_mapping(train, "accelerator")
-    for name in ("cpu_offload", "reference_cpu_offload", "offload_during_rollout",
-                 "experimental_moe_device_residency"):
+    for name in ("cpu_offload", "reference_cpu_offload", "offload_during_rollout"):
         if name in accelerator and not isinstance(accelerator[name], bool):
             raise ValueError(f"train.accelerator.{name} must be a boolean")
     zero_copy = accelerator.get("comm_fusion_zero_copy")
