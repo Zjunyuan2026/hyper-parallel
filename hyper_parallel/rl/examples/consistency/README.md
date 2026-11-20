@@ -462,3 +462,29 @@ The comparison excludes the first step. It requires successful strict consistenc
 matching effective configs except for the residency switches. Generated token counts are reported
 separately; differing response lengths or cache effects can affect the ratio. Failed runs print saved
 rank errors and never produce a speedup ratio. Existing baseline files are read without modification.
+
+### Multi-node HCCL environment probe
+
+`scripts/run_hccl_cluster.py` in this example is a standalone communication diagnostic, not a
+multi-node RL launcher. Run it from the first host outside Docker. Replace the example addresses and
+interface with the management IPs and data interface of your allocation:
+
+```bash
+python3 hyper_parallel/rl/examples/consistency/scripts/run_hccl_cluster.py \
+    --hosts 192.0.2.10,192.0.2.11 --master-addr 198.51.100.10 \
+    --interface data0 --nproc-per-node 16
+```
+
+The controller requires noninteractive SSH to the other hosts, identical locally loaded images, and
+idle NPUs on every host. It sends the worker source through each temporary container's environment;
+other hosts need no checkout. Containers use host networking, the existing driver mount, automatic
+HCCL host/device port allocation and devices `0..nproc_per_node-1`. No model or dataset is loaded.
+Each rank verifies every element of 4-byte, 4-MiB and 64-MiB AllReduce results. The first iteration at
+each size is warmup; three subsequent iterations measure synchronized local duration. Reported
+durations are not bus bandwidth or RL throughput. The default timeout is 300 seconds per collective
+and 900 seconds for controller polling, excluding startup and preflight.
+
+Only containers with names generated for this invocation are removed on completion or interruption.
+Logs and `summary.json` remain in the controller's `hccl-results/` directory. This does not modify
+image-reference containers. `--dry-run` checks arguments and displays topology without contacting
+hosts. A passing probe does not remove the current single-node RL rollout restriction.
