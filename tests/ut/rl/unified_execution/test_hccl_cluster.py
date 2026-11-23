@@ -48,6 +48,8 @@ class ClusterProbeTests(unittest.TestCase):
             return CONTROLLER.collect_results(["HCCL_PROBE_RESULT " + json.dumps(row) for row in rows], 128, 16)
 
         self.assertTrue(collect(records)["passed"])
+        four_nodes = ["HCCL_PROBE_RESULT " + json.dumps({**row, "world_size": 64}) for row in records[:64]]
+        self.assertTrue(CONTROLLER.collect_results(four_nodes, 64, 16)["passed"])
         self.assertFalse(collect(records[:-1])["passed"])
         self.assertFalse(collect(records + [records[0]])["passed"])
         for key, value in (("world_size", 8), ("local_rank", 5), ("passed", False)):
@@ -89,6 +91,8 @@ class ClusterProbeTests(unittest.TestCase):
         def execute(host: str, local: bool, command: list[str]) -> SimpleNamespace:
             del host, local
             commands.append(command)
+            if command[0] == "npu-smi":
+                return SimpleNamespace(stdout="Process id\nNo running processes found", stderr="")
             if command[1] in ("run", "logs"):
                 raise subprocess.CalledProcessError(1, command)
             return SimpleNamespace(stdout="", stderr="")
@@ -106,6 +110,48 @@ class ClusterProbeTests(unittest.TestCase):
             self.assertTrue(removals[0][-1].startswith("hp-hccl-"))
             summary = json.loads(next(Path(temporary).glob("*/summary.json")).read_text())
             self.assertFalse(summary["passed"])
+
+    def test_pipe_separated_busy_table_is_not_hidden_by_other_idle_devices(self) -> None:
+        """A single occupied chip rejects a node even if other chips report idle."""
+        for row in ("| 0 0 | 123 | rayOnlineWork | 40868 |", "| 0 | 0 | 123 | python | 100 |"):
+            with self.subTest(row=row), self.assertRaisesRegex(RuntimeError, "NPUs busy"):
+                CONTROLLER.require_idle("| NPU Chip | Process id | Name |\n" + row
+                                        + "\n| No running processes found in NPU 1 |", "host")
+        CONTROLLER.require_idle("| NPU Chip | PROCESS ID |\n| No running processes found in NPU 0 |", "host")
+        with self.assertRaisesRegex(RuntimeError, "unrecognized"):
+            CONTROLLER.require_idle("unrecognized driver response", "host")
+
+    def test_select_four_keeps_rank_zero_and_skips_busy_peers(self) -> None:
+        """Selection uses fresh checks, preserves order and never silently substitutes rank zero."""
+        candidates = [f"192.0.2.{number}" for number in range(1, 8)]
+        args = argparse.Namespace(hosts=candidates.copy(), select_nodes=4, interface="data0",
+                                  master_addr="198.51.100.1", image="image")
+        busy = {"192.0.2.2", "192.0.2.4"}
+
+        def execute(host: str, local: bool, command: list[str]) -> SimpleNamespace:
+            del local
+            if command[0] == "hostname":
+                text = candidates[0]
+            elif command[0] == "docker":
+                text = "sha256:same"
+            elif command[0] == "ip":
+                text = "inet 198.51.100." + host.rsplit(".", 1)[1] + "/24"
+            else:
+                text = "Process id\n"
+                text += "| 0 0 | 123 | python |" if host in busy else "No running processes found"
+            return SimpleNamespace(stdout=text, stderr="")
+
+        with patch.object(CONTROLLER, "execute", side_effect=execute), contextlib.redirect_stdout(io.StringIO()):
+            _, addresses = CONTROLLER.preflight(args)
+            self.assertEqual(args.hosts, [candidates[index] for index in (0, 2, 4, 5)])
+            self.assertEqual(len(addresses), 4)
+            busy.update(candidates[1:])
+            args.hosts = candidates.copy()
+            with self.assertRaisesRegex(RuntimeError, "Only 1/4"):
+                CONTROLLER.preflight(args)
+            busy.add(candidates[0])
+            with self.assertRaisesRegex(RuntimeError, "NPUs busy"):
+                CONTROLLER.preflight(args)
 
 
 if __name__ == "__main__":

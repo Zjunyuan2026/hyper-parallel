@@ -488,3 +488,11 @@ Only containers with names generated for this invocation are removed on completi
 Logs and `summary.json` remain in the controller's `hccl-results/` directory. This does not modify
 image-reference containers. `--dry-run` checks arguments and displays topology without contacting
 hosts. A passing probe does not remove the current single-node RL rollout restriction.
+
+To select four hosts from a longer candidate list, append `--select-nodes 4`. The first host remains
+mandatory rank zero. Other candidates are checked in list order; busy, unreachable, image-mismatched
+or otherwise ineligible peers are skipped. No containers start unless four eligible hosts are found.
+The selected host list is printed as `SELECTED_HOSTS` and saved in the summary. Add `--select-only`
+to inspect the selection without starting containers. Selection is a snapshot, not a resource
+reservation; occupancy is checked again before startup. Without `--select-nodes`, every listed host
+is required, preserving the original behavior.

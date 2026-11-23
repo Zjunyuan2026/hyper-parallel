@@ -30,6 +30,7 @@ import signal
 import subprocess
 import tempfile
 import time
+from typing import Optional
 import uuid
 
 
@@ -97,32 +98,62 @@ def collect_results(logs: list[str], world: int, nproc: int) -> dict:
             "scope": "AllReduce correctness and per-rank duration; not RL acceptance or bus bandwidth"}
 
 
+def require_idle(info: str, host: str) -> None:
+    """Reject occupied or unrecognized process tables, including pipe-separated A3 rows."""
+    header = re.search(r"(?im)^.*\bprocess\s+id\b.*$", info)
+    if header is None:
+        raise RuntimeError(f"NPU process table unrecognized on {host}; no probe launched\n{info}")
+    section = info[header.end():]
+    process = re.search(r"(?m)^\|\s*\d+(?:\s*\|\s*|\s+)\d+(?:\s*\|\s*|\s+)\d+(?:\s*\||\s+).*$", section)
+    if process:
+        raise RuntimeError(f"NPUs busy on {host}; no probe launched: {process.group(0)}")
+    if (not re.search(r"no\s+running\s+process(?:es)?\s+found", section, re.IGNORECASE)
+            or re.search(r"(?m)^\|\s*\d", section)):
+        raise RuntimeError(f"NPU idle state unconfirmed on {host}; no probe launched\n{info}")
+
+
+def check_host(args: argparse.Namespace, host: str, local: bool, expected_image: Optional[str]) -> tuple[str, str]:
+    """Check one candidate without creating containers or taking a device context."""
+    current = execute(host, local, ["docker", "image", "inspect", args.image, "--format", "{{.Id}}"]).stdout.strip()
+    if expected_image is not None and current != expected_image:
+        raise RuntimeError(f"Image ID mismatch on {host}")
+    require_idle(execute(host, local, ["npu-smi", "info"]).stdout, host)
+    network = execute(host, local, ["ip", "-o", "-4", "addr", "show", "dev", args.interface]).stdout
+    found = re.findall(r"\binet (\d+\.\d+\.\d+\.\d+)/", network)
+    if len(found) != 1:
+        raise RuntimeError(f"Expected one IPv4 address on {host}/{args.interface}")
+    return current, found[0]
+
+
 def preflight(args: argparse.Namespace) -> tuple[str, list[str]]:
-    """Require all hosts to have identical images, idle devices and a selected interface."""
+    """Keep the first host mandatory; optionally select eligible peers in candidate order."""
     local_ips = execute(args.hosts[0], True, ["hostname", "-I"]).stdout.split()
     if args.hosts[0] not in local_ips:
         raise ValueError("Run this controller on the first host, outside Docker")
     image_id = None
     addresses = []
+    selected = []
+    count = getattr(args, "select_nodes", None)
     for index, host in enumerate(args.hosts):
         print(f"PREFLIGHT {host}", flush=True)
-        current = execute(host, index == 0, ["docker", "image", "inspect", args.image,
-                                            "--format", "{{.Id}}"]).stdout.strip()
+        try:
+            current, address = check_host(args, host, index == 0, image_id)
+        except (RuntimeError, subprocess.SubprocessError, OSError) as error:
+            if index == 0 or count is None:
+                raise
+            print(f"SKIP {host}: {error}", flush=True)
+            continue
         image_id = image_id or current
-        if current != image_id:
-            raise RuntimeError(f"Image ID mismatch on {host}")
-        info = execute(host, index == 0, ["npu-smi", "info"]).stdout
-        section = info.split("Process id", 1)[-1]
-        if ("Process id" not in info or "No running processes found" not in section
-                or re.search(r"(?m)^\|\s*\d+\s+\d+\s+\d+\s", section)):
-            raise RuntimeError(f"NPUs busy or idle state unconfirmed on {host}; no probe launched")
-        network = execute(host, index == 0, ["ip", "-o", "-4", "addr", "show", "dev", args.interface]).stdout
-        found = re.findall(r"\binet (\d+\.\d+\.\d+\.\d+)/", network)
-        if len(found) != 1:
-            raise RuntimeError(f"Expected one IPv4 address on {host}/{args.interface}")
-        addresses.append(found[0])
+        selected.append(host)
+        addresses.append(address)
+        if count is not None and len(selected) == count:
+            break
+    if count is not None and len(selected) != count:
+        raise RuntimeError(f"Only {len(selected)}/{count} eligible hosts, including required rank0; no probe launched")
     if addresses[0] != args.master_addr:
         raise ValueError("Master address must match the first host's selected interface")
+    args.hosts = selected
+    print("SELECTED_HOSTS " + ",".join(selected), flush=True)
     return image_id, addresses
 
 
@@ -130,6 +161,8 @@ def main() -> None:
     """Preflight all hosts, run the bounded probe, collect logs and remove only owned containers."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hosts", required=True, type=lambda text: text.split(","))
+    parser.add_argument("--select-nodes", type=int, help="Select this many eligible hosts, always including the first")
+    parser.add_argument("--select-only", action="store_true", help="Check/select hosts without launching containers")
     parser.add_argument("--master-addr", required=True)
     parser.add_argument("--interface", required=True)
     parser.add_argument("--image", default="hyper-rl:consistency-v0.30.0-cann9.2.1-a3-runtime-arm64")
@@ -142,11 +175,18 @@ def main() -> None:
         ipaddress.IPv4Address(address)
     if len(args.hosts) != len(set(args.hosts)) or not 1024 <= args.master_port <= 65535:
         parser.error("Hosts must be unique and master port must be in [1024,65535]")
+    if args.select_nodes is not None and not 1 <= args.select_nodes <= len(args.hosts):
+        parser.error("--select-nodes must be between 1 and the number of candidate hosts")
     if args.dry_run:
-        print(json.dumps({"hosts": args.hosts, "world_size": len(args.hosts) * args.nproc_per_node,
+        print(json.dumps({"candidate_hosts": args.hosts, "select_nodes": args.select_nodes,
+                          "world_size": (args.select_nodes or len(args.hosts)) * args.nproc_per_node,
                           "interface": args.interface, "image": args.image}, indent=2))
         return
     image_id, addresses = preflight(args)
+    if args.select_only:
+        return
+    for index, host in enumerate(args.hosts):
+        require_idle(execute(host, index == 0, ["npu-smi", "info"]).stdout, host)
     args.result_base.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix="probe-", dir=args.result_base.resolve()))
     worker = base64.b64encode(Path(__file__).with_name("hccl_probe_worker.py").read_bytes()).decode()
