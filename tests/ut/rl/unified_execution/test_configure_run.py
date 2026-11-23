@@ -31,6 +31,19 @@ CONFIGURE = runpy.run_path(str(ROOT / "scripts/configure_run.py"))["configure"]
 class ConfigureRunTests(unittest.TestCase):
     """Keep task selection and token/transport budgets independent of topology."""
 
+    def test_four_node_training_uses_global_dp_and_node_local_rollout_dp(self) -> None:
+        """Full-model selection is independent of the small recipe filename."""
+        environment = {"RUN_MODEL_PATH": "/models/Qwen3-30B-A3B", "TRAIN_TP": "4", "TRAIN_CP": "2",
+                       "TRAIN_EP": "4", "ROLLOUT_TP": "2", "ROLLOUT_PCP": "1", "ROLLOUT_EP": "8",
+                       "ROLLOUT_LOCAL_WORLD_SIZE": "16", "CPU_OFFLOAD": "false"}
+        with patch.dict(os.environ, environment, clear=True):
+            config = CONFIGURE(yaml.safe_load((ROOT / "configs/qwen3_moe_4l_cp_rl.yaml").read_text()), 64)
+        accelerator = config["train"]["accelerator"]
+        self.assertEqual((accelerator["dp_shard"], accelerator["edp_shard"]), (8, 16))
+        self.assertEqual(config["rollout"]["vllm"]["data_parallel_size"], 8)
+        self.assertEqual(config["rollout"]["vllm"]["node_local_world_size"], 16)
+        self.assertEqual(config["model"]["registry_name"], "qwen3_30b_a3b")
+
     def test_device_residency_uses_standard_offload_switch(self) -> None:
         """One standard switch selects the existing device or CPU offload policy."""
         for enabled in (False, True):

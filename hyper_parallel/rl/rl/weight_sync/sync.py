@@ -18,12 +18,14 @@ __all__ = [
     "ActorRolloutWeightSync",
     "PolicySnapshot",
     "coordinator_call",
+    "create_node_control_group",
     "synchronized_call",
     "synchronize_error",
 ]
 
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Callable, Mapping, Optional
 
 import torch.distributed as dist
@@ -79,11 +81,24 @@ def synchronized_call(operation: str, callback: Callable[[], Any]) -> Any:
     return result
 
 
-def coordinator_call(operation: str, callback: Callable[[], Any]) -> Any:
-    """Run one coordinator operation and return its result on every rank."""
+def create_node_control_group(local_world_size: int) -> Any:
+    """Create contiguous torchrun node groups in the same order on every rank."""
+    world = dist.get_world_size()
+    if local_world_size < 1 or world % local_world_size:
+        raise ValueError("Node-local rollout size must divide the Trainer world")
+    selected = None
+    for start in range(0, world, local_world_size):
+        group = dist.new_group(list(range(start, start + local_world_size)))
+        if start <= dist.get_rank() < start + local_world_size:
+            selected = group
+    return selected
+
+
+def coordinator_call(operation: str, callback: Callable[[], Any], *, group: Any = None) -> Any:
+    """Control one server per group; propagate failures across the entire Trainer world."""
     try:
         world_size = dist.get_world_size()
-        rank = dist.get_rank()
+        rank = dist.get_rank(group) if group is not None else dist.get_rank()
     except (RuntimeError, ValueError):
         world_size = 1
         rank = 0
@@ -98,7 +113,11 @@ def coordinator_call(operation: str, callback: Callable[[], Any]) -> Any:
             local_error = error
     synchronize_error(local_error, operation)
     shared = [result]
-    dist.broadcast_object_list(shared, src=0)
+    source = dist.get_global_rank(group, 0) if group is not None else 0
+    if group is None:
+        dist.broadcast_object_list(shared, src=source)
+    else:
+        dist.broadcast_object_list(shared, src=source, group=group)
     return shared[0]
 
 
@@ -113,6 +132,7 @@ class ActorRolloutWeightSync:
         weight_transfer: Optional[Any],
         *,
         sleep_level: int = 1,
+        control_group: Any = None,
     ) -> None:
         """Initialize publication; level 2 requires a complete publish after every training sleep."""
         if not isinstance(sleep_level, int) or isinstance(sleep_level, bool) or sleep_level not in (1, 2):
@@ -122,7 +142,8 @@ class ActorRolloutWeightSync:
         self._model_name = model_name
         self._deployment = deployment
         self._sleep_level = sleep_level
-        self._control_call = coordinator_call
+        self._control_call = (coordinator_call if control_group is None
+                              else partial(coordinator_call, group=control_group))
         self._client_provider = client_provider
         self._weight_transfer = weight_transfer
         self._policy_version = 0
@@ -164,24 +185,25 @@ class ActorRolloutWeightSync:
             )
         if not isinstance(client, VLLMWeightSyncClientMixin):
             raise RuntimeError("Generation requires the owned vLLM HTTP client")
-        worker_version = self._control_call(
-            "generation rollout version",
-            lambda: committed_policy_version(client),
-        )
-        if worker_version != self._policy_version:
-            raise RuntimeError(
-                "vLLM worker policy version differs from the published version: "
-                f"expected={self._policy_version}, actual={worker_version}"
-            )
-        return worker_version
+        def verify_version() -> int:
+            """Reject a stale node before any node admits the next rollout."""
+            worker_version = committed_policy_version(client)
+            if worker_version != self._policy_version:
+                raise RuntimeError(
+                    "vLLM worker policy version differs from the published version: "
+                    f"expected={self._policy_version}, actual={worker_version}"
+                )
+            return worker_version
 
-    @staticmethod
+        return self._control_call("generation rollout version", verify_version)
+
     def _server_owner_call(
+        self,
         operation: str,
         callback: Callable[[], Any],
     ) -> Any:
         """Run one mutating server operation exactly once on the coordinator."""
-        return coordinator_call(operation, callback)
+        return self._control_call(operation, callback)
 
     def prepare_for_training(self) -> None:
         """Sleep colocated rollout before policy Actor training starts."""
@@ -285,15 +307,16 @@ class ActorRolloutWeightSync:
                 "post-publication pause check",
                 verify_post_publication_pause,
             )
-            worker_version = self._control_call(
-                "pending rollout version",
-                lambda: committed_policy_version(client),
-            )
-            if worker_version != self._pending_policy_version:
-                raise RuntimeError(
-                    "vLLM worker version differs from the pending policy: "
-                    f"expected={self._pending_policy_version}, actual={worker_version}"
-                )
+            def verify_pending_version() -> None:
+                """Keep all node services paused if one node retained stale weights."""
+                worker_version = committed_policy_version(client)
+                if worker_version != self._pending_policy_version:
+                    raise RuntimeError(
+                        "vLLM worker version differs from the pending policy: "
+                        f"expected={self._pending_policy_version}, actual={worker_version}"
+                    )
+
+            self._control_call("pending rollout version", verify_pending_version)
         self._resume_rollout(client, check_residency=True)
         if self._pending_policy_version is not None:
             self._policy_version = self._pending_policy_version

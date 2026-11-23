@@ -42,6 +42,11 @@ def configure(config: dict, world: int) -> dict:
     train = config["train"]
     accelerator = train["accelerator"]
     inference = config["rollout"]["vllm"]
+    local_world = integer("ROLLOUT_LOCAL_WORLD_SIZE", world)
+    if local_world > world or world % local_world:
+        raise ValueError("ROLLOUT_LOCAL_WORLD_SIZE must divide the global Trainer world")
+    if local_world != world:
+        inference["node_local_world_size"] = local_world
     train_tp = integer("TRAIN_TP", accelerator["tp"])
     rollout_tp = integer("ROLLOUT_TP", inference["tensor_parallel_size"])
     train_cp = integer("TRAIN_CP", accelerator.get("cp", 1))
@@ -56,6 +61,8 @@ def configure(config: dict, world: int) -> dict:
         raise ValueError("TP x CP, TP x PCP and each EP size must divide the selected device count")
     if 128 % train_ep or 128 % rollout_ep:
         raise ValueError("EP must divide the model's 128 experts")
+    if any(local_world % size for size in (train_tp * train_cp, rollout_tp * rollout_pcp, rollout_ep)):
+        raise ValueError("Trainer TP x CP and rollout TP x PCP / EP groups must fit within each node")
     if train_cp > 1 and not any(
         rule.get("when") == "cp" for rule in train["plan_overrides"]
     ):
@@ -63,7 +70,7 @@ def configure(config: dict, world: int) -> dict:
     accelerator.update(tp=train_tp, dp_shard=world // (train_tp * train_cp), ep=train_ep,
                        edp_shard=world // train_ep if train_ep > 1 else 1,
                        sequence_parallel=boolean("TRAIN_SP", accelerator["sequence_parallel"]), cp=train_cp, pp=1)
-    inference.update(tensor_parallel_size=rollout_tp, data_parallel_size=world // (rollout_tp * rollout_pcp),
+    inference.update(tensor_parallel_size=rollout_tp, data_parallel_size=local_world // (rollout_tp * rollout_pcp),
                      context_parallel_size=rollout_pcp, decode_context_parallel_size=1,
                      expert_parallel_size=rollout_ep,
                      sequence_parallel=boolean("ROLLOUT_SP", inference.get("sequence_parallel", False)))
@@ -139,7 +146,8 @@ def configure(config: dict, world: int) -> dict:
     config["rollout"]["max_new_tokens"] = integer("MAX_NEW_TOKENS", 32 if runner == "internal" else 128)
     if config["data"]["max_prompt_length"] + config["rollout"]["max_new_tokens"] > context:
         raise ValueError("MAX_PROMPT + MAX_NEW_TOKENS must not exceed MAX_MODEL_LEN")
-    inference.update(max_model_len=context, max_num_batched_tokens=integer("PREFILL_TOKENS", 128 if runner == "internal" else 512))
+    inference.update(max_model_len=context,
+                     max_num_batched_tokens=integer("PREFILL_TOKENS", 128 if runner == "internal" else 512))
     # Legacy EP_CAPACITY bounded every input; the new limit applies only to MC2.
     capacity = integer("MC2_CAPACITY", min(integer("EP_CAPACITY", 256), 256))
     backend = os.environ.get("INFERENCE_EP_BACKEND", "auto")

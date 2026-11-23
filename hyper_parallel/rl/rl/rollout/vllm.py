@@ -53,7 +53,9 @@ from rl.rollout.topology import (
     model_parallel_size,
     worker_tensor_parallel_size,
 )
-from rl.weight_sync.sync import ActorRolloutWeightSync, PolicySnapshot, synchronize_error, synchronized_call
+from rl.weight_sync.sync import (
+    ActorRolloutWeightSync, PolicySnapshot, create_node_control_group, synchronize_error, synchronized_call,
+)
 from rl.weight_sync.vllm_client import VLLMWeightSyncClientMixin
 from rl.weight_sync.transfer import WeightPublisher, build_weight_publisher
 from rl.weight_sync.config import resolve_weight_sync_config
@@ -66,6 +68,9 @@ _DISTRIBUTED_ENVIRONMENT_VARIABLES = (
     "WORLD_SIZE",
     "MASTER_ADDR",
     "MASTER_PORT",
+    "NNODES",
+    "NODE_RANK",
+    "NODE_ADDR",
     "GROUP_RANK",
     "ROLE_RANK",
     "ROLE_WORLD_SIZE",
@@ -731,6 +736,7 @@ class VLLMGenerationEngine:
         client: Optional[Any] = None,
         publisher: Optional[WeightPublisher] = None,
         rollout_model: Optional[VLLMModelRegistration] = None,
+        control_group: Any = None,
     ) -> None:
         """Initialize the lazy vLLM client and policy synchronization."""
         self._model = model
@@ -762,6 +768,7 @@ class VLLMGenerationEngine:
             self._ensure_client,
             publisher,
             sleep_level=self._config.get("sleep_level", 1),
+            control_group=control_group,
         )
 
     @property
@@ -795,6 +802,12 @@ class VLLMGenerationEngine:
         self._trainer_tp_group = group
         self._trainer_tp_rank = int(tp_rank)
         self._trainer_tp_size = int(tp_size)
+        local_world = self._config.get("node_local_world_size")
+        if local_world is not None:
+            if int(local_world) % tp_size:
+                raise ValueError("Trainer TP x CP request groups must stay within each rollout node")
+            request_size = int(local_world) // tp_size
+            request_rank %= request_size
         self._trainer_request_rank = int(request_rank)
         self._trainer_request_size = int(request_size)
 
@@ -1249,6 +1262,9 @@ class VLLMGenerationEngine:
         if self._trainer_request_size is not None:
             trainer_world_size = self._trainer_request_size
             trainer_rank = self._trainer_request_rank
+        elif self._config.get("node_local_world_size") is not None:
+            trainer_world_size = int(self._config["node_local_world_size"])
+            trainer_rank = int(os.environ["LOCAL_RANK"])
         else:
             try:
                 trainer_world_size = dist.get_world_size()
@@ -1571,6 +1587,8 @@ def build_vllm_engine(
     """Build the registered optional vLLM generation engine."""
     vllm_config = config.get("vllm", {})
     deployment = vllm_config.get("deployment", "disjoint")
+    local_world = vllm_config.get("node_local_world_size")
+    control_group = None if local_world is None else create_node_control_group(int(local_world))
     rollout_model = resolve_vllm_model(
         model,
         vllm_config.get("model_implementation", "native")
@@ -1594,12 +1612,14 @@ def build_vllm_engine(
                             * int(vllm_config.get("context_parallel_size", 1))),
         bucket_size_bytes=normalized_weight_sync.bucket_size_bytes,
         strategy=normalized_weight_sync.strategy,
+        control_group=control_group,
     )
     return VLLMGenerationEngine(
         model,
         config,
         publisher=weight_transfer,
         rollout_model=rollout_model,
+        control_group=control_group,
     )
 
 

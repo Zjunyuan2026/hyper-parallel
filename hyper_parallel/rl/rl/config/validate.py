@@ -216,12 +216,22 @@ def _validate_colocated_vllm(
             "Colocated rollout derives its physical NPUs from the Trainer; "
             "remove rollout.vllm.visible_devices"
         )
-    if rollout_dp * model_parallel_size(vllm) != trainer_world_size:
+    local_world = vllm.get("node_local_world_size", trainer_world_size)
+    if (isinstance(local_world, bool) or not isinstance(local_world, int) or local_world < 1
+            or trainer_world_size % local_world):
+        raise ValueError("rollout.vllm.node_local_world_size must be a positive divisor of the Trainer world")
+    if vllm.get("node_local_world_size") is not None:
+        if int(os.environ.get("LOCAL_WORLD_SIZE", local_world)) != local_world:
+            raise ValueError("node_local_world_size differs from torchrun LOCAL_WORLD_SIZE")
+        if local_world % (int(accelerator.get("tp", 1)) * int(accelerator.get("cp", 1))):
+            raise ValueError("Trainer TP x CP groups must fit within each rollout node")
+    if rollout_dp * model_parallel_size(vllm) != local_world:
         raise ValueError(
-            "Colocated rollout devices must match the Trainer world: "
+            "Colocated rollout devices must match the Trainer rollout domain: "
             f"data_parallel_size={rollout_dp}, tensor_parallel_size={rollout_tp}, "
             f"pipeline_parallel_size={vllm.get('pipeline_parallel_size', 1)}, "
-            f"context_parallel_size={vllm.get('context_parallel_size', 1)}, trainer_world_size={trainer_world_size}"
+            f"context_parallel_size={vllm.get('context_parallel_size', 1)}, "
+            f"trainer_world_size={trainer_world_size}, node_local_world_size={local_world}"
         )
 
 
@@ -467,6 +477,11 @@ def _validate_vllm(
     vllm = optional_mapping(rollout, "vllm")
     deployment, rollout_dp, rollout_tp = _validate_vllm_basics(vllm)
     trainer_world_size = _trainer_world_size(accelerator)
+    if vllm.get("node_local_world_size") is not None and (
+        deployment != "colocated" or model_registration.family != "qwen3_moe"
+        or vllm.get("model_implementation", "native") != "unified"
+    ):
+        raise ValueError("Node-local rollout requires colocated unified Qwen3 MoE")
     if deployment == "colocated":
         resident_moe = (model_registration.family == "qwen3_moe"
                         and vllm.get("model_implementation", "native") == "unified")
@@ -908,6 +923,11 @@ def validate_config(config: Mapping[str, Any], algorithm: RLAlgorithm) -> None:
     _validate_accelerator_options(train, accelerator, config, algorithm)
     _validate_training_optimizer(train, rollout, model, algorithm)
     model_registration = build_model_registration(config)
+    if optional_mapping(rollout, "vllm").get("node_local_world_size") is not None and (
+        algorithm.name != "grpo" or agentic.get("runner", "internal") != "internal"
+        or "async_training" in config or "colocate_async" in config
+    ):
+        raise ValueError("Node-local rollout currently requires synchronous internal GRPO")
     _validate_rollout_offload(config, model_registration, algorithm)
     _validate_model_scope(config, model_registration)
     _validate_token_log_probs(config, model_registration, algorithm)

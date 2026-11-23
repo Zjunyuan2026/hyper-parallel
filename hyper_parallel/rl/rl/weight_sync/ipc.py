@@ -90,11 +90,13 @@ class IPCWeightTransport:
     """Own IPC handles, receiver acknowledgements, and unsafe producer buffers."""
     name = "ipc"
 
-    def __init__(self, *, data_parallel_size: int = 1, tensor_parallel_size: int = 1) -> None:
+    def __init__(self, *, data_parallel_size: int = 1, tensor_parallel_size: int = 1,
+                 control_group: Any = None) -> None:
         """Defer physical-device discovery until rollout weights are awake."""
         if data_parallel_size <= 0 or tensor_parallel_size <= 0:
             raise ValueError("IPC DP and TP sizes must be positive")
         self._data_parallel_size = int(data_parallel_size)
+        self._control_group = control_group
         self._tensor_parallel_size = int(tensor_parallel_size)
         self._context: Optional[IPCContext] = None
         self._failed_buffers: list[Any] = []
@@ -118,7 +120,8 @@ class IPCWeightTransport:
         """Resolve a single endpoint and explicit same-device ownership once."""
         if destination_tp_size != self._tensor_parallel_size:
             raise ValueError("IPC destination size differs from rollout TP")
-        endpoint = shared_endpoint(client)
+        endpoint = (shared_endpoint(client) if self._control_group is None
+                    else shared_endpoint(client, group=self._control_group))
         if self._context is not None:
             if endpoint != self._context.endpoint:
                 raise RuntimeError("IPC rollout endpoint changed after transport initialization")
@@ -128,8 +131,13 @@ class IPCWeightTransport:
         )
 
         device_id = npu_generate_uuid()
-        physical_ids = [None] * dist.get_world_size()
-        dist.all_gather_object(physical_ids, device_id)
+        local_world = (dist.get_world_size() if self._control_group is None
+                       else dist.get_world_size(self._control_group))
+        physical_ids = [None] * local_world
+        if self._control_group is None:
+            dist.all_gather_object(physical_ids, device_id)
+        else:
+            dist.all_gather_object(physical_ids, device_id, group=self._control_group)
         workers = resolve_physical_worker_topology(
             self._device_order(physical_ids), data_parallel_size=self._data_parallel_size,
             tensor_parallel_size=self._tensor_parallel_size,
@@ -178,9 +186,8 @@ class IPCWeightTransport:
             received.add(coordinate)
         return received
 
-    @staticmethod
     def _collect_handles(
-        context: IPCContext, packed: Any, expected_devices: set[Any],
+        self, context: IPCContext, packed: Any, expected_devices: set[Any],
     ) -> dict[Any, Any]:
         """Synchronize export errors before gathering the intended device handles."""
         def export() -> dict[Any, Any]:
@@ -190,18 +197,28 @@ class IPCWeightTransport:
             return {context.physical_device_id: tensor_ipc_rebuild_args(packed)}
 
         local_handles = synchronized_call("IPC handle export", export)
-        handles_by_rank = [None] * dist.get_world_size()
-        dist.all_gather_object(handles_by_rank, local_handles)
-        handles = {}
-        for rank_handles in handles_by_rank:
-            if not isinstance(rank_handles, Mapping) or handles.keys() & rank_handles.keys():
-                raise RuntimeError(f"IPC received duplicate or invalid producer handles: {handles_by_rank}")
-            handles.update(rank_handles)
-        if handles.keys() != expected_devices:
-            raise RuntimeError(
-                f"IPC handles do not cover the target devices: actual={set(handles)}, expected={expected_devices}"
-            )
-        return handles
+        local_world = (dist.get_world_size() if self._control_group is None
+                       else dist.get_world_size(self._control_group))
+        handles_by_rank = [None] * local_world
+        if self._control_group is None:
+            dist.all_gather_object(handles_by_rank, local_handles)
+        else:
+            dist.all_gather_object(handles_by_rank, local_handles, group=self._control_group)
+
+        def validate() -> dict[Any, Any]:
+            """Reject local IPC discovery failures before any node enters the receive RPC."""
+            handles = {}
+            for rank_handles in handles_by_rank:
+                if not isinstance(rank_handles, Mapping) or handles.keys() & rank_handles.keys():
+                    raise RuntimeError(f"IPC received duplicate or invalid producer handles: {handles_by_rank}")
+                handles.update(rank_handles)
+            if handles.keys() != expected_devices:
+                raise RuntimeError(
+                    f"IPC handles do not cover the target devices: actual={set(handles)}, expected={expected_devices}"
+                )
+            return handles
+
+        return synchronized_call("IPC handle validation", validate)
 
     def _receive(
         self, client: VLLMWeightSyncClientMixin, context: IPCContext, method: str,
@@ -221,7 +238,10 @@ class IPCWeightTransport:
                 results, context, target_tp_rank, copied_bytes, target_worker_rank, require_all_workers,
             )
 
-        coordinator_call("IPC bucket receive", receive)
+        if self._control_group is None:
+            coordinator_call("IPC bucket receive", receive)
+        else:
+            coordinator_call("IPC bucket receive", receive, group=self._control_group)
         synchronized_call(
             "IPC acknowledged producer synchronization", torch.get_device_module().current_stream().synchronize,
         )

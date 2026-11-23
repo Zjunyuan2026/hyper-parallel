@@ -115,10 +115,13 @@ class VLLMWeightSyncClientMixin:
             raise RuntimeError(f"vLLM /resume returned invalid status {status!r}")
 
 
-def shared_endpoint(client: VLLMWeightSyncClientMixin) -> str:
+def shared_endpoint(client: VLLMWeightSyncClientMixin, *, group: Any = None) -> str:
     """Require every Trainer rank to use the same nonempty endpoint."""
-    endpoints = [None] * dist.get_world_size()
-    dist.all_gather_object(endpoints, client.base_url)
+    endpoints = [None] * (dist.get_world_size() if group is None else dist.get_world_size(group))
+    if group is None:
+        dist.all_gather_object(endpoints, client.base_url)
+    else:
+        dist.all_gather_object(endpoints, client.base_url, group=group)
     if not endpoints or not endpoints[0] or any(value != endpoints[0] for value in endpoints):
         raise RuntimeError(f"Weight synchronization requires one shared rollout endpoint: {endpoints}")
     return str(endpoints[0])

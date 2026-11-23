@@ -98,8 +98,16 @@ def _resolve_eos_token_ids(model: Any, tokenizer: Any) -> tuple[int, ...]:
 
 def _validate_shared_vllm_metadata(
     metadata: list[Any], deployment: str, world_size: int, expected_devices: int,
+    *, node_local_world_size: Optional[int] = None,
 ) -> None:
     """Require all trainer ranks to agree on one local vLLM endpoint and NPU set."""
+    if node_local_world_size is not None:
+        local = node_local_world_size
+        if deployment != "colocated" or local < 1 or world_size % local or len(metadata) != world_size:
+            raise ValueError("Node-local rollout requires complete colocated torchrun node groups")
+        for start in range(0, world_size, local):
+            _validate_shared_vllm_metadata(metadata[start:start + local], deployment, local, local)
+        return
     for rank, rank_metadata in enumerate(metadata):
         rank_local_world_size, _, _, rank_devices = rank_metadata
         if int(rank_local_world_size) != world_size:
@@ -250,7 +258,9 @@ class _TrainerBuilder:
             else int(vllm_config["data_parallel_size"])
             * int(vllm_config["tensor_parallel_size"])
         )
-        _validate_shared_vllm_metadata(metadata, deployment, world_size, expected_devices)
+        options = ({"node_local_world_size": int(vllm_config["node_local_world_size"])}
+                   if vllm_config.get("node_local_world_size") is not None else {})
+        _validate_shared_vllm_metadata(metadata, deployment, world_size, expected_devices, **options)
 
     def _build_runtime(self) -> None:
         """Build tokenizer, data, requirement-selected roles, optimizers, and tracking."""

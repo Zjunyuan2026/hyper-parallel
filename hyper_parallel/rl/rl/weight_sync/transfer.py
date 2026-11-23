@@ -23,6 +23,7 @@ __all__ = [
 
 
 import logging
+from functools import partial
 from typing import TYPE_CHECKING, Any, Mapping, Optional, Union
 
 import torch
@@ -118,9 +119,12 @@ class WeightPublisher:
         self,
         source: WeightSource,
         transport: WeightTransport,
+        *, control_group: Any = None,
     ) -> None:
         """Own the bucket plan, transport, and latest result."""
         self.source = source
+        self._control_call = (coordinator_call if control_group is None
+                              else partial(coordinator_call, group=control_group))
         self._buckets: Optional[tuple[PackedWeightBucket, ...]] = None
         self._parameter_names: frozenset[str] = frozenset()
         self._context: Optional[Union[IPCContext, str]] = None
@@ -143,8 +147,8 @@ class WeightPublisher:
                 "weight-sync layout preparation",
                 lambda: self.prepare(client, state, self.transport),
             )
-            coordinator_call("weight-sync pause", client.pause)
-            coordinator_call("weight-sync start", client.start_weight_update)
+            self._control_call("weight-sync pause", client.pause)
+            self._control_call("weight-sync start", client.start_weight_update)
 
             def execute_transfer() -> Optional[dict[str, Any]]:
                 """Execute the prepared publication strategy on every rank."""
@@ -154,16 +158,18 @@ class WeightPublisher:
                 "weight-sync data transfer",
                 execute_transfer,
             )
-            coordinator_call("weight-sync finish", client.finish_weight_update)
-            committed_version = coordinator_call(
-                "weight-sync committed version",
-                lambda: committed_policy_version(client),
-            )
-            if committed_version != snapshot.version:
-                raise RuntimeError(
-                    "vLLM committed a different policy version: "
-                    f"expected={snapshot.version}, actual={committed_version}"
-                )
+            self._control_call("weight-sync finish", client.finish_weight_update)
+
+            def verify_committed_version() -> None:
+                """Reject every Trainer if any node committed a different policy version."""
+                committed_version = committed_policy_version(client)
+                if committed_version != snapshot.version:
+                    raise RuntimeError(
+                        "vLLM committed a different policy version: "
+                        f"expected={snapshot.version}, actual={committed_version}"
+                    )
+
+            self._control_call("weight-sync committed version", verify_committed_version)
             self.last_strategy = self.configured_strategy
             self.last_streaming_stats = streaming_stats
             if dist.get_rank() == 0:
@@ -304,6 +310,7 @@ def build_weight_publisher(
     deployment: str, model: VLLMModelRegistration, *, tensor_parallel_size: int = 1,
     data_parallel_size: int = 1, bucket_size_bytes: int = 128 * 2**20,
     strategy: str = "full_gather",
+    control_group: Any = None,
 ) -> WeightPublisher:
     """Compose one data strategy with the deployment transport."""
     validate_weight_sync_support(
@@ -314,5 +321,10 @@ def build_weight_publisher(
         raise ValueError("Weight-sync DP size and bucket bytes must be positive")
     source = WeightSource(model, bucket_size_bytes)
     transport_type = IPCWeightTransport if deployment == "colocated" else HCCLWeightTransport
-    transport = transport_type(data_parallel_size=data_parallel_size, tensor_parallel_size=tensor_parallel_size)
-    return WeightPublisher(source, transport)
+    options = {"control_group": control_group} if control_group is not None else {}
+    if options and deployment != "colocated":
+        raise ValueError("Node-local control groups require colocated IPC publication")
+    transport = transport_type(
+        data_parallel_size=data_parallel_size, tensor_parallel_size=tensor_parallel_size, **options,
+    )
+    return WeightPublisher(source, transport, **options)

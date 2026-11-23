@@ -487,7 +487,7 @@ and 900 seconds for controller polling, excluding startup and preflight.
 Only containers with names generated for this invocation are removed on completion or interruption.
 Logs and `summary.json` remain in the controller's `hccl-results/` directory. This does not modify
 image-reference containers. `--dry-run` checks arguments and displays topology without contacting
-hosts. A passing probe does not remove the current single-node RL rollout restriction.
+hosts. A passing probe establishes communication evidence only; RL requires its own short run.
 
 To select four hosts from a longer candidate list, append `--select-nodes 4`. The first host remains
 mandatory rank zero. Other candidates are checked in list order; busy, unreachable, image-mismatched
@@ -510,3 +510,53 @@ This writes `recovered-summary.json` and preserves the original logs and summary
 save container exit states: their worker evidence can pass while the overall `passed` field remains
 false because exit status cannot be verified. Check `worker_checks_passed` and
 `container_exit_status_verified` separately. New runs retain the container exit states.
+
+### Selected-node full-model RL short run
+
+`scripts/run_qwen3_moe_cluster.py` is the experimental synchronous Qwen3 MoE cluster entry.
+Run it on the first management host, outside Docker, after pulling this branch. It selects that
+host plus eligible peers in candidate order; the default selection is four hosts with 16 devices
+each. The controller checks image identity, device occupancy, the data interface, model/data paths
+and shared storage before launching. Selection does not reserve devices.
+
+```bash
+python3 hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_cluster.py --hosts 192.0.2.10,192.0.2.11,192.0.2.12,192.0.2.13 --master-addr 198.51.100.10 --interface data0 --select-nodes 4 --dry-run
+```
+
+Replace addresses/interface with the allocation and remove `--dry-run` to execute. Paths default
+to `/mnt/share/zjy/models/Qwen3-30B-A3B`, `/mnt/share/zjy/datasets/gsm8k/prepared`, and
+`/mnt/share/zjy/rl-cluster-runs`; override them using `--model-root`, `--data-root`, and
+`--shared-root`. The last directory must be writable and shared at the same path on every host.
+The existing runtime image must already be loaded locally on each eligible host.
+
+The controller snapshots this checkout's tracked working files plus the batch-invariant and
+runtime wheels into a new shared run directory. All containers mount this same snapshot read-only;
+other hosts need no checkout. `plan.json`, `source.tar.sha256`, selected hosts and the resolved
+image ID preserve the run inputs. The known batch-invariant wheel checksum is checked before launch.
+
+Four-host defaults:
+
+| Setting | Value |
+| --- | --- |
+| Model | Full pretrained Qwen3-30B-A3B; `MODEL_LAYERS=0` |
+| Training | Global TP4 / CP2 / DP8 / EP4 / EDP16 |
+| Inference | Per-node TP2 / DP8 / EP8, PCP1 |
+| Residency | `cpu_offload=false`; add `--cpu-offload` for the standard offload policy |
+| Workload | 3 steps, 1 prompt per training DP rank, 4 responses per prompt |
+| Token budgets | 512 prompt tokens, up to 1024 new tokens; override `--max-new-tokens` |
+| Acceptance | Strict pre-update sampled-token consistency plus update observation |
+
+Each node owns one loopback vLLM service. Global full-gather/broadcast still publishes one policy;
+HTTP mutations, physical-device discovery and IPC handles stay within each node. Any node's control
+or version-validation failure rejects all Trainers. Training TP x CP groups must fit inside a node.
+The small configuration template's filename does not crop the model: the shared worker explicitly
+selects the full checkpoint and skips checkpoint preparation.
+
+The controller prints `RESULT_DIRECTORY`; inspect `node0/run/consistency.json`,
+`node0/run/summary.json`, `node*/run/progress-rank*.json`, and `node*.log` there. The top-level
+`summary.json` passes only when the consistency report covers all requested steps and every owned
+container exits successfully. Cleanup removes only containers created by this invocation.
+
+CPU/mocked regressions validate orchestration, not multi-node numerical parity or performance.
+Real-device cluster RL acceptance remains pending. This entry does not implement a 50-step full
+GSM8K epoch, train/validation splitting, or final test evaluation; those require the separate data plan.

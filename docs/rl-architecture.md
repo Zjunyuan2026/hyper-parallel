@@ -14,6 +14,12 @@ Only native-vLLM and streaming full_gather remain, using IPC/HCCL according to d
 The old consistency machinery, Hyper inference models, and direct_reshard have been removed. New checkpoints explicitly use schema 2 and are incompatible with historical snapshots.
 GRPO/PPO/GSPO, MoE, RM, Teacher, Agent, and both asynchronous modes retain their existing support matrices; directory migration does not expand support.
 
+Experimental synchronous internal Qwen3 MoE runs may set `rollout.vllm.node_local_world_size`.
+Training meshes and complete-policy tensor publication remain global; each contiguous torchrun node
+group owns its loopback service, HTTP coordinator and IPC device handles. Control failures propagate
+globally before node-local results are admitted. The [consistency example](../hyper_parallel/rl/examples/consistency/README.md#selected-node-full-model-rl-short-run)
+owns the launcher and current acceptance limits; multi-node RL device acceptance is pending.
+
 See the [runtime architecture](../hyper_parallel/rl/docs/architecture.md) for detailed ordering and state contracts,
 [feature navigation](rl-navigation.md) for configuration and validation entry points, and [RL rules](../.agent/rules/hyper-rl.md) for development boundaries.
 Record CPU contract validation, short device flows, and learning outcomes separately.
