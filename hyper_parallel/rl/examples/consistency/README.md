@@ -611,6 +611,38 @@ To inspect timings for either an old or new retained run without launching conta
 python3 hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_cluster.py --summarize /path/to/qwen3-cluster-directory
 ```
 
+#### Target-batch preflight
+
+Before predicting a full-dataset run, measure its intended batch with the same full model and topology.
+For four nodes, 136 global questions divide into 17 questions per training DP rank, with four responses
+per question. Keep micro-batch 1 and set the local response mini-batch to 68, so each step contains one
+optimizer update with 68 forward/backward micro-batches per DP rank:
+
+```bash
+python3 hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_cluster.py --hosts 192.0.2.10,192.0.2.11,192.0.2.12,192.0.2.13 --master-addr 198.51.100.10 --interface data0 --select-nodes 4 --steps 5 --global-prompt-batch-size 136 --micro-batch-size 1 --response-mini-batch-size 68 --full-data --plot
+```
+
+Use allocation-specific addresses and interface. Append `--dry-run` to inspect the batch plan without
+contacting hosts. `BATCH_PLAN`, `plan.json`, the generated configuration and top-level summary retain
+the effective batch settings. The local mini-batch defaults to all local responses; explicit uneven
+DP batches or non-divisible accumulation settings are rejected before preflight. Defaults without
+these options preserve the original one-question-per-DP short run.
+
+`--full-data` loads and shuffles the existing training parquet; a five-step pilot processes 680 question
+presentations, not an entire epoch. It does not create the planned train/validation split or evaluate
+the official test set. Pilot checkpoints remain disabled: the formal split-based run starts afresh
+from the original pretrained model rather than reusing pilot updates.
+
+`CLUSTER_TIMING` and `--summarize` also show the response-count-weighted mean generated length,
+minimum/maximum response lengths, truncation ratio, and the recorded Trainer rank-zero allocation
+peak. Missing counters remain null. This memory value excludes other training ranks and vLLM
+processes and must not be interpreted as the whole-device HBM peak. Keep it alongside real-device
+occupancy observations and any rank-specific OOM reports.
+
+`--plot` uses the existing six-figure export in `node0/run/plots`: reward, loss, consistency, the
+three-panel overview, raw reward and raw loss, each in PNG and SVG. These pilot plots do not replace
+the additional validation and coverage figures planned for the formal run.
+
 CPU/mocked regressions validate orchestration, not multi-node numerical parity or performance.
 Real-device cluster RL acceptance of the updated execution path remains pending. This entry does not implement a 50-step full
 GSM8K epoch, train/validation splitting, or final test evaluation; those require the separate data plan.

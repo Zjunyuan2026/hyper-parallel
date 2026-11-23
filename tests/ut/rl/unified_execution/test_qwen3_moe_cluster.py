@@ -42,11 +42,48 @@ def arguments(directory: Path) -> argparse.Namespace:
                               master_addr="192.0.2.1", master_port=29751, interface="data0.172",
                               model_root=directory / "model", data_root=directory / "data",
                               shared_root=directory, wheel=directory / "wheel", cpu_offload=False,
-                              steps=3, max_new_tokens=1024, timeout=3600)
+                              steps=3, max_new_tokens=1024, timeout=3600,
+                              global_prompt_batch_size=None, micro_batch_size=1, response_mini_batch_size=None,
+                              full_data=False, plot=False)
 
 
 class ClusterLauncherTests(unittest.TestCase):
     """Validate placement, completeness, and bounded failure cleanup without NPU use."""
+
+    def test_target_batch_accumulates_into_one_optimizer_update(self) -> None:
+        """136 questions span eight DP ranks; 68 micro-batches form one local mini-batch."""
+        args = arguments(Path("/shared/run"))
+        args.hosts = ["192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.4"]
+        args.global_prompt_batch_size = 136
+        args.full_data = True
+        args.plot = True
+        batch = CONTROLLER.resolve_batch(args, 4)
+        self.assertEqual(batch["global_response_batch_size"], 544)
+        self.assertEqual(batch["prompts_per_dp_rank"], 17)
+        self.assertEqual(batch["response_mini_batch_size"], 68)
+        self.assertEqual(batch["micro_batch_size"], 1)
+        self.assertEqual(batch["optimizer_updates_per_step"], 1)
+        with patch.object(os, "getuid", return_value=0, create=True), \
+             patch.object(os, "getgid", return_value=0, create=True):
+            command = CONTROLLER.docker_command(args, 0, "172.27.3.101", "image", "owned", Path("/shared/run"))
+        env = dict(value.split("=", 1) for index, value in enumerate(command) if index and command[index - 1] == "-e")
+        expected = {"GLOBAL_PROMPT_BATCH_SIZE": "136", "PROMPTS_PER_RANK": "17", "CANDIDATES": "4",
+                    "MICRO_BATCH_SIZE": "1", "RESPONSE_MINI_BATCH_SIZE": "68", "FULL_DATASET": "true",
+                    "PLOT_TRAINING": "true", "MODEL_LAYERS": "0"}
+        self.assertEqual({key: env[key] for key in expected}, expected)
+
+    def test_invalid_batch_is_rejected_before_preflight(self) -> None:
+        """Uneven DP work and impossible accumulation cannot allocate remote devices."""
+        base = [str(SCRIPT), "--hosts", "192.0.2.1,192.0.2.2,192.0.2.3,192.0.2.4",
+                "--master-addr", "172.27.3.101", "--global-prompt-batch-size", "136"]
+        for extra in (["--micro-batch-size", "8"], ["--response-mini-batch-size", "3"],
+                      ["--global-prompt-batch-size", "135"], ["--micro-batch-size", "0"]):
+            with self.subTest(extra=extra), patch.object(sys, "argv", base + extra), \
+                 patch.object(CONTROLLER, "preflight") as preflight, contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    CONTROLLER.main()
+                self.assertEqual(error.exception.code, 2)
+                preflight.assert_not_called()
 
     def test_container_uses_full_model_and_node_local_rollout(self) -> None:
         """Selected host order drives rank assignment; global and local sizes remain distinct."""
@@ -121,6 +158,31 @@ class ClusterLauncherTests(unittest.TestCase):
             result = CONTROLLER.summarize_timings(directory)
         self.assertEqual(result["warm_step_samples"], 2)
         self.assertEqual(result["mean_seconds"], {"perf/time_per_step": 65, "timing_s/gen": 15})
+        self.assertIsNone(result["reported_peak_allocated_gb"])
+        self.assertIsNone(result["rollout_summary"]["mean_response_tokens"])
+
+    def test_length_and_memory_summary_preserves_measurement_scope(self) -> None:
+        """Response means are weighted by response count; startup allocation peaks remain visible."""
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            metrics = directory / "node0/run/steps.jsonl"
+            metrics.parent.mkdir(parents=True)
+            rows = [{"rollout/generated_tokens": 900, "system/max_memory_allocated_gb": 42},
+                    {"rollout/generated_tokens": 100, "rollout/sequence_count": 10,
+                     "rollout/response_length_min": 2, "rollout/response_length_max": 40,
+                     "rollout/truncated_ratio": 0.1, "system/max_memory_allocated_gb": 40},
+                    {"rollout/generated_tokens": 300, "rollout/sequence_count": 20,
+                     "rollout/response_length_min": 3, "rollout/response_length_max": 50,
+                     "rollout/truncated_ratio": 0.2, "system/max_memory_allocated_gb": 41}]
+            metrics.write_text("\n".join(json.dumps(row) for row in rows))
+            result = CONTROLLER.summarize_timings(directory)
+        self.assertEqual(result["reported_peak_allocated_gb"], 42)
+        self.assertIn("not whole-device HBM", result["memory_scope"])
+        lengths = result["rollout_summary"]
+        self.assertEqual(lengths["warm_response_count"], 30)
+        self.assertAlmostEqual(lengths["mean_response_tokens"], 400 / 30)
+        self.assertAlmostEqual(lengths["truncated_ratio"], 5 / 30)
+        self.assertEqual((lengths["min_response_tokens"], lengths["max_response_tokens"]), (2, 50))
 
     def test_summary_mode_reads_results_without_ssh_or_docker(self) -> None:
         """Previously saved A3 runs remain readable without any runtime dependencies."""

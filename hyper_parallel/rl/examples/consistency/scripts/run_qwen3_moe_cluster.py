@@ -31,6 +31,7 @@ import subprocess
 import tarfile
 import tempfile
 import time
+from typing import Optional
 import uuid
 
 from run_hccl_cluster import execute, interrupt, preflight, require_idle
@@ -40,6 +41,31 @@ ROOT = Path(__file__).resolve().parents[5]
 SCRIPTS = "hyper_parallel/rl/examples/consistency/scripts"
 WHEEL = "flash_attn_npu-0.5.0+hpbi1-cp312-cp312-linux_aarch64.whl"
 WHEEL_SHA256 = "5ef04a872b1be2c812bb0c36c17ba4776a4b5f9b9eabb24eab0a56a139a497c9"
+
+
+def resolve_batch(args: argparse.Namespace, node_count: int) -> dict:
+    """Keep prompt work global and gradient accumulation local to the training DP group."""
+    dp_size = node_count * 2
+    prompts = args.global_prompt_batch_size if args.global_prompt_batch_size is not None else dp_size
+    if prompts < 1 or prompts % dp_size:
+        raise ValueError(f"Global prompt batch must be positive and divisible by training DP={dp_size}")
+    responses = prompts // dp_size * 4
+    mini = args.response_mini_batch_size if args.response_mini_batch_size is not None else responses
+    if args.micro_batch_size < 1 or mini < 1 or responses % mini or mini % args.micro_batch_size:
+        raise ValueError("Responses per DP rank must divide into mini-batches and mini-batches into micro-batches")
+    return {"training_dp_size": dp_size, "global_prompt_batch_size": prompts,
+            "prompts_per_dp_rank": prompts // dp_size, "candidates": 4,
+            "global_response_batch_size": prompts * 4, "response_mini_batch_size": mini,
+            "micro_batch_size": args.micro_batch_size, "optimizer_updates_per_step": responses // mini}
+
+
+def finite_values(rows: list[dict], key: str) -> Optional[list[float]]:
+    """Return complete nonnegative measurements; partial evidence stays missing."""
+    values = [row.get(key) for row in rows]
+    if not values or not all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                             and math.isfinite(value) and value >= 0 for value in values):
+        return None
+    return values
 
 
 def summarize_timings(directory: Path) -> dict:
@@ -52,15 +78,28 @@ def summarize_timings(directory: Path) -> dict:
                    if key.startswith("timing_s/") or key == "perf/time_per_step"})
     means = {}
     for key in keys:
-        values = [row.get(key) for row in warm]
-        if all(isinstance(value, (int, float)) and not isinstance(value, bool)
-               and math.isfinite(value) and value >= 0 for value in values):
+        values = finite_values(warm, key)
+        if values is not None:
             means[key] = statistics.mean(values)
-    tokens = [row.get("rollout/generated_tokens") for row in warm]
-    generated = (sum(tokens) if tokens and all(isinstance(value, (int, float)) and not isinstance(value, bool)
-                                             and math.isfinite(value) and value >= 0 for value in tokens) else None)
+    tokens = finite_values(warm, "rollout/generated_tokens")
+    generated = sum(tokens) if tokens is not None else None
+    counts = finite_values(warm, "rollout/sequence_count")
+    count = sum(counts) if counts is not None else None
+    minimum = finite_values(warm, "rollout/response_length_min")
+    maximum = finite_values(warm, "rollout/response_length_max")
+    truncation = finite_values(warm, "rollout/truncated_ratio")
+    memory = finite_values(rows, "system/max_memory_allocated_gb")
     return {"recorded_steps": len(rows), "warm_step_samples": len(warm), "mean_seconds": means,
             "warm_generated_tokens": generated,
+            "rollout_summary": {
+                "warm_response_count": count,
+                "mean_response_tokens": generated / count if count and generated is not None else None,
+                "min_response_tokens": min(minimum) if minimum is not None else None,
+                "max_response_tokens": max(maximum) if maximum is not None else None,
+                "truncated_ratio": (sum(ratio * size for ratio, size in zip(truncation, counts)) / count
+                                    if count and truncation is not None else None)},
+            "reported_peak_allocated_gb": max(memory) if memory is not None else None,
+            "memory_scope": "Trainer rank-0 allocator peak; excludes vLLM and other ranks; not whole-device HBM",
             "timing_scope": "Excludes first step, container setup and model startup; not full-dataset throughput"}
 
 
@@ -96,6 +135,7 @@ def docker_command(args: argparse.Namespace, node_rank: int, address: str,
     """Use node-local inference meshes alongside one global training mesh."""
     source = directory / "source"
     result = directory / f"node{node_rank}"
+    batch = resolve_batch(args, len(args.hosts))
     command = ["docker", "run", "-d", "--name", name, "--label", "hyper-rl.cluster=true",
                "--privileged", "--network=host", "--shm-size=64g", "-w", "/workspace"]
     mounts = [(str(source), "/workspace", "ro"), (str(result), "/results", "rw"),
@@ -118,7 +158,11 @@ def docker_command(args: argparse.Namespace, node_rank: int, address: str,
         "ROLLOUT_LOCAL_WORLD_SIZE": "16", "TRAIN_TP": "4", "TRAIN_CP": "2", "TRAIN_EP": "4",
         "TRAIN_SP": "true", "ROLLOUT_TP": "2", "ROLLOUT_PCP": "1", "ROLLOUT_EP": "8",
         "ROLLOUT_SP": "false", "CPU_OFFLOAD": str(args.cpu_offload).lower(), "RUNNER": "internal",
-        "STEPS": str(args.steps), "CANDIDATES": "4", "PROMPTS_PER_RANK": "1",
+        "STEPS": str(args.steps), "CANDIDATES": "4", "PROMPTS_PER_RANK": str(batch["prompts_per_dp_rank"]),
+        "GLOBAL_PROMPT_BATCH_SIZE": str(batch["global_prompt_batch_size"]),
+        "MICRO_BATCH_SIZE": str(batch["micro_batch_size"]),
+        "RESPONSE_MINI_BATCH_SIZE": str(batch["response_mini_batch_size"]),
+        "FULL_DATASET": str(args.full_data).lower(),
         "MAX_PROMPT": "512", "MAX_NEW_TOKENS": str(args.max_new_tokens),
         "MAX_MODEL_LEN": str(512 + args.max_new_tokens), "PREFILL_TOKENS": "512",
         "MAX_NUM_SEQS": "4", "KV_CACHE_MEMORY_BYTES": str(2 * 1024**3),
@@ -133,7 +177,7 @@ def docker_command(args: argparse.Namespace, node_rank: int, address: str,
         "HYPER_RL_VLLM_CPU_THREADS": os.environ.get("HYPER_RL_VLLM_CPU_THREADS", "1"),
         "VLLM_HOST_IP": "127.0.0.1", "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
         "HYPER_RL_DIAGNOSTICS_DIR": "/results/run", "V4_WHEEL_SHA256": WHEEL_SHA256,
-        "RESULT_UID": str(os.getuid()), "RESULT_GID": str(os.getgid()), "PLOT_TRAINING": "false",
+        "RESULT_UID": str(os.getuid()), "RESULT_GID": str(os.getgid()), "PLOT_TRAINING": str(args.plot).lower(),
     }
     for key, value in environment.items():
         command.extend(["-e", f"{key}={value}"])
@@ -143,6 +187,7 @@ def docker_command(args: argparse.Namespace, node_rank: int, address: str,
 def run(args: argparse.Namespace) -> Path:
     """Preflight, stage, launch, collect evidence, and clean up only owned containers."""
     image_id, addresses = preflight(args)
+    batch = resolve_batch(args, len(args.hosts))
     args.shared_root.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix="qwen3-cluster-", dir=args.shared_root.resolve()))
     source, revision = stage_source(directory, args.wheel)
@@ -162,8 +207,11 @@ def run(args: argparse.Namespace) -> Path:
             "world_size": len(args.hosts) * 16, "training": "TP4/CP2/EP4; DP=world/8; EDP=world/4",
             "rollout_per_node": "TP2/DP8/EP8", "cpu_offload": args.cpu_offload,
             "steps": args.steps, "model_layers": "full", "model_root": str(args.model_root),
-            "data_root": str(args.data_root), "scope": "Short consistency run; not full GSM8K training/evaluation"}
+            "data_root": str(args.data_root), "batch": batch, "full_data": args.full_data,
+            "max_new_tokens": args.max_new_tokens, "plot": args.plot,
+            "scope": "Short consistency run; not full GSM8K training/evaluation"}
     (directory / "plan.json").write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+    print("BATCH_PLAN", json.dumps(batch), flush=True)
     launched = []
     result = {**plan, "passed": False}
     print("RESULT_DIRECTORY", directory, flush=True)
@@ -208,7 +256,8 @@ def run(args: argparse.Namespace) -> Path:
         except (OSError, ValueError) as error:
             result["timing_error"] = str(error)
         (directory / "summary.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
-        timing_keys = ("warm_step_samples", "mean_seconds", "warm_generated_tokens", "timing_error")
+        timing_keys = ("warm_step_samples", "mean_seconds", "warm_generated_tokens", "rollout_summary",
+                       "reported_peak_allocated_gb", "memory_scope", "timing_error")
         print("CLUSTER_TIMING", json.dumps({key: result[key] for key in timing_keys if key in result}), flush=True)
         print("CLUSTER_RESULT", json.dumps({"passed": result["passed"], "directory": str(directory)}), flush=True)
     if not result["passed"]:
@@ -231,6 +280,13 @@ def main() -> None:
     parser.add_argument("--shared-root", type=Path, default=Path("/mnt/share/zjy/rl-cluster-runs"))
     parser.add_argument("--wheel", type=Path, default=ROOT / "wheels" / WHEEL)
     parser.add_argument("--steps", type=int, default=3)
+    parser.add_argument("--global-prompt-batch-size", type=int, help="Global questions per step across training DP")
+    parser.add_argument("--micro-batch-size", type=int, default=1)
+    parser.add_argument("--response-mini-batch-size", type=int,
+                        help="Responses per training DP mini-batch; default is all local responses")
+    parser.add_argument("--full-data", action="store_true",
+                        help="Shuffle all training rows; steps need not cover an epoch")
+    parser.add_argument("--plot", action="store_true", help="Export rank-zero reward/loss/consistency figures")
     parser.add_argument("--max-new-tokens", type=int, default=1024)
     parser.add_argument("--cpu-offload", action="store_true")
     parser.add_argument("--timeout", type=int, default=14400)
@@ -239,7 +295,7 @@ def main() -> None:
     if args.summarize is not None:
         directory = args.summarize.resolve()
         result = json.loads((directory / "summary.json").read_text(encoding="utf-8"))
-        result = {key: result.get(key) for key in ("passed", "hosts", "revision", "steps")}
+        result = {key: result.get(key) for key in ("passed", "hosts", "revision", "steps", "batch", "full_data")}
         result.update(directory=str(directory), **summarize_timings(directory))
         print(json.dumps(result, indent=2), flush=True)
         return
@@ -250,12 +306,17 @@ def main() -> None:
     if (len(set(args.hosts)) != len(args.hosts) or not 2 <= args.select_nodes <= len(args.hosts)
             or not 1024 <= args.master_port <= 65535 or min(args.steps, args.max_new_tokens, args.timeout) < 1):
         parser.error("Use unique hosts, >=2 selected nodes, a valid port and positive budgets")
+    try:
+        batch = resolve_batch(args, args.select_nodes)
+    except ValueError as error:
+        parser.error(str(error))
     if args.dry_run:
         print(json.dumps({"candidate_hosts": args.hosts, "required_rank0": args.hosts[0],
                           "selected_nodes": args.select_nodes, "world_size": args.select_nodes * 16,
                           "steps": args.steps, "model_layers": "full", "cpu_offload": args.cpu_offload,
                           "training": f"TP4/CP2/DP{args.select_nodes * 2}/EP4/EDP{args.select_nodes * 4}",
-                          "rollout_per_node": "TP2/DP8/EP8", "shared_root": str(args.shared_root)}, indent=2))
+                          "rollout_per_node": "TP2/DP8/EP8", "shared_root": str(args.shared_root),
+                          "batch": batch, "full_data": args.full_data, "plot": args.plot}, indent=2))
         return
     run(args)
 

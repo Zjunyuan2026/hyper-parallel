@@ -45,7 +45,9 @@ class NodeControlTests(unittest.TestCase):
                   / "hyper_parallel/rl/examples/consistency/configs/qwen3_moe_4l_cp_rl.yaml")
         environment = {"RUN_MODEL_PATH": "/models/Qwen3-30B-A3B", "TRAIN_TP": "4", "TRAIN_CP": "2",
                        "TRAIN_EP": "4", "ROLLOUT_TP": "2", "ROLLOUT_PCP": "1", "ROLLOUT_EP": "8",
-                       "ROLLOUT_LOCAL_WORLD_SIZE": "16", "LOCAL_WORLD_SIZE": "16", "CPU_OFFLOAD": "false"}
+                       "ROLLOUT_LOCAL_WORLD_SIZE": "16", "LOCAL_WORLD_SIZE": "16", "CPU_OFFLOAD": "false",
+                       "GLOBAL_PROMPT_BATCH_SIZE": "136", "CANDIDATES": "4", "MICRO_BATCH_SIZE": "1",
+                       "RESPONSE_MINI_BATCH_SIZE": "68", "FULL_DATASET": "true", "STEPS": "5"}
         with tempfile.TemporaryDirectory() as temporary, patch.dict("os.environ", environment, clear=True), \
              patch.object(torch.accelerator, "current_accelerator", return_value=SimpleNamespace(type="npu")):
             root = Path(temporary)
@@ -72,6 +74,8 @@ class NodeControlTests(unittest.TestCase):
             runtime = build_runtime_config(config)
             self.assertEqual(runtime.fsdp_config.dp_shard_size, 8)
             self.assertEqual(runtime.fsdp_config.edp_shard_size, 16)
+            self.assertEqual(config["train"]["prompt_batch_size"], 17)
+            self.assertEqual(config["train"]["response_mini_batch_size"], 68)
             config["async_training"] = {}
             with self.assertRaisesRegex(ValueError, "synchronous"):
                 validate_config(config, build_algorithm(config["algorithm"]))

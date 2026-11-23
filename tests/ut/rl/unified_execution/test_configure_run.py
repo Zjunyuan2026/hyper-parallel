@@ -31,6 +31,25 @@ CONFIGURE = runpy.run_path(str(ROOT / "scripts/configure_run.py"))["configure"]
 class ConfigureRunTests(unittest.TestCase):
     """Keep task selection and token/transport budgets independent of topology."""
 
+    def test_target_batch_preflight_uses_complete_local_mini_batches(self) -> None:
+        """Large prompt batches do not silently multiply the number of optimizer updates."""
+        environment = {"RUN_MODEL_PATH": "/models/Qwen3-30B-A3B", "TRAIN_TP": "4", "TRAIN_CP": "2",
+                       "TRAIN_EP": "4", "ROLLOUT_TP": "2", "ROLLOUT_PCP": "1", "ROLLOUT_EP": "8",
+                       "ROLLOUT_LOCAL_WORLD_SIZE": "16", "GLOBAL_PROMPT_BATCH_SIZE": "136",
+                       "MICRO_BATCH_SIZE": "1", "RESPONSE_MINI_BATCH_SIZE": "68", "CANDIDATES": "4",
+                       "FULL_DATASET": "true", "STEPS": "5", "CPU_OFFLOAD": "false"}
+        with patch.dict(os.environ, environment, clear=True):
+            config = CONFIGURE(yaml.safe_load((ROOT / "configs/qwen3_moe_4l_cp_rl.yaml").read_text()), 64)
+        train = config["train"]
+        self.assertEqual((train["prompt_batch_size"], train["response_mini_batch_size"], train["micro_batch_size"]),
+                         (17, 68, 1))
+        self.assertEqual(train["max_steps"], 5)
+        self.assertEqual(train["policy_update_epochs"], 1)
+        self.assertIsNone(config["data"]["max_train_samples"])
+        self.assertTrue(config["data"]["shuffle"])
+        self.assertFalse(config["evaluation"]["enabled"])
+        self.assertFalse(train["checkpoint"]["save_final"])
+
     def test_four_node_training_uses_global_dp_and_node_local_rollout_dp(self) -> None:
         """Full-model selection is independent of the small recipe filename."""
         environment = {"RUN_MODEL_PATH": "/models/Qwen3-30B-A3B", "TRAIN_TP": "4", "TRAIN_CP": "2",
