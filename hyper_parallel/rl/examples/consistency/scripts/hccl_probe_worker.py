@@ -55,9 +55,11 @@ def main() -> None:
         dist.barrier()
     finally:
         dist.destroy_process_group()
-    print("HCCL_PROBE_RESULT " + json.dumps({"rank": rank, "local_rank": local_rank,
-                                            "world_size": world, "passed": True, "measurements": results}),
-          flush=True)
+    record = ("HCCL_PROBE_RESULT " + json.dumps({"rank": rank, "local_rank": local_rank,
+                                                "world_size": world, "passed": True,
+                                                "measurements": results}) + "\n").encode()
+    if len(record) > 4096 or os.write(1, record) != len(record):
+        raise RuntimeError("Could not write a complete bounded result record")
 
 
 if __name__ == "__main__":

@@ -68,11 +68,17 @@ def docker_command(args: argparse.Namespace, node_rank: int, address: str,
 def collect_results(logs: list[str], world: int, nproc: int) -> dict:
     """Require one successful record for every expected global and local rank."""
     records = []
+    parse_errors = []
+    decoder = json.JSONDecoder()
     for log in logs:
-        for line in log.splitlines():
-            if "HCCL_PROBE_RESULT " in line:
-                records.append(json.loads(line.split("HCCL_PROBE_RESULT ", 1)[1]))
-    valid = (sorted(row.get("rank", -1) for row in records) == list(range(world))
+        for marker in re.finditer(r"HCCL_PROBE_RESULT\s*(?=\{)", log):
+            try:
+                record, _ = decoder.raw_decode(log, marker.end())
+                records.append(record)
+            except json.JSONDecodeError as error:
+                parse_errors.append(str(error))
+    valid = (not parse_errors and all(isinstance(row.get("rank"), int) for row in records)
+             and sorted(row["rank"] for row in records) == list(range(world))
              and all(row.get("passed") is True and row.get("world_size") == world
                      and row.get("local_rank") == row["rank"] % nproc for row in records))
     measurements = []
@@ -94,8 +100,28 @@ def collect_results(logs: list[str], world: int, nproc: int) -> dict:
             measurements.append({"bytes": size, "min_mean_seconds": min(values),
                                  "max_mean_seconds": max(values)})
     return {"passed": valid, "expected_ranks": world, "reported_ranks": len(records),
+            "parse_errors": parse_errors,
             "measurements": measurements if valid else [],
             "scope": "AllReduce correctness and per-rank duration; not RL acceptance or bus bandwidth"}
+
+
+def recover_results(directory: Path) -> dict:
+    """Reparse retained logs without launching containers or overwriting the original summary."""
+    metadata = json.loads((directory / "summary.json").read_text(encoding="utf-8"))
+    hosts = metadata["hosts"]
+    nproc = metadata["nproc_per_node"]
+    logs = [(directory / f"node{index}.log").read_text(encoding="utf-8") for index in range(len(hosts))]
+    result = collect_results(logs, len(hosts) * nproc, nproc)
+    result["worker_checks_passed"] = result["passed"]
+    states = metadata.get("container_states", [])
+    verified = (len(states) == len(hosts)
+                and all(not state["Running"] and state["ExitCode"] == 0 for state in states))
+    result.update(passed=result["passed"] and verified, container_exit_status_verified=verified,
+                  hosts=hosts, nproc_per_node=nproc, recovered_from_logs=True)
+    if result["worker_checks_passed"] and not states:
+        result["note"] = "Worker checks passed; the older controller did not retain container exit states"
+    (directory / "recovered-summary.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    return result
 
 
 def require_idle(info: str, host: str) -> None:
@@ -160,17 +186,24 @@ def preflight(args: argparse.Namespace) -> tuple[str, list[str]]:
 def main() -> None:
     """Preflight all hosts, run the bounded probe, collect logs and remove only owned containers."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--hosts", required=True, type=lambda text: text.split(","))
+    parser.add_argument("--hosts", type=lambda text: text.split(","))
     parser.add_argument("--select-nodes", type=int, help="Select this many eligible hosts, always including the first")
     parser.add_argument("--select-only", action="store_true", help="Check/select hosts without launching containers")
-    parser.add_argument("--master-addr", required=True)
-    parser.add_argument("--interface", required=True)
+    parser.add_argument("--master-addr")
+    parser.add_argument("--interface")
+    parser.add_argument("--summarize", type=Path, help="Recover evidence from an existing result directory; no NPU use")
     parser.add_argument("--image", default="hyper-rl:consistency-v0.30.0-cann9.2.1-a3-runtime-arm64")
     parser.add_argument("--nproc-per-node", type=int, choices=range(1, 17), default=16)
     parser.add_argument("--master-port", type=int, default=29651)
     parser.add_argument("--result-base", type=Path, default=Path.cwd() / "hccl-results")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if args.summarize is not None:
+        result = recover_results(args.summarize.resolve())
+        print(json.dumps(result, indent=2), flush=True)
+        raise SystemExit(0 if result["passed"] else 1)
+    if not args.hosts or not args.master_addr or not args.interface:
+        parser.error("--hosts, --master-addr and --interface are required to launch a probe")
     for address in [*args.hosts, args.master_addr]:
         ipaddress.IPv4Address(address)
     if len(args.hosts) != len(set(args.hosts)) or not 1024 <= args.master_port <= 65535:
@@ -217,7 +250,8 @@ def main() -> None:
             log = output.stdout + output.stderr
             logs.append(log)
             (directory / f"node{index}.log").write_text(log, encoding="utf-8")
-        result = collect_results(logs, len(args.hosts) * args.nproc_per_node, args.nproc_per_node)
+        result["container_states"] = states
+        result.update(collect_results(logs, len(args.hosts) * args.nproc_per_node, args.nproc_per_node))
         result["passed"] = result["passed"] and all(not state["Running"] and state["ExitCode"] == 0
                                                     for state in states)
     finally:

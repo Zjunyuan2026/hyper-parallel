@@ -496,3 +496,17 @@ The selected host list is printed as `SELECTED_HOSTS` and saved in the summary. 
 to inspect the selection without starting containers. Selection is a snapshot, not a resource
 reservation; occupancy is checked again before startup. Without `--select-nodes`, every listed host
 is required, preserving the original behavior.
+
+Concurrent rank output may place multiple JSON records on one line. The collector parses each
+marked object independently; malformed or incomplete evidence never becomes a pass. To reparse
+retained logs without contacting hosts or launching containers:
+
+```bash
+python3 hyper_parallel/rl/examples/consistency/scripts/run_hccl_cluster.py \
+    --summarize /path/to/hccl-results/probe-directory
+```
+
+This writes `recovered-summary.json` and preserves the original logs and summary. Older runs did not
+save container exit states: their worker evidence can pass while the overall `passed` field remains
+false because exit status cannot be verified. Check `worker_checks_passed` and
+`container_exit_status_verified` separately. New runs retain the container exit states.

@@ -38,6 +38,42 @@ SPEC.loader.exec_module(CONTROLLER)
 class ClusterProbeTests(unittest.TestCase):
     """Reject incomplete evidence and preserve cleanup after partial startup."""
 
+    def test_concatenated_rank_records_and_trailing_logs(self) -> None:
+        """Torchrun may concatenate records on one line; trailing text is not JSON payload."""
+        records = [{"rank": rank, "local_rank": rank % 16, "world_size": 64, "passed": True,
+                    "measurements": [{"bytes": size, "mean_seconds": 0.01}
+                                     for size in (4, 4194304, 67108864)]} for rank in range(64)]
+        log = "warning\n" + "".join("HCCL_PROBE_RESULT " + json.dumps(row) for row in records) + "trailing log"
+        result = CONTROLLER.collect_results([log], 64, 16)
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["reported_ranks"], 64)
+        broken = log.replace('"rank": 0', '"rank": BROKEN', 1)
+        result = CONTROLLER.collect_results([broken], 64, 16)
+        self.assertFalse(result["passed"])
+        self.assertTrue(result["parse_errors"])
+
+    def test_recovery_distinguishes_worker_evidence_from_missing_exit_states(self) -> None:
+        """Read old logs without NPU calls or overwriting original run evidence."""
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            metadata = {"hosts": ["192.0.2.1"], "nproc_per_node": 1, "passed": False}
+            original = json.dumps(metadata)
+            (directory / "summary.json").write_text(original)
+            record = {"rank": 0, "local_rank": 0, "world_size": 1, "passed": True,
+                      "measurements": [{"bytes": size, "mean_seconds": 0.01}
+                                       for size in (4, 4194304, 67108864)]}
+            (directory / "node0.log").write_text("HCCL_PROBE_RESULT " + json.dumps(record))
+            with patch.object(CONTROLLER, "execute") as execute:
+                result = CONTROLLER.recover_results(directory)
+                self.assertTrue(result["worker_checks_passed"])
+                self.assertFalse(result["passed"])
+                self.assertFalse(result["container_exit_status_verified"])
+                self.assertEqual((directory / "summary.json").read_text(), original)
+                metadata["container_states"] = [{"Running": False, "ExitCode": 0}]
+                (directory / "summary.json").write_text(json.dumps(metadata))
+                self.assertTrue(CONTROLLER.recover_results(directory)["passed"])
+                execute.assert_not_called()
+
     def test_every_rank_and_message_size_is_required(self) -> None:
         """Missing/duplicate ranks and invalid timing must never become success."""
         records = [{"rank": rank, "local_rank": rank % 16, "world_size": 128, "passed": True,
