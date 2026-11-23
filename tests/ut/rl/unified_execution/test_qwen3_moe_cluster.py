@@ -44,11 +44,31 @@ def arguments(directory: Path) -> argparse.Namespace:
                               shared_root=directory, wheel=directory / "wheel", cpu_offload=False,
                               steps=3, max_new_tokens=1024, timeout=3600,
                               global_prompt_batch_size=None, micro_batch_size=1, response_mini_batch_size=None,
-                              full_data=False, plot=False)
+                              full_data=False, plot=False, formal_gsm8k=False, max_prompt=512)
 
 
 class ClusterLauncherTests(unittest.TestCase):
     """Validate placement, completeness, and bounded failure cleanup without NPU use."""
+
+    def test_formal_defaults_are_explicit_and_dry_run_allocates_nothing(self) -> None:
+        """The formal flag retains measured settings and cannot masquerade as a short pilot."""
+        command = [str(SCRIPT), "--hosts", "192.0.2.1,192.0.2.2,192.0.2.3,192.0.2.4",
+                   "--master-addr", "198.51.100.1", "--formal-gsm8k", "--dry-run"]
+        stream = io.StringIO()
+        with patch.object(sys, "argv", command), patch.object(CONTROLLER, "preflight") as probe, \
+             contextlib.redirect_stdout(stream):
+            CONTROLLER.main()
+        result = json.loads(stream.getvalue())
+        self.assertEqual(result["steps"], 50)
+        self.assertEqual(result["batch"]["global_prompt_batch_size"], 136)
+        self.assertEqual(result["batch"]["micro_batch_size"], 1)
+        self.assertEqual(result["timeout"], 86400)
+        self.assertTrue(result["plot"])
+        probe.assert_not_called()
+        for extra in (["--micro-batch-size", "2"], ["--steps", "5"], ["--cpu-offload"]):
+            with patch.object(sys, "argv", command + extra), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    CONTROLLER.main()
 
     def test_target_batch_accumulates_into_one_optimizer_update(self) -> None:
         """136 questions span eight DP ranks; 68 micro-batches form one local mini-batch."""

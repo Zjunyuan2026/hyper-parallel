@@ -70,6 +70,11 @@ def run(config: dict[str, Any], report_path: Path, *, track_updates: bool = Fals
         report_path.with_name("config.yaml").write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
     phases = PhaseRecorder(report_path.parent)
     trainer = phases.call("build_trainer", lambda: build_trainer(config))
+    formal = None
+    if os.environ.get("FORMAL_GSM8K") == "true":
+        # Optional task workflow; ordinary consistency runs retain their existing schedule.
+        from examples.consistency.scripts.full_gsm8k import FormalRun
+        formal = FormalRun(trainer, config, report_path.parent, Path("/formal-run"))
     phases.next_step = lambda: trainer.state.global_step + 1
     prepare = trainer.targets.prepare
     checks = []
@@ -108,6 +113,8 @@ def run(config: dict[str, Any], report_path: Path, *, track_updates: bool = Fals
     observer = MetricsObserver(trainer._tracker, report_path.parent)
     trainer._tracker = observer
     trainer.train()
+    if formal is not None:
+        formal.finish()
     if (trainer.state.global_step != requested_steps
             or [check["step"] for check in checks] != list(range(1, requested_steps + 1))):
         raise RuntimeError("The normal RL loop did not complete and verify every requested update")
@@ -172,7 +179,7 @@ class MetricsObserver:
     def log(self, metrics: dict, *, step: int, **kwargs: Any) -> None:
         """Keep the original tracker and write rank-zero step metrics."""
         self.tracker.log(metrics, step=step, **kwargs)
-        if int(os.environ.get("RANK", "0")) != 0:
+        if int(os.environ.get("RANK", "0")) != 0 or step == 0:
             return
         row = {"step": step, "recorded_at_unix": time.time(), **metrics}
         self.rows.append(row)

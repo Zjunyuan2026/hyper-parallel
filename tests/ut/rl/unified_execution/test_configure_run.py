@@ -31,6 +31,22 @@ CONFIGURE = runpy.run_path(str(ROOT / "scripts/configure_run.py"))["configure"]
 class ConfigureRunTests(unittest.TestCase):
     """Keep task selection and token/transport budgets independent of topology."""
 
+    def test_formal_data_evaluation_and_checkpoint_settings(self) -> None:
+        """Formal mode holds out validation and enables complete greedy evaluation and saves."""
+        environment = {"RUN_MODEL_PATH": "/models/Qwen3-30B-A3B", "TRAIN_TP": "4", "TRAIN_CP": "2",
+                       "TRAIN_EP": "4", "ROLLOUT_TP": "2", "ROLLOUT_PCP": "1", "ROLLOUT_EP": "8",
+                       "ROLLOUT_LOCAL_WORLD_SIZE": "16", "GLOBAL_PROMPT_BATCH_SIZE": "136",
+                       "MICRO_BATCH_SIZE": "1", "RESPONSE_MINI_BATCH_SIZE": "68", "CANDIDATES": "4",
+                       "FORMAL_GSM8K": "true", "STEPS": "50", "CPU_OFFLOAD": "false"}
+        with patch.dict(os.environ, environment, clear=True):
+            config = CONFIGURE(yaml.safe_load((ROOT / "configs/qwen3_moe_4l_cp_rl.yaml").read_text()), 64)
+        self.assertEqual(config["data"]["test_path"], "/formal-run/data/validation.parquet")
+        self.assertEqual(config["evaluation"]["every_n_steps"], 10)
+        self.assertIsNone(config["evaluation"]["max_samples"])
+        self.assertFalse(config["evaluation"]["do_sample"])
+        self.assertEqual(config["train"]["checkpoint"]["save_steps"], 10)
+        self.assertTrue(config["train"]["checkpoint"]["save_final"])
+
     def test_target_batch_preflight_uses_complete_local_mini_batches(self) -> None:
         """Large prompt batches do not silently multiply the number of optimizer updates."""
         environment = {"RUN_MODEL_PATH": "/models/Qwen3-30B-A3B", "TRAIN_TP": "4", "TRAIN_CP": "2",

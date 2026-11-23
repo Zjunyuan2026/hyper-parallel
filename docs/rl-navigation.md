@@ -71,3 +71,6 @@ For the implemented role-specific EP paths, see the
   [device transport acceptance](../hyper_parallel/rl/tests/st/test_unified_expert_parallel.py), and
   [two-step publication loop](../hyper_parallel/rl/tests/st/test_prefill_context_parallel.py).
 - Boundaries: [MoE execution contract](../hyper_parallel/rl/docs/unified_execution_moe.md#数值契约).
+
+Formal complete-data GSM8K runs use the [50-step epoch entry](../hyper_parallel/rl/examples/consistency/README.md#formal-50-step-gsm8k-epoch),
+with finite train coverage, held-out validation, final official testing and eight chart exports.

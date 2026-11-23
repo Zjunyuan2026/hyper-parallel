@@ -644,5 +644,46 @@ three-panel overview, raw reward and raw loss, each in PNG and SVG. These pilot 
 the additional validation and coverage figures planned for the formal run.
 
 CPU/mocked regressions validate orchestration, not multi-node numerical parity or performance.
-Real-device cluster RL acceptance of the updated execution path remains pending. This entry does not implement a 50-step full
-GSM8K epoch, train/validation splitting, or final test evaluation; those require the separate data plan.
+
+#### Formal 50-step GSM8K epoch
+
+```bash
+python3 hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_cluster.py --hosts 192.0.2.10,192.0.2.11,192.0.2.12,192.0.2.13 --master-addr 198.51.100.10 --interface data0 --select-nodes 4 --formal-gsm8k
+```
+
+Replace example addresses/interface with allocated hosts. The first host remains mandatory; additional
+candidates allow three idle peers to be selected. This opt-in mode retains full pretrained MoE,
+TP4/CP2/DP8/EP4/EDP16 training, node-local TP2/DP8/EP8 rollout, offload=false and micro-batch 1.
+Defaults are 50 steps, global batch 136 and a 24-hour timeout. Append `--dry-run` for a plan without allocation.
+Ordinary short-run and single-node entries retain their behavior. Formal runs start from original
+pretrained weights and do not reuse pilot updates or expose an automatic resume option.
+
+CPU preparation enforces 7473/1319 source counts, duplicate/overlap checks and full untruncated prompt
+lengths. A fixed seed splits the training source into 6726 train / 747 validation; all 1319 official
+test rows remain unchanged. Source/split hashes and source indices are saved in `formal/data/manifest.json`.
+Original parquet files are read-only. Prompts exceeding 512 tokens stop before training; `--max-prompt`
+explicitly raises that budget, changing the workload and requiring a new throughput estimate.
+
+A finite loader uses every training question once: 49 batches of 136, then 62 real questions, four
+responses per question. At step 50 six DP ranks hold 32 responses and two hold 28; the latter append
+four zero-action-mask rows each. The final mini-batch is 32 with micro-batch 1 and one optimizer update.
+Padding generates no extra responses and preserves real GRPO advantages. Actual question indices are
+gathered in `node0/run/coverage.json`; missing or duplicated coverage fails formal acceptance.
+
+Greedy validation covers all 747 held-out questions at steps 0/10/20/30/40/50. The final step-50 model
+is tested once on all 1319 official test questions before inference shutdown. Test accuracy does not
+select the checkpoint. Each evaluation retains count, accuracy and elapsed time in
+`node0/run/validation-step*.json` or `test-step50.json`.
+
+Checkpoints are saved at steps 10/20/30/40/50 under `formal/checkpoints/step_*`; the final HF export is
+`formal/checkpoints/step_50/hf`. The launcher prints shared free space and a model-only minimum for
+five checkpoints plus export; optimizer/rank state needs additional capacity. Formal acceptance also
+requires checkpoint completion markers and final exported weights.
+
+Eight figures are exported under `node0/run/plots`, each in PNG and SVG: reward, loss, consistency,
+validation accuracy, step time, stage time, coverage and overview (including final test accuracy).
+Reward/loss use trailing-five-step display smoothing; consistency stays unsmoothed. Raw JSON/CSV
+remains available, and missing evidence never becomes zero or a pass. `summary.json` and `--summarize`
+include formal acceptance, evaluation records and controller elapsed time covering preparation,
+startup, evaluation, checkpoint IO and cleanup. Step timing excludes evaluation and checkpoint IO.
+Formal four-node device acceptance remains separate from CPU/mocked regression checks.

@@ -86,7 +86,9 @@ plot_code=0
 if [[ "${PLOT_TRAINING:-false}" == true && -s /results/run/steps.jsonl ]]; then
     phase=plot
     set +e
-    python hyper_parallel/rl/examples/consistency/scripts/plot_training.py /results/run \
+    plot_script=plot_training.py
+    if [[ "${FORMAL_GSM8K:-false}" == true ]]; then plot_script=plot_full_gsm8k.py; fi
+    python "hyper_parallel/rl/examples/consistency/scripts/${plot_script}" /results/run \
         > /results/run/plot.log 2>&1
     plot_code=$?
     set -e

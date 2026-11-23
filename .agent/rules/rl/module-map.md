@@ -8,6 +8,7 @@ Paths below are relative to `hyper_parallel/rl/` unless prefixed with `hyper_par
 | Area | Code or entry | Contract |
 | --- | --- | --- |
 | Experimental node-local rollout | `rl/rollout/vllm.py`, `rl/weight_sync/sync.py`, `ipc.py`, `examples/consistency/scripts/run_qwen3_moe_cluster.py` | [Cluster short run](../../../hyper_parallel/rl/examples/consistency/README.md#selected-node-full-model-rl-short-run); global training/publication, node-local HTTP/IPC; real-device RL acceptance pending |
+| Formal GSM8K epoch | `examples/consistency/scripts/full_gsm8k.py`, `plot_full_gsm8k.py`, `run_qwen3_moe_cluster.py --formal-gsm8k` | [50-step epoch](../../../hyper_parallel/rl/examples/consistency/README.md#formal-50-step-gsm8k-epoch); finite coverage, held-out validation, final official test and durable checkpoints; device acceptance separate |
 | Configuration and CLI | `rl/config/validate.py`, `rl/config/loader.py`, `train_rl.py` | [Runtime architecture](../../../hyper_parallel/rl/docs/architecture.md) |
 | Synchronous roles and orchestration | `rl/trainer/build.py`, `rl/trainer/sync.py`, `rl/workers/engine/model.py` | [Training step](../../../hyper_parallel/rl/docs/architecture.md#一个训练步) |
 | Asynchronous orchestration | `rl/async_runtime/`, `examples/fully_async/launch.py` | [Rayless GRPO](../../../hyper_parallel/rl/docs/architecture.md#rayless-asynchronous-grpo) |

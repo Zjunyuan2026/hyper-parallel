@@ -164,6 +164,22 @@ def pad_agent_call_batch_for_dp(rollout: ExperienceBatch, dp_group_info: Optiona
     return _append_padding_rows(rollout, target - count)
 
 
+def pad_rollout_responses(rollout: ExperienceBatch, target_rows: int) -> ExperienceBatch:
+    """Align a partial training batch without inventing sampled actions or rewards.
+
+    Only the appended rows repeat a valid context and carry zero action masks.
+    Call before computing reference probabilities, values or training targets.
+    """
+    count = rollout.sequences.shape[0]
+    if isinstance(target_rows, bool) or not isinstance(target_rows, int) or target_rows < count or count < 1:
+        raise ValueError("Padding target must cover a nonempty real response batch")
+    if any(getattr(rollout, field) is not None for field in (
+        "reference_log_probs", "values", "bootstrap_values", "advantages", "returns",
+    )):
+        raise ValueError("Response padding must precede role outputs and target preparation")
+    return rollout if target_rows == count else _append_padding_rows(rollout, target_rows - count)
+
+
 def _append_padding_rows(rollout: ExperienceBatch, missing: int) -> ExperienceBatch:
     """Repeat a valid context, clearing all trainable actions and labels."""
     source = max(range(len(rollout.trajectories)), key=lambda row: rollout.trajectories[row].token_ids.numel())

@@ -26,6 +26,7 @@ import math
 import os
 from pathlib import Path
 import signal
+import shutil
 import statistics
 import subprocess
 import tarfile
@@ -149,6 +150,8 @@ def docker_command(args: argparse.Namespace, node_rank: int, address: str,
               ("/usr/local/dcmi", "/usr/local/dcmi", "ro"),
               ("/usr/local/bin/npu-smi", "/usr/local/bin/npu-smi", "ro"),
               ("/etc/ascend_install.info", "/etc/ascend_install.info", "ro")]
+    if args.formal_gsm8k:
+        mounts.append((str(directory / "formal"), "/formal-run", "rw"))
     for host, container, mode in mounts:
         command.extend(["-v", f"{host}:{container}:{mode}"])
     environment = {
@@ -163,8 +166,9 @@ def docker_command(args: argparse.Namespace, node_rank: int, address: str,
         "MICRO_BATCH_SIZE": str(batch["micro_batch_size"]),
         "RESPONSE_MINI_BATCH_SIZE": str(batch["response_mini_batch_size"]),
         "FULL_DATASET": str(args.full_data).lower(),
-        "MAX_PROMPT": "512", "MAX_NEW_TOKENS": str(args.max_new_tokens),
-        "MAX_MODEL_LEN": str(512 + args.max_new_tokens), "PREFILL_TOKENS": "512",
+        "FORMAL_GSM8K": str(args.formal_gsm8k).lower(),
+        "MAX_PROMPT": str(args.max_prompt), "MAX_NEW_TOKENS": str(args.max_new_tokens),
+        "MAX_MODEL_LEN": str(args.max_prompt + args.max_new_tokens), "PREFILL_TOKENS": str(args.max_prompt),
         "MAX_NUM_SEQS": "4", "KV_CACHE_MEMORY_BYTES": str(2 * 1024**3),
         "RUN_TIMEOUT": str(args.timeout), "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1",
         "ASCEND_RT_VISIBLE_DEVICES": ",".join(map(str, range(16))),
@@ -184,13 +188,58 @@ def docker_command(args: argparse.Namespace, node_rank: int, address: str,
     return command + [image_id, "bash", f"{SCRIPTS}/run_qwen3_moe_worker.sh", "--track-updates"]
 
 
+def prepare_formal_data(args: argparse.Namespace, directory: Path, image_id: str) -> dict:
+    """Tokenize and split on CPU before launching any training containers."""
+    shared = directory / "formal"
+    shared.mkdir()
+    name = f"hp-rl-data-{uuid.uuid4().hex[:12]}"
+    command = ["docker", "run", "-d", "--name", name, "--network=none", "-w", "/workspace",
+               "-e", "PYTHONPATH=/workspace/hyper_parallel/rl:/workspace", "-e", "OMP_NUM_THREADS=1",
+               "-e", "MKL_NUM_THREADS=1", "-e", "PYTHONDONTWRITEBYTECODE=1"]
+    for host, target, mode in ((directory / "source", "/workspace", "ro"),
+                               (shared, "/formal-run", "rw"), (args.data_root, "/data/gsm8k", "ro"),
+                               (args.model_root, "/models/Qwen3-30B-A3B", "ro"),
+                               ("/usr/local/Ascend/driver", "/usr/local/Ascend/driver", "ro")):
+        command.extend(["-v", f"{host}:{target}:{mode}"])
+    command.extend([image_id, "bash", "-c",
+                    "source /usr/local/Ascend/cann/set_env.sh && exec python "
+                    f"{SCRIPTS}/full_gsm8k.py --source /data/gsm8k --destination /formal-run/data "
+                    f"--model /models/Qwen3-30B-A3B --max-prompt {args.max_prompt}"])
+    print("PREPARE_FORMAL_DATA CPU-only; validating all prompts and split isolation", flush=True)
+    try:
+        execute(args.hosts[0], True, command)
+        deadline = time.monotonic() + 1800
+        while True:
+            state = json.loads(execute(args.hosts[0], True,
+                                      ["docker", "inspect", name, "--format", "{{json .State}}"]).stdout)
+            if not state["Running"]:
+                if state["ExitCode"] != 0:
+                    raise RuntimeError("Formal data preparation failed; inspect prepare-data.log")
+                break
+            if time.monotonic() > deadline:
+                raise TimeoutError("Formal CPU data preparation exceeded 30 minutes")
+            time.sleep(2)
+    finally:
+        for command in (["docker", "logs", name], ["docker", "rm", "-f", name]):
+            try:
+                output = execute(args.hosts[0], True, command)
+                if command[1] == "logs":
+                    (directory / "prepare-data.log").write_text(output.stdout + output.stderr, encoding="utf-8")
+                    print(output.stdout + output.stderr, flush=True)
+            except (subprocess.SubprocessError, OSError) as error:
+                print(f"Data container {command[1]} incomplete: {error}", flush=True)
+    return json.loads((shared / "data/manifest.json").read_text(encoding="utf-8"))
+
+
 def run(args: argparse.Namespace) -> Path:
     """Preflight, stage, launch, collect evidence, and clean up only owned containers."""
+    controller_started = time.monotonic()
     image_id, addresses = preflight(args)
     batch = resolve_batch(args, len(args.hosts))
     args.shared_root.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix="qwen3-cluster-", dir=args.shared_root.resolve()))
     source, revision = stage_source(directory, args.wheel)
+    print("RESULT_DIRECTORY", directory, flush=True)
     (source / "wheels/runtime").mkdir(parents=True, exist_ok=True)
     token = uuid.uuid4().hex[:12]
     sentinel = directory / "shared-check.txt"
@@ -203,18 +252,34 @@ def run(args: argparse.Namespace) -> Path:
             execute(host, index == 0, ["test", "-s", str(path)])
         require_idle(execute(host, index == 0, ["npu-smi", "info"]).stdout, host)
         (directory / f"node{index}/run").mkdir(parents=True)
+    if args.formal_gsm8k:
+        weight_bytes = sum(path.stat().st_size for path in args.model_root.glob("*.safetensors"))
+        free_bytes = shutil.disk_usage(directory).free
+        print("CHECKPOINT_STORAGE", json.dumps({"shared_free_gb": free_bytes / 1024**3,
+              "model_only_lower_bound_gb": weight_bytes * 6 / 1024**3,
+              "note": "Five checkpoints plus final export; optimizer/rank state needs additional space"}), flush=True)
+        if weight_bytes == 0 or free_bytes < weight_bytes * 6:
+            raise RuntimeError("Insufficient minimum checkpoint space or missing safetensors model weights")
+    manifest = prepare_formal_data(args, directory, image_id) if args.formal_gsm8k else None
+    # CPU preparation may take minutes; recheck occupancy immediately before launch.
+    if args.formal_gsm8k:
+        for index, host in enumerate(args.hosts):
+            require_idle(execute(host, index == 0, ["npu-smi", "info"]).stdout, host)
     plan = {"hosts": args.hosts, "addresses": addresses, "image_id": image_id, "revision": revision,
             "world_size": len(args.hosts) * 16, "training": "TP4/CP2/EP4; DP=world/8; EDP=world/4",
             "rollout_per_node": "TP2/DP8/EP8", "cpu_offload": args.cpu_offload,
             "steps": args.steps, "model_layers": "full", "model_root": str(args.model_root),
             "data_root": str(args.data_root), "batch": batch, "full_data": args.full_data,
             "max_new_tokens": args.max_new_tokens, "plot": args.plot,
-            "scope": "Short consistency run; not full GSM8K training/evaluation"}
+            "formal_gsm8k": args.formal_gsm8k, "dataset_counts": manifest["counts"] if manifest else None,
+            "shared_free_gb_at_start": shutil.disk_usage(directory).free / 1024**3,
+            "scope": ("One complete GSM8K epoch, held-out validation and final official test" if manifest
+                      else "Short consistency run; not full GSM8K training/evaluation")}
     (directory / "plan.json").write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
     print("BATCH_PLAN", json.dumps(batch), flush=True)
     launched = []
     result = {**plan, "passed": False}
-    print("RESULT_DIRECTORY", directory, flush=True)
+    started = time.monotonic()
     try:
         for index, host in enumerate(args.hosts):
             name = f"hp-rl-{token}-{index}"
@@ -242,6 +307,10 @@ def run(args: argparse.Namespace) -> Path:
                                 and evidence.get("completed_steps") == args.steps
                                 and len(evidence.get("checks", [])) == args.steps
                                 and all(not state["Running"] and state["ExitCode"] == 0 for state in states))
+        if args.formal_gsm8k:
+            formal_path = directory / "node0/run/formal-summary.json"
+            result["formal"] = json.loads(formal_path.read_text()) if formal_path.is_file() else {}
+            result["passed"] = result["passed"] and result["formal"].get("passed") is True
     finally:
         for index, host, name in launched:
             for command in (["docker", "logs", name], ["docker", "rm", "-f", name]):
@@ -255,6 +324,8 @@ def run(args: argparse.Namespace) -> Path:
             result.update(summarize_timings(directory))
         except (OSError, ValueError) as error:
             result["timing_error"] = str(error)
+        result["elapsed_launch_to_collection_seconds"] = time.monotonic() - started
+        result["elapsed_controller_seconds"] = time.monotonic() - controller_started
         (directory / "summary.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
         timing_keys = ("warm_step_samples", "mean_seconds", "warm_generated_tokens", "rollout_summary",
                        "reported_peak_allocated_gb", "memory_scope", "timing_error")
@@ -279,7 +350,9 @@ def main() -> None:
     parser.add_argument("--data-root", type=Path, default=Path("/mnt/share/zjy/datasets/gsm8k/prepared"))
     parser.add_argument("--shared-root", type=Path, default=Path("/mnt/share/zjy/rl-cluster-runs"))
     parser.add_argument("--wheel", type=Path, default=ROOT / "wheels" / WHEEL)
-    parser.add_argument("--steps", type=int, default=3)
+    parser.add_argument("--steps", type=int)
+    parser.add_argument("--formal-gsm8k", action="store_true",
+                        help="50 steps over 6726 training questions, 747 validation and 1319 final test")
     parser.add_argument("--global-prompt-batch-size", type=int, help="Global questions per step across training DP")
     parser.add_argument("--micro-batch-size", type=int, default=1)
     parser.add_argument("--response-mini-batch-size", type=int,
@@ -288,23 +361,36 @@ def main() -> None:
                         help="Shuffle all training rows; steps need not cover an epoch")
     parser.add_argument("--plot", action="store_true", help="Export rank-zero reward/loss/consistency figures")
     parser.add_argument("--max-new-tokens", type=int, default=1024)
+    parser.add_argument("--max-prompt", type=int, default=512)
     parser.add_argument("--cpu-offload", action="store_true")
-    parser.add_argument("--timeout", type=int, default=14400)
+    parser.add_argument("--timeout", type=int)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if args.summarize is not None:
         directory = args.summarize.resolve()
         result = json.loads((directory / "summary.json").read_text(encoding="utf-8"))
-        result = {key: result.get(key) for key in ("passed", "hosts", "revision", "steps", "batch", "full_data")}
+        result = {key: result.get(key) for key in ("passed", "hosts", "revision", "steps", "batch", "full_data",
+                                                  "formal_gsm8k", "formal", "elapsed_launch_to_collection_seconds",
+                                                  "elapsed_controller_seconds")}
         result.update(directory=str(directory), **summarize_timings(directory))
         print(json.dumps(result, indent=2), flush=True)
         return
+    args.steps = args.steps if args.steps is not None else (50 if args.formal_gsm8k else 3)
+    args.timeout = args.timeout if args.timeout is not None else (86400 if args.formal_gsm8k else 14400)
+    if args.formal_gsm8k:
+        args.global_prompt_batch_size = 136 if args.global_prompt_batch_size is None else args.global_prompt_batch_size
+        args.response_mini_batch_size = 68 if args.response_mini_batch_size is None else args.response_mini_batch_size
+        if (args.steps != 50 or args.select_nodes != 4 or args.global_prompt_batch_size != 136
+                or args.micro_batch_size != 1 or args.response_mini_batch_size != 68 or args.cpu_offload):
+            parser.error("Formal GSM8K retains four nodes, 50 steps, batch 136, micro/mini=1/68 and offload=false")
+        args.full_data = args.plot = True
     if not args.hosts or not args.master_addr:
         parser.error("--hosts and --master-addr are required to launch training")
     for address in [*args.hosts, args.master_addr]:
         ipaddress.IPv4Address(address)
     if (len(set(args.hosts)) != len(args.hosts) or not 2 <= args.select_nodes <= len(args.hosts)
-            or not 1024 <= args.master_port <= 65535 or min(args.steps, args.max_new_tokens, args.timeout) < 1):
+            or not 1024 <= args.master_port <= 65535
+            or min(args.steps, args.max_new_tokens, args.max_prompt, args.timeout) < 1):
         parser.error("Use unique hosts, >=2 selected nodes, a valid port and positive budgets")
     try:
         batch = resolve_batch(args, args.select_nodes)
@@ -316,7 +402,8 @@ def main() -> None:
                           "steps": args.steps, "model_layers": "full", "cpu_offload": args.cpu_offload,
                           "training": f"TP4/CP2/DP{args.select_nodes * 2}/EP4/EDP{args.select_nodes * 4}",
                           "rollout_per_node": "TP2/DP8/EP8", "shared_root": str(args.shared_root),
-                          "batch": batch, "full_data": args.full_data, "plot": args.plot}, indent=2))
+                          "batch": batch, "full_data": args.full_data, "plot": args.plot,
+                          "formal_gsm8k": args.formal_gsm8k, "timeout": args.timeout}, indent=2))
         return
     run(args)
 

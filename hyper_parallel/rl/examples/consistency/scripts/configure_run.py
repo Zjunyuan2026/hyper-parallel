@@ -158,6 +158,19 @@ def configure(config: dict, world: int) -> dict:
                                       require_mixed_rewards=True, max_step=1)
         if os.environ.get("LEARNING_PROMPT_ROWS"):
             config["data"]["train_path"] = "/results/run/learning-data/train.parquet"
+    if boolean("FORMAL_GSM8K", False):
+        if (world != 64 or dp_size != 8 or train["max_steps"] != 50 or runner != "internal"
+                or train["prompt_batch_size"] != 17 or candidates != 4
+                or train["micro_batch_size"] != 1 or mini != 68):
+            raise ValueError("Formal GSM8K requires four nodes, 50 steps, 136 prompts and micro/mini=1/68")
+        config["data"].update(train_path="/formal-run/data/train.parquet",
+                              test_path="/formal-run/data/validation.parquet", max_train_samples=None,
+                              shuffle=False, metadata_columns=["formal_source_id"])
+        config["evaluation"].update(enabled=True, max_samples=None, batch_size=16,
+                                    max_new_tokens=config["rollout"]["max_new_tokens"], do_sample=False,
+                                    before_train=True, every_n_steps=10, at_end=True)
+        train["checkpoint"].update(output_dir="/formal-run/checkpoints", save_steps=10,
+                                   save_final=True, verify_reload=False, load_path=None)
     return config
 
 
