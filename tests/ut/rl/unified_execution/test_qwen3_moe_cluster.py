@@ -63,6 +63,9 @@ class ClusterLauncherTests(unittest.TestCase):
         self.assertEqual(result["batch"]["global_prompt_batch_size"], 136)
         self.assertEqual(result["batch"]["micro_batch_size"], 1)
         self.assertEqual(result["timeout"], 86400)
+        self.assertEqual(result["max_prompt_tokens"], 512)
+        self.assertEqual(result["max_new_tokens"], 1024)
+        self.assertEqual(result["max_model_len"], 1536)
         self.assertTrue(result["plot"])
         probe.assert_not_called()
         for extra in (["--micro-batch-size", "2"], ["--steps", "5"], ["--cpu-offload"]):

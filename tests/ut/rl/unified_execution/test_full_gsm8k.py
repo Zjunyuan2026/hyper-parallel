@@ -25,6 +25,7 @@ from unittest.mock import patch
 # pylint: disable=forbidden-backend-import
 import pandas as pd
 import torch
+from transformers import BatchEncoding
 
 from examples.consistency.scripts import full_gsm8k as formal
 from rl.algorithm import build_algorithm
@@ -108,13 +109,19 @@ class FormalGsm8kTests(unittest.TestCase):
             root = Path(temporary)
             pd.DataFrame({"prompt": [f"training {i}" for i in range(7473)]}).to_parquet(root / "train.parquet")
             pd.DataFrame({"prompt": [f"testing {i}" for i in range(1319)]}).to_parquet(root / "test.parquet")
-            tokenizer = SimpleNamespace(apply_chat_template=lambda *args, **kwargs: [1] * 20)
+            def encode(*args, **kwargs):
+                self.assertTrue(kwargs["return_dict"])
+                self.assertFalse(kwargs["truncation"])
+                return BatchEncoding({"input_ids": [1] * 20, "attention_mask": [1] * 20})
+
+            tokenizer = SimpleNamespace(apply_chat_template=encode)
             with patch.object(formal.AutoTokenizer, "from_pretrained", return_value=tokenizer):
                 with self.assertRaises(ValueError):
                     formal.prepare(root, root / "invalid", root, 10)
                 self.assertFalse((root / "invalid").exists())
                 result = formal.prepare(root, root / "prepared", root, 32)
             self.assertEqual(result["counts"], {"train": 6726, "validation": 747, "test": 1319})
+            self.assertEqual(result["max_prompt_tokens"], {"train": 20, "test": 20})
             train = set(result["source_indices"]["train"])
             validation = set(result["source_indices"]["validation"])
             self.assertFalse(train & validation)

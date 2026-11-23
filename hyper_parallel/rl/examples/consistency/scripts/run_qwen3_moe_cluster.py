@@ -270,7 +270,8 @@ def run(args: argparse.Namespace) -> Path:
             "rollout_per_node": "TP2/DP8/EP8", "cpu_offload": args.cpu_offload,
             "steps": args.steps, "model_layers": "full", "model_root": str(args.model_root),
             "data_root": str(args.data_root), "batch": batch, "full_data": args.full_data,
-            "max_new_tokens": args.max_new_tokens, "plot": args.plot,
+            "max_prompt_tokens": args.max_prompt, "max_new_tokens": args.max_new_tokens,
+            "max_model_len": args.max_prompt + args.max_new_tokens, "plot": args.plot,
             "formal_gsm8k": args.formal_gsm8k, "dataset_counts": manifest["counts"] if manifest else None,
             "shared_free_gb_at_start": shutil.disk_usage(directory).free / 1024**3,
             "scope": ("One complete GSM8K epoch, held-out validation and final official test" if manifest
@@ -403,6 +404,8 @@ def main() -> None:
                           "training": f"TP4/CP2/DP{args.select_nodes * 2}/EP4/EDP{args.select_nodes * 4}",
                           "rollout_per_node": "TP2/DP8/EP8", "shared_root": str(args.shared_root),
                           "batch": batch, "full_data": args.full_data, "plot": args.plot,
+                          "max_prompt_tokens": args.max_prompt, "max_new_tokens": args.max_new_tokens,
+                          "max_model_len": args.max_prompt + args.max_new_tokens,
                           "formal_gsm8k": args.formal_gsm8k, "timeout": args.timeout}, indent=2))
         return
     run(args)

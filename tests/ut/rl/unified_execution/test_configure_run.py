@@ -37,11 +37,15 @@ class ConfigureRunTests(unittest.TestCase):
                        "TRAIN_EP": "4", "ROLLOUT_TP": "2", "ROLLOUT_PCP": "1", "ROLLOUT_EP": "8",
                        "ROLLOUT_LOCAL_WORLD_SIZE": "16", "GLOBAL_PROMPT_BATCH_SIZE": "136",
                        "MICRO_BATCH_SIZE": "1", "RESPONSE_MINI_BATCH_SIZE": "68", "CANDIDATES": "4",
-                       "FORMAL_GSM8K": "true", "STEPS": "50", "CPU_OFFLOAD": "false"}
+                       "FORMAL_GSM8K": "true", "STEPS": "50", "CPU_OFFLOAD": "false",
+                       "MAX_PROMPT": "512", "MAX_NEW_TOKENS": "1024", "MAX_MODEL_LEN": "1536"}
         with patch.dict(os.environ, environment, clear=True):
             config = CONFIGURE(yaml.safe_load((ROOT / "configs/qwen3_moe_4l_cp_rl.yaml").read_text()), 64)
         self.assertEqual(config["data"]["test_path"], "/formal-run/data/validation.parquet")
         self.assertEqual(config["evaluation"]["every_n_steps"], 10)
+        self.assertEqual(config["data"]["max_prompt_length"], 512)
+        self.assertEqual(config["rollout"]["max_new_tokens"], 1024)
+        self.assertEqual(config["rollout"]["vllm"]["max_model_len"], 1536)
         self.assertIsNone(config["evaluation"]["max_samples"])
         self.assertFalse(config["evaluation"]["do_sample"])
         self.assertEqual(config["train"]["checkpoint"]["save_steps"], 10)

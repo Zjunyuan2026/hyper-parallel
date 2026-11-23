@@ -15,6 +15,7 @@
 """One finite GSM8K epoch, held-out evaluation and coverage evidence for the A3 example."""
 
 import argparse
+from collections.abc import Mapping
 import hashlib
 import json
 import math
@@ -63,8 +64,13 @@ def prepare(source: Path, destination: Path, model: Path, max_prompt: int) -> di
             question, prompt = _normalize_prompt(record["prompt"], index, PROMPT_INSTRUCTION)
             encoded = tokenizer.apply_chat_template([{"role": "user", "content": prompt}],
                                                     add_generation_prompt=True, tokenize=True,
-                                                    enable_thinking=False, truncation=False)
-            longest = max(longest, len(encoded))
+                                                    enable_thinking=False, truncation=False, return_dict=True,
+                                                    tokenizer_kwargs={"return_attention_mask": True})
+            input_ids = encoded.get("input_ids") if isinstance(encoded, Mapping) else None
+            if (not isinstance(input_ids, (list, tuple)) or not input_ids
+                    or any(isinstance(token, bool) or not isinstance(token, int) for token in input_ids)):
+                raise ValueError(f"Expected one nonempty flat input_ids sequence at {split} row {index}")
+            longest = max(longest, len(input_ids))
             hashes.append(hashlib.sha256(question.encode()).hexdigest())
         if len(hashes) != len(set(hashes)):
             raise ValueError(f"Duplicate questions in official {split} source")

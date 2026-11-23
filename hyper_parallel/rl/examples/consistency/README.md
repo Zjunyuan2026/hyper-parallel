@@ -661,6 +661,7 @@ pretrained weights and do not reuse pilot updates or expose an automatic resume 
 CPU preparation enforces 7473/1319 source counts, duplicate/overlap checks and full untruncated prompt
 lengths. A fixed seed splits the training source into 6726 train / 747 validation; all 1319 official
 test rows remain unchanged. Source/split hashes and source indices are saved in `formal/data/manifest.json`.
+Formal defaults are 512 prompt tokens, 1024 new tokens and 1536 total context tokens.
 Original parquet files are read-only. Prompts exceeding 512 tokens stop before training; `--max-prompt`
 explicitly raises that budget, changing the workload and requiring a new throughput estimate.
 
