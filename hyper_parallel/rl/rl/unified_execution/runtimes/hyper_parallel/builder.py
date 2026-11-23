@@ -14,7 +14,9 @@
 # ============================================================================
 """Construct the existing HP model using the shared explicit replacement plan."""
 
+from collections.abc import Callable
 from copy import deepcopy
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -40,7 +42,8 @@ def normalized_compute_setup(plan_overrides: list[dict], mesh_context: Any = Non
 
 
 def build_inference_model(hf_config: Any, plan_overrides: list[dict], *,
-                          attn_implementation: str = "eager", parallel_context: Any = None) -> Any:
+                          attn_implementation: str = "eager", parallel_context: Any = None,
+                          adapt_factory: Callable | None = None) -> Any:
     """Build the training model through its complete HP parallel construction path.
 
     Args:
@@ -48,6 +51,7 @@ def build_inference_model(hf_config: Any, plan_overrides: list[dict], *,
         plan_overrides: Complete Actor YAML plan, including parameter and activation layouts.
         attn_implementation: Initial HF attention selection before the cache bridge is installed.
         parallel_context: Worker-local HP compute meshes.
+        adapt_factory: Optional rollout specialization applied before HP binds TP/SP boundaries.
 
     Returns:
         Independent causal LM with the training-side HP sharding and redistribution implementation.
@@ -59,22 +63,16 @@ def build_inference_model(hf_config: Any, plan_overrides: list[dict], *,
     if getattr(hf_config, "attention_dropout", 0.0) != 0.0:
         raise ValueError("Unified Qwen3 requires attention_dropout=0")
     entries = deepcopy(plan_overrides)
-    runtime = getattr(parallel_context, "expert_runtime", None)
     for entry in entries:
-        implementation = entry.get("replace", {}).get("implementation", {})
-        if implementation.get("_target_") != UNIFIED_EP_TARGET:
-            continue
-        if getattr(parallel_context, "ep_size", 1) <= 1:
-            continue  # The when=ep recipe is disabled; preserve EP1 computation.
-        if runtime is None:
-            raise ValueError("Inference unified EP requires a preinitialized worker transport")
-        entry["replace"]["implementation"] = {
-            "_target_": INFERENCE_EP_TARGET, "mc2_capacity": implementation.get("mc2_capacity", 256),
-            "backend": runtime.backend, "comm_name": runtime.comm_name,
-            "max_token_rows": runtime.max_token_rows, "row_alignment": runtime.row_alignment,
-            "dp_size": runtime.dp_size,
-        }
+        action = entry.get("replace", {})
+        implementation = action.get("implementation")
+        target = implementation.get("_target_") if isinstance(implementation, dict) else implementation
+        if target == UNIFIED_EP_TARGET and getattr(parallel_context, "ep_size", 1) > 1:
+            action["implementation"] = {"_target_": INFERENCE_EP_TARGET}
     setup = normalized_compute_setup(entries, getattr(parallel_context, "mesh_context", None))
+    if adapt_factory is not None:
+        setup.module_replacements = tuple(replace(spec, factory=adapt_factory(spec.factory))
+                                          for spec in setup.module_replacements)
     # The public builder uses the device already selected by this worker and
     # shares replacements, parameter shards and forward wrappers with training.
     # vLLM supplies checkpoint tensors later through its load_weights protocol.

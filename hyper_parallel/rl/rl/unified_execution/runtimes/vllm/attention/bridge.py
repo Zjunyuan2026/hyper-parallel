@@ -22,7 +22,7 @@ import torch
 from torch import nn
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-from rl.unified_execution.core.validation import validate_attention_execution_path
+from rl.unified_execution.runtimes.hyper_parallel.validation import validate_attention_execution_path
 from rl.unified_execution.models import get_model_family
 from rl.unified_execution.runtimes.vllm.parallel import payload_from_vllm_config
 
@@ -87,7 +87,9 @@ def install_paged_attention(model: nn.Module, vllm_config: Any, prefix: str = ""
         )
 
         backend_options["attn_backend"] = UnifiedAscendAttentionBackend
-        _, attentions = validate_attention_execution_path(model)
+        from rl.unified_execution.runtimes.vllm.attention.gqa import rollout_attention_forward
+
+        _, attentions = validate_attention_execution_path(model, rollout_forward=rollout_attention_forward)
     ALL_ATTENTION_FUNCTIONS.register(_ATTENTION_INTERFACE, paged_attention_forward)
     for index, attention in enumerate(attentions):
         config = attention.config

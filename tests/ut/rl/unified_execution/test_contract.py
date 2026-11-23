@@ -22,15 +22,21 @@ from unittest.mock import MagicMock, patch
 
 import torch
 from rl.unified_execution.core.contract import build_unified_payload, fingerprint, parse_unified_payload
+from rl.unified_execution.core.execution_plan import UNIFIED_EP_TARGET
 from rl.unified_execution.models import get_model_family
 from rl.unified_execution.runtimes.hyper_parallel.builder import build_inference_model
 from rl.unified_execution.runtimes.vllm.parallel import build_parallel_context, payload_from_vllm_config
-from rl.unified_execution.core.validation import capture_training_structure
+from rl.unified_execution.runtimes.hyper_parallel.validation import capture_training_structure
 from rl.workers.engine.model import architecture_for_implementation
 from torch import nn
 from transformers import Qwen3Config
 
 from hyper_parallel.models.replacement import module_replacement
+
+
+def _expert_plan():
+    return [{"match": "*.mlp.forward", "when": "ep", "replace": {"kind": "method",
+             "implementation": {"_target_": UNIFIED_EP_TARGET}}}]
 
 
 class MarkerLinear(nn.Linear):
@@ -308,7 +314,7 @@ class TestParallelWorkerMesh(unittest.TestCase):
         config.parallel_config.data_parallel_rank = 1
         config.model_config = SimpleNamespace(enforce_eager=True, is_moe=True)
         payload = {"parallelism": {"tp": 1, "cp": 1, "pp": 1},
-                   "expert_parallelism": {"training": 2, "inference": 2}}
+                   "expert_parallelism": {"training": 2, "inference": 2}, "plan_overrides": _expert_plan()}
         fake_vllm = ModuleType("vllm.distributed")
         tp_group, dp_group = object(), object()
         fake_vllm.get_tp_group = lambda: SimpleNamespace(ranks=[1], device_group=tp_group)
@@ -330,13 +336,13 @@ class TestParallelWorkerMesh(unittest.TestCase):
         self.assertEqual((result.dp_rank, result.ep_rank, result.tp_rank), (1, 1, 0))
         self.assertIs(result.mesh_context.fsdp_moe_mesh, expert_mesh)
 
-    def test_ep_requires_eager_and_valid_rank_domain(self) -> None:
+    def test_ep_requires_shared_recipe_and_valid_rank_domain(self) -> None:
         """Do not silently change graph mode or create incomplete expert groups."""
         config = self._config(tp=2)
         config.model_config = SimpleNamespace(enforce_eager=False)
         payload = {"parallelism": {"tp": 2, "cp": 1, "pp": 1},
                    "expert_parallelism": {"inference": 2}}
-        with self.assertRaisesRegex(ValueError, "shared graph EP recipe"):
+        with self.assertRaisesRegex(ValueError, "shared EP recipe"):
             build_parallel_context(config, payload)
         payload["expert_parallelism"]["inference"] = 3
         with self.assertRaisesRegex(ValueError, "must divide"):
@@ -357,7 +363,7 @@ if __name__ == "__main__":
 
 def _moe_config() -> dict:
     return {
-        "model": {"name": "qwen3_moe"}, "train": {"plan_overrides": []},
+        "model": {"name": "qwen3_moe"}, "train": {"plan_overrides": _expert_plan()},
         "rollout": {"engine": "vllm", "vllm": {"enforce_eager": True}},
         "consistency": {"schema_version": 1, "mode": "architecture"},
     }
@@ -390,6 +396,7 @@ class TestMoEContract(unittest.TestCase):
         self.assertEqual(payload["expert_parallelism"], {"training": 2, "inference": 2})
         self.assertEqual(parse_unified_payload(payload), payload)
         config["rollout"]["vllm"]["enforce_eager"] = False
+        config["train"]["plan_overrides"] = []
         with self.assertRaisesRegex(ValueError, "EP requires"):
             build_unified_payload(config)
 

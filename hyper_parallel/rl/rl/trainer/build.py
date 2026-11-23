@@ -58,7 +58,7 @@ from rl.weight_sync.publication import PolicyPublication
 from rl.distillation.runtime import TeacherScorer
 from rl.reward_model.runtime import RewardScorer
 from rl.unified_execution.runtimes.hyper_parallel.moe import validate_training_ep
-from rl.unified_execution.core.validation import capture_training_structure
+from rl.unified_execution.runtimes.hyper_parallel.validation import capture_training_structure
 from rl.unified_execution.runtimes.hyper_parallel.attention import guard_training_numerics, install_training_attention
 from rl.unified_execution.core.batch_invariant import initialize_batch_invariant, verify_batch_invariant
 from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo

@@ -39,25 +39,3 @@ def ordered_combine(routes: torch.Tensor, weights: torch.Tensor) -> torch.Tensor
         product = routes[:, slot].float() * weights[:, slot, None].float()
         result = result + product
     return result.to(routes.dtype)
-
-
-def owner_routes(received: torch.Tensor, indices: torch.Tensor, local_experts: int) -> torch.Tensor:
-    """Select each route's unique expert owner without a floating-point rank sum.
-
-    Args:
-        received: [P, T, K, H] returned slots, indexed by sending expert rank.
-        indices: [T, K] global expert IDs; -1 marks an EP padding route.
-        local_experts: Contiguous expert count per rank, used to derive owners.
-
-    Returns:
-        [T, K, H] unweighted routes; padding routes are zero.
-    """
-    ranks = received.shape[0]
-    tokens, slots = indices.shape
-    hidden = received.shape[-1]
-    values = received.view(ranks, tokens, slots, hidden).permute(1, 2, 0, 3)
-    # Contiguous expert ownership identifies exactly one contribution per
-    # route. Gather that value instead of reducing the padded rank dimension.
-    owners = (indices.clamp_min(0) // local_experts).view(tokens, slots, 1, 1)
-    selected = values.gather(2, owners.expand(tokens, slots, 1, hidden)).squeeze(2)
-    return torch.where((indices >= 0)[:, :, None], selected, 0)

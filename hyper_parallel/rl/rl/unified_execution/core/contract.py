@@ -23,7 +23,8 @@ from typing import Any
 
 from rl.unified_execution.core.batch_invariant import normalize_policy
 from rl.unified_execution.core.execution_plan import (
-    unified_ep_options,
+    resolve_pik_leaves,
+    has_unified_ep,
     validate_cp_plan,
     validate_pcp_plan,
     validate_pik_contract,
@@ -47,11 +48,11 @@ def fingerprint(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def split_plan_overrides(entries: Any) -> tuple[list[dict], list[dict]]:
+def _normalize_plan_overrides(entries: Any) -> list[dict]:
     """Validate the complete shared plan without dropping layout or method rules."""
     if not isinstance(entries, list):
         raise ValueError("train.plan_overrides must be an explicit list")
-    compute, excluded = [], []
+    plan = []
     for index, entry in enumerate(entries):
         if not isinstance(entry, Mapping) or set(entry) - _PLAN_FIELDS:
             raise ValueError(f"Unknown plan_overrides fields at entry {index}")
@@ -64,19 +65,23 @@ def split_plan_overrides(entries: Any) -> tuple[list[dict], list[dict]]:
             raise ValueError(f"Unsupported plan_overrides condition: {condition!r}")
         action = entry.get("replace")
         if action is not None:
-            _validate_action(action, match, index)
-        compute.append(dict(entry))
-    return compute, excluded
+            _validate_action(action, index)
+        # HP accepts grouped pure module replacements. Its layout and method
+        # builders require individual strings, in the same declaration order.
+        if isinstance(match, list) and (action is None or action["kind"] == "method"
+                                        or set(entry) - {"match", "replace", "when", "low_precision_dtype_scheme"}):
+            plan.extend({**entry, "match": pattern} for pattern in match)
+        else:
+            plan.append(dict(entry))
+    return plan
 
 
-def _validate_action(action: Any, match: Any, index: int) -> None:
-    """Validate replacement kind, target and method matching fields."""
+def _validate_action(action: Any, index: int) -> None:
+    """Validate the replacement kind and its import target."""
     if not isinstance(action, Mapping) or set(action) - {"kind", "implementation", "source_type", "exact_type"}:
         raise ValueError(f"Unknown replacement action at plan_overrides[{index}]")
     if action.get("kind") not in ("module", "method"):
         raise ValueError("Replacement kind must be module or method")
-    if action["kind"] == "method" and not isinstance(match, str):
-        raise ValueError("Method replacements require one string match")
     implementation = action.get("implementation")
     target = implementation.get("_target_") if isinstance(implementation, Mapping) else implementation
     if not isinstance(target, str) or not target.strip():
@@ -132,14 +137,12 @@ def _validate_model_parallelism(config, family, train, accelerator, vllm, traini
     if family.moe:
         _validate_moe_parallelism(training, inference)
         if vllm.get("enable_expert_parallel", False) or vllm.get("enable_eplb", False):
-            raise ValueError("Unified MoE does not use vLLM expert parallelism or EPLB")
+            raise ValueError("Unified MoE does not use vLLM engine flags for expert ownership. Configure expert_parallel_size.")
         if train.get("router_replay", {}).get("mode", "off") not in ("off", "disabled", None):
             raise ValueError("Unified MoE router replay is not integrated")
-    if family.moe:
         expert = _expert_options(config)
-        if (expert["inference"] > 1 and not vllm.get("enforce_eager", False)
-                and unified_ep_options(train.get("plan_overrides", [])) is None):
-            raise ValueError("Unified HP EP requires enforce_eager=true or the shared graph EP recipe")
+        if expert["inference"] > 1 and not has_unified_ep(train.get("plan_overrides", [])):
+            raise ValueError("Unified HP EP requires the shared EP recipe in both eager and graph mode")
     elif accelerator.get("ep", 1) != 1 or vllm.get("expert_parallel_size", 1) != 1:
         raise ValueError("Dense unified execution does not use expert parallelism")
 
@@ -178,6 +181,7 @@ def validate_unified_config(config: Mapping[str, Any]) -> None:
     if rollout.get("engine", "vllm") != "vllm":
         raise ValueError("Unified execution requires vLLM rollout")
     training, inference = _parallel_options(config)
+    train = {**train, "plan_overrides": _normalize_plan_overrides(train.get("plan_overrides"))}
     _validate_training_cp(config, train, training)
     _validate_model_parallelism(config, family, train, accelerator, vllm, training, inference)
     if vllm.get("decode_context_parallel_size", 1) != 1:
@@ -186,7 +190,7 @@ def validate_unified_config(config: Mapping[str, Any]) -> None:
         validate_pcp_plan(train.get("plan_overrides", []), inference, attention_backend,
                           _validate_numerical_selection(consistency))
         if family.moe and (_expert_options(config)["inference"] <= 1
-                           or unified_ep_options(train.get("plan_overrides", [])) is None):
+                           or not has_unified_ep(train.get("plan_overrides", []))):
             raise ValueError("Inference MoE PCP requires graph-capable HP EP > 1")
     if attention_backend == "native" and not vllm.get("enforce_eager", False):
         raise ValueError("Unified execution requires rollout.vllm.enforce_eager=true")
@@ -197,7 +201,6 @@ def validate_unified_config(config: Mapping[str, Any]) -> None:
     if ("async_training" in config or "colocate_async" in config or train.get("async_training")
             or train.get("colocate_async") or train.get("mode", "sync") != "sync"):
         raise ValueError("Unified execution currently supports synchronous training only")
-    split_plan_overrides(train.get("plan_overrides"))
 
 
 def _validate_training_cp(config: Mapping, train: Mapping, topology: Mapping) -> None:
@@ -223,7 +226,7 @@ def _validate_training_cp(config: Mapping, train: Mapping, topology: Mapping) ->
     if get_model_family(_mapping(config, "model").get("name")).moe:
         experts = _expert_options(config)
         if (min(experts.values()) <= 1
-                or unified_ep_options(train.get("plan_overrides", [])) is None):
+                or not has_unified_ep(train.get("plan_overrides", []))):
             raise ValueError("Training MoE CP requires the graph-capable EP recipe on both sides with EP > 1")
 
 
@@ -310,15 +313,17 @@ def _make_payload(entries: list, attn_implementation: str, training: Mapping, in
                   batch_invariant: Mapping | None = None, model_family: str = "qwen3",
                   expert_parallelism: Mapping | None = None) -> dict[str, Any]:
     """Serialize the shared execution plan and its fingerprint."""
-    entries = json.loads(json.dumps(entries, allow_nan=False))
-    full_plan, excluded = split_plan_overrides(entries)
-    compute = [entry for entry in full_plan if (entry.get("replace") or {}).get("kind") == "module"]
+    entries = _normalize_plan_overrides(json.loads(json.dumps(entries, allow_nan=False)))
+    training = _validate_parallelism(training)
+    inference = _validate_inference_parallelism(inference)
+    resolve_pik_leaves(entries, training, inference)
+    compute = [entry for entry in entries if (entry.get("replace") or {}).get("kind") == "module"]
     result = {
         "schema_version": 1, "mode": mode, "plan_overrides": entries,
-        "compute_plan_overrides": compute, "excluded_plan_overrides": excluded,
+        "compute_plan_overrides": compute, "excluded_plan_overrides": [],
         "attn_implementation": attn_implementation,
-        "parallelism": _validate_inference_parallelism(inference),
-        "training_parallelism": _validate_parallelism(training),
+        "parallelism": inference,
+        "training_parallelism": training,
         "attention_backend": attention_backend,
     }
     family = get_model_family(model_family)

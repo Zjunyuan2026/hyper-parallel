@@ -133,6 +133,11 @@ class TestFailureReporting(unittest.TestCase):
         """Build a proc stat fixture whose command contains spaces and nested parentheses."""
         return "123 (worker (retired)) " + " ".join([state] + ["0"] * 18 + [started])
 
+    def test_cards_associate_bus_readings_with_the_reported_device(self) -> None:
+        monitor = load_tool("monitor_8npu_run")
+        sample = "| 3   example-chip | OK | 45 |\n| 0  0 | 0000:C1:00.0 | 17   0 / 0   123 / 456 |"
+        self.assertEqual(monitor.cards(sample), {"3": {"aicore": 17, "hbm_mb": 123, "capacity_mb": 456}})
+
     def test_process_identity_handles_exit_reuse_and_unreadable_state(self) -> None:
         """Only live processes with stable ownership can count as experiment workers."""
         self.monitor = load_tool("monitor_8npu_run")

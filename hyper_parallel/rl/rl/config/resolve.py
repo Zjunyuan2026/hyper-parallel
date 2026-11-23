@@ -24,7 +24,7 @@ from rl.config.schema import (
     _trainer_topology, build_model_registration, optional_mapping, required_mapping, router_replay_mode,
 )
 from rl.config.validate import _validate_model_scope
-from rl.unified_execution.core.contract import build_unified_payload, validate_unified_config
+from rl.unified_execution.core.contract import build_unified_payload
 from hyper_parallel.components.checkpoint.config import CheckpointingConfig
 from hyper_parallel.components.optim import AdamW, MultiLRScheduler
 from hyper_parallel.models import HyperAutoModelForCausalLM
@@ -48,6 +48,9 @@ def resolve_unified_execution_config(config: Mapping[str, Any]) -> dict[str, Any
     resolved = deepcopy(dict(config))
     payload = build_unified_payload(resolved)
     if payload is not None:
+        # Both roles must consume the same resolved G, even when their TP sizes
+        # differ. Never let a worker derive G from only its own local topology.
+        resolved["train"]["plan_overrides"] = deepcopy(payload["plan_overrides"])
         vllm = resolved["rollout"].setdefault("vllm", {})
         if vllm.get("model_implementation", "unified") != "unified":
             raise ValueError("consistency.mode=architecture conflicts with rollout.vllm.model_implementation")
@@ -245,7 +248,7 @@ def build_runtime_config(
     config: Mapping[str, Any], *, critic: bool = False, reference: bool = False,
 ) -> TrainerConfig:
     """Translate Hyper-RL YAML into the HyperAutoModel runtime configuration."""
-    validate_unified_config(config)
+    config = resolve_unified_execution_config(config)
     if critic and reference:
         raise ValueError("A role cannot be both Critic and Reference")
     registration = build_model_registration(config)

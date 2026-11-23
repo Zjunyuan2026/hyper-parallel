@@ -62,6 +62,12 @@ class NodeControlTests(unittest.TestCase):
             config = resolve_vllm_automatic_limits(
                 resolve_router_replay_config(resolve_unified_execution_config(config)),
             )
+            shared_pik = [entry["replace"]["implementation"]["num_leaves"]
+                          for entry in config["train"]["plan_overrides"]
+                          if entry.get("replace", {}).get("implementation", {}).get("_target_", "").endswith(
+                              "replace_attention_with_pik")]
+            self.assertEqual(shared_pik, [4])
+            self.assertEqual(config["rollout"]["vllm"]["node_local_world_size"], 16)
             validate_config(config, build_algorithm(config["algorithm"]))
             runtime = build_runtime_config(config)
             self.assertEqual(runtime.fsdp_config.dp_shard_size, 8)

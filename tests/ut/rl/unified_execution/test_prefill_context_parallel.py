@@ -105,13 +105,10 @@ class TestPrefillContextParallel(unittest.TestCase):
                 patch(module + ".dist.is_initialized", return_value=True), \
                 patch(module + ".DeviceMesh.from_group", side_effect=[tp_mesh, dense_mesh]) as from_group, \
                 patch(module + ".init_device_mesh", return_value=root) as build_mesh, \
-                patch(module + ".build_expert_mesh", return_value=expert_mesh) as build_experts, \
-                patch("rl.unified_execution.runtimes.vllm.parallel.build_expert_runtime") as build_runtime:
+                patch(module + ".build_expert_mesh", return_value=expert_mesh) as build_experts:
             context = build_parallel_context(config, payload)
         build_mesh.assert_called_once_with("cpu", (4, 2), mesh_dim_names=("dp", "tp"), rank_list=tuple(range(8)))
         build_experts.assert_called_once_with(root, 4)
-        build_runtime.assert_called_once_with(config, payload, expert_mesh["ep"].get_group(), list(range(8)))
-        self.assertIs(context.expert_runtime, build_runtime.return_value)
         from_group.assert_called_with([root["dp"].get_group(), tp_group], "cpu",
                                       mesh=[[0, 1], [2, 3], [4, 5], [6, 7]], mesh_dim_names=("dp", "tp"))
         get_native_dp.assert_not_called()
@@ -194,7 +191,8 @@ class TestPrefillContextParallel(unittest.TestCase):
         )
         for ep in (1, 2):
             payload = {"parallelism": {"tp": 2, "cp": 2, "pp": 1}, "expert_parallelism": {"inference": ep}}
-            with self.subTest(ep=ep), self.assertRaisesRegex(ValueError, "graph-capable"):
+            message = "graph-capable" if ep == 1 else "shared EP recipe"
+            with self.subTest(ep=ep), self.assertRaisesRegex(ValueError, message):
                 build_parallel_context(config, payload)
 
     def test_publication_addresses_every_pcp_replica_without_changing_tp(self) -> None:

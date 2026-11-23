@@ -49,7 +49,8 @@ def _effective(plan: list[dict], name: str, sp: bool) -> dict:
         if condition is not None and not (condition == "sequence_parallel" and sp):
             continue
         match = entry["match"]
-        if isinstance(match, str) and fnmatchcase(name, match):
+        patterns = [match] if isinstance(match, str) else match
+        if any(fnmatchcase(name, pattern) for pattern in patterns):
             effective.update(entry)
     return effective
 
@@ -92,13 +93,33 @@ def _pik_entry_options(entry: dict, description, attention: bool) -> dict:
             "_target_", "num_leaves", "leaf_layout", "fill_uninitialized_memory"}:
         raise ValueError("PIK must explicitly fix num_leaves, leaf_layout and memory filling")
     count = implementation["num_leaves"]
-    if isinstance(count, bool) or not isinstance(count, int) or count < 1 or count & (count - 1):
-        raise ValueError("PIK num_leaves must be a positive power of two")
+    if count != "auto" and (isinstance(count, bool) or not isinstance(count, int)
+                            or count < 1 or count & (count - 1)):
+        raise ValueError("PIK num_leaves must be auto or a positive power of two")
     if implementation["leaf_layout"] not in ("strided", "packed"):
         raise ValueError("PIK leaf_layout must be strided or packed")
     if not isinstance(implementation["fill_uninitialized_memory"], bool):
         raise ValueError("PIK fill_uninitialized_memory must be bool")
     return {key: value for key, value in implementation.items() if key != "_target_"}
+
+
+def resolve_pik_leaves(plan: list[dict], training: Mapping, inference: Mapping) -> None:
+    """Freeze automatic leaves on a private plan before either model is built.
+
+    Each TP rank must own a complete subtree. With power-of-two TP degrees,
+    max(train TP, rollout TP) is the smallest common global leaf count. An
+    explicit larger count remains useful when comparing several run topologies.
+    """
+    for entry in plan:
+        if _target(entry) not in (PIK_MODULE_TARGET, PIK_ATTENTION_TARGET):
+            continue
+        degrees = (training["tp"], inference["tp"])
+        if any(isinstance(size, bool) or not isinstance(size, int) or size < 1
+               or size & (size - 1) for size in degrees):
+            raise ValueError("PIK training and inference TP must be powers of two (including 1)")
+        implementation = entry["replace"]["implementation"]
+        if implementation.get("num_leaves") == "auto":
+            implementation["num_leaves"] = max(degrees)
 
 
 def pik_row_options(plan: list[dict], family: str | None = None) -> dict | None:
@@ -166,22 +187,14 @@ def validate_pcp_plan(plan: list[dict], inference: dict, backend: str, policy: d
         raise ValueError("Inference PCP requires Level 3 V4 and the shared PIK recipe")
 
 
-def unified_ep_options(plan: list[dict]) -> dict | None:
-    """Validate the all-layer role recipe; mc2_capacity bounds only the MC2 fast path."""
+def has_unified_ep(plan: list[dict]) -> bool:
+    """Identify the shared all-layer MoE recipe and reject ambiguous role bindings."""
     entries = [entry for entry in plan if entry.get("match") == "*.mlp.forward" and entry.get("when") == "ep"]
     if not any(_target(entry) == UNIFIED_EP_TARGET for entry in entries):
-        return None
+        return False
     if len(entries) != 1 or entries[0]["replace"].get("kind") != "method":
         raise ValueError("Unified EP requires one unambiguous shared all-layer method recipe")
     implementation = entries[0]["replace"]["implementation"]
-    if not isinstance(implementation, Mapping):
-        raise ValueError("Unified EP requires explicit implementation options")
-    if set(implementation) - {"_target_", "mc2_capacity", "inference_backend"}:
-        raise ValueError("Unified EP received unknown recipe options")
-    mc2_capacity = implementation.get("mc2_capacity", 256)
-    if not isinstance(mc2_capacity, int) or isinstance(mc2_capacity, bool) or mc2_capacity < 1:
-        raise ValueError("MC2 capacity must be a positive integer")
-    backend = implementation.get("inference_backend", "auto")
-    if backend not in ("auto", "mc2", "allgather"):
-        raise ValueError("Unified EP inference_backend must be auto, mc2 or allgather")
-    return {"mc2_capacity": mc2_capacity, "inference_backend": backend}
+    if isinstance(implementation, Mapping) and set(implementation) != {"_target_"}:
+        raise ValueError("Unified EP takes only _target_; remove transport options from the recipe")
+    return True

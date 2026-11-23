@@ -16,10 +16,8 @@
 
 from __future__ import annotations
 
-import inspect
 from collections.abc import Mapping
 from functools import partial
-from types import CodeType
 from typing import Any, Callable
 
 import torch
@@ -69,6 +67,7 @@ class PikLinear(nn.Linear):
         self.pik_plan = plan
         self.pik_policy = {"fill_uninitialized_memory": fill_uninitialized_memory}
         self.pik_context = None
+        self.optimized_rollout = False
         self.train(module.training)
         if not parallel:
             self.bind_pik(None, sequence_parallel=False)
@@ -87,7 +86,7 @@ class PikLinear(nn.Linear):
         """Read current HP-owned parameters, including freshly unsharded weights."""
         if self.pik_context is None:
             raise RuntimeError("HP must bind the PIK TP context before forward")
-        output = pik_linear(input, self.weight, self.bias, context=self.pik_context)
+        output = pik_linear(input, self.weight, self.bias, context=self.pik_context, rollout=self.optimized_rollout)
         if (torch.is_grad_enabled() and self.pik_context.world_size > 1
                 and not self.pik_context.sequence_parallel):
             output = _NativeRowOutputGradient.apply(output, self.pik_context.group)
@@ -119,14 +118,14 @@ def pik_row_compute_fn(*, module: Any, mesh: Any, tp_mesh: Any, cp_mesh: Any,
     if not isinstance(module, PikLinear):
         raise ValueError("PIK forward binding requires the shared PikLinear replacement")
     group = tp_mesh.get_group() if tp_mesh is not None and tp_mesh.size() > 1 else None
-    module.bind_pik(group, sequence_parallel=sequence_parallel)
+    # A TP1 replacement already owns its local context. An EP-only mesh
+    # still installs this method boundary during HP sharding.
+    existing = module.pik_context
+    if not (group is None and existing is not None and existing.world_size == 1
+            and existing.sequence_parallel == sequence_parallel):
+        module.bind_pik(group, sequence_parallel=sequence_parallel)
 
-    # Keep the same input keyword for HP method-boundary layout binding.
-    def compute_fn(module: Any, input: torch.Tensor) -> torch.Tensor:  # pylint: disable=redefined-builtin
-        """Call the same module implementation without recursing into HP's wrapper."""
-        return PikLinear.forward(module, input)
-
-    return compute_fn
+    return PikLinear.forward
 
 
 @module_replacement
@@ -161,20 +160,18 @@ def bind_expert_ownership(module: Any, ep_mesh: Any) -> tuple[Callable, dict]:
 
 
 def validate_expert_binding(module: Any, function: Any, ep_size: int, path: str,
-                            router_fn: Callable, factory: Callable, transport: Callable) -> dict:
-    """Audit the actual role closure and HP ownership, without importing a runtime."""
-    codes = {item for item in factory.__code__.co_consts
-             if isinstance(item, CodeType) and item.co_name == "compute_fn"}
-    if (not isinstance(function, partial) or function.args != (module,) or function.keywords
-            or getattr(function.func, "__code__", None) not in codes):
-        raise ValueError(f"Unified EP requires the audited role binding at {path}")
-    closure = inspect.getclosurevars(function.func).nonlocals
-    options = closure.get("options", getattr(function.func, "expert_options", None))
-    if (closure["transport"] is not transport or closure["router_fn"] is not router_fn
-            or set(options) != {"group", "rank", "world_size", "local_experts"}
-            or options["world_size"] != ep_size or options["group"].size() != ep_size
+                            router_fn: Callable, forward: Callable, *, executor: Any = None) -> None:
+    """Check the live compute function, router and ownership bound by HP."""
+    # HP binds the module last; partial flattens this with our router and role data.
+    if (not isinstance(function, partial) or function.func is not forward or function.keywords
+            or len(function.args) != 3 or function.args[0] is not router_fn or function.args[2] is not module):
+        raise ValueError(f"Unified EP role, router or expert ownership differs at {path}")
+    binding = function.args[1]
+    if executor is not None and binding is not executor:
+        raise ValueError(f"Unified EP executor differs at {path}")
+    options = binding if executor is None else executor.options
+    if (options["world_size"] != ep_size or options["group"].size() != ep_size
             or options["group"].rank() != options["rank"]
             or options["local_experts"] != module.experts.local_expert_count
             or not getattr(module.experts, "_ep_use_grouped_gemm", False)):
         raise ValueError(f"Unified EP role, router or expert ownership differs at {path}")
-    return closure

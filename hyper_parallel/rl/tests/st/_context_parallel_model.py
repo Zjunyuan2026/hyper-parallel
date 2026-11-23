@@ -73,11 +73,6 @@ def recipe(args):
         train['accelerator']['comm_fusion'] = False
     train['optimizer']['lr'] = .001
     train['checkpoint']['output_dir'] = str(args.output / 'checkpoints')
-    for entry in train['plan_overrides']:
-        implementation = entry.get('replace', {}).get('implementation', {})
-        if 'mc2_capacity' in implementation and args.mc2_capacity is not None:
-            # This is an inference transport option; training rows remain dynamic.
-            implementation['mc2_capacity'] = args.mc2_capacity
     vllm = config['rollout']['vllm']
     world = args.tp * args.cp * args.dp
     vllm.update(tensor_parallel_size=args.tp, data_parallel_size=world // args.tp,
@@ -212,7 +207,6 @@ def main():
     parser.add_argument('--packed-check', action='store_true')
     parser.add_argument('--compare-gradients', action='store_true')
     parser.add_argument('--empty-query-ranks', action='store_true')
-    parser.add_argument('--mc2-capacity', type=int)
     parser.add_argument('--no-comm-fusion', action='store_true')
     parser.add_argument('--save-activations-on-cpu', action='store_true')
     parser.add_argument('--replicated-batch', action='store_true')
@@ -311,7 +305,6 @@ def main():
         if not changed or not math.isfinite(metrics.gradient_norm) or metrics.gradient_norm <= 0:
             raise AssertionError('CP Actor must execute a finite nonzero gradient and change weights')
         report = {'tp': args.tp, 'cp': args.cp, 'dp': args.dp, 'ep': args.ep, 'sp': args.sp, 'length': args.length,
-                  'mc2_capacity_override': args.mc2_capacity,
                   'comm_fusion': not args.no_comm_fusion,
                   'saved_tensors_on_cpu': args.save_activations_on_cpu,
                   'replicated_batch': args.replicated_batch,

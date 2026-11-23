@@ -5,6 +5,8 @@ Unified Execution 让 HyperParallel 训练与 vLLM 推理复用模型、参数�
 本文解释整个调用链、Attention、CP/PCP、TP/SP 与权重发布；
 专家路由、通信和合并详见 [MoE 实现](unified_execution_moe.md)。
 
+新模型的接入顺序、组件选型和生产验收见[新模型训推一致性接入与生产验收](unified_execution_model_onboarding.md)。
+
 ## 一致性比较的对象
 
 比较前提是**同一权重版本、同一 token 前缀、同一逻辑位置**。训练 padding、CP 本地片段和
@@ -37,11 +39,12 @@ flowchart TD
 ```
 
 配置解析在 [core/contract.py](../rl/unified_execution/core/contract.py) 和
-[core/execution_plan.py](../rl/unified_execution/core/execution_plan.py) 中进行：
+[core/execution_plan.py](../rl/unified_execution/core/execution_plan.py) 中进行。
+分组书写的 `match` 在 RL 配置入口按声明顺序展开为 HP 的方法或布局规则。训练和 rollout 使用同一份解析结果，纯模块替换可以直接使用 HP 的分组匹配。
 
 - `build_unified_payload()` 携带完整 `train.plan_overrides`、训练/推理各自的并行度、数值策略和指纹。
 - worker 的 `parse_unified_payload()` 重新计算派生声明及指纹，防止配置漂移。
-- [capture_training_structure()](../rl/unified_execution/core/validation.py) 检查实际模块、参数逻辑形状、
+- [capture_training_structure()](../rl/unified_execution/runtimes/hyper_parallel/validation.py) 检查实际模块、参数逻辑形状、
   参数别名及可执行 forward 路径；推理在安装缓存桥接之前运行同一结构检查。
 - 训练与推理各自提供 EP 执行路径校验，允许通信实现不同，同时检查共享 router、专家所有权和数值规则。
 
@@ -96,6 +99,15 @@ Attention 使用 [V4 适配](../rl/unified_execution/ops/attention/flash_attenti
 [ops/pik/](../rl/unified_execution/ops/pik/) 将矩阵乘法的全局 K 维划成固定数量的 leaf。
 改变 TP 只改变 leaf 的归属，不改变 leaf 内的计算和全局二叉树。
 
+配方默认使用 `num_leaves: auto`：配置解析时取 `G=max(训练 TP, 推理 TP)`，
+并将同一个具体 G 写入训练计划和推理 payload，运行中保持不变。两侧 TP 必须是 2 的幂（包括 1），
+且模型全局 K 必须可被 G 整除。例如 TP4/TP4 使用 G4，每 rank 一个 leaf；TP4/TP2 同样使用 G4，
+推理每 rank 两个 leaf。仅要求 TP 为偶数不足以满足完整子树约束。
+
+仍可显式指定较大的 `num_leaves`，用于多种拓扑之间共用同一数值基线。
+自动模式保证当前训练/推理配置对共用一棵树；如果另一次运行的最大 TP 改变，G 也会改变，
+不承诺这两次运行的结果逐位相同。改变 G 后，需要按新的共享计划重新验证训推一致性。
+
 ```text
 输入 [..., K/TP]、权重 [N, K/TP]
     → 本地 leaf BMM [L_local, M, N]
@@ -107,6 +119,8 @@ Attention 使用 [V4 适配](../rl/unified_execution/ops/attention/flash_attenti
 普通 AllReduce 的树可能随 TP 改变，因此 PIK 自己拥有最终规约；HP 的输出边界声明为
 已经完成规约的 Replicate，或 SP 的 Shard(1)，避免重复求和。
 非 SP 训练反向仍保留 HP 的下游梯度 SUM 语义。
+
+统一 rollout 在 HP 替换产生的 `PikLinear` 上按组件选择优化，在 `G=TP=2`、strided 叶布局、默认 all-gather 配方下可使用两叶特例。稠密 4B 的这条路径覆盖 Attention 的 `o_proj` 和 MLP 的 `down_proj`。每个 rank 用本地 BF16 Linear 产生一个 BF16 叶值，全局树仅有一个加法节点，其最终 BF16 舍入可由这两个叶值的 BF16 SUM 实现。bias 加在规约后，SP 按原序列轴取回本地行。其他树形仍用显式固定树。训练和 Actor 重算保留原有梯度路径。[PIK 实现](../rl/unified_execution/ops/pik/linear.py)
 Dense 模型覆盖 `o_proj` 和 MLP `down_proj`；当前 MoE 配方仅对 `o_proj` 使用 PIK，专家内部没有 ETP/PIK。
 
 ## 训练 Attention 与 CP
@@ -158,6 +172,8 @@ Actor 的训练 loss 留在 CP 本地；仅对 detached 的 old/reference log-pr
 [attention/bridge.py](../rl/unified_execution/runtimes/vllm/attention/bridge.py) 把 HP 的
 `[1,N,L,D]` Q/K/V 转成原生调度行 `[T,N*D]`，剔除 HP SP 对齐行；随后恢复 `[1,L,Nq,D]` 输出。
 原生调度产生的请求、图 bucket 和 PCP padding 仍由 vLLM 元数据解释。
+
+统一 rollout 按 HP `GQAAttention` 的布局和 Q/K 归一化实现选择快路径。对于已覆盖的完整半旋转布局，128 维 BF16 Q/K head 使用融合的 RMSNorm 和半旋转 RoPE。算子直接读取 HP 的交错 QKV、本地归一化参数及当前 token 的 cos/sin。先按 head 计算 FP32 均方与 epsilon，保留训练参考的设备 `torch.rsqrt`，再融合归一化、权重乘法及旋转，保留中间 BF16 舍入点。该绑定在 HP 安装 TP/SP 包装前完成，在线发布后读取同一参数地址。其他 Attention 布局沿用共享实现。[Q/K 内核](../rl/unified_execution/ops/attention/qk_norm_rope.py) · [推理绑定](../rl/unified_execution/runtimes/vllm/attention/gqa.py)
 
 [attention/ascend_v4.py](../rl/unified_execution/runtimes/vllm/attention/ascend_v4.py) 保留原生 KV 写入，
 把缓存、block table、query 起点和每请求 KV 长度交给共享 V4：
@@ -219,7 +235,7 @@ CP 可选 1/2/4，PCP 可选 1/2/4，PP 与 GQA DCP 固定为 1。
 CP>1 的 RL 路径限定同步 token-mean GRPO、dense token log-prob、BF16、Level 3、V4 和 PIK；
 MoE 两侧需 EP>1。动态 token batching、DP balancing、AC、loss parallel、R3、Critic/PPO 和蒸馏
 不在该 CP 路径范围。任意 Attention bias 和滑窗也不受支持。
-`TP1/DP2/EP2 + PIK` 推理仍存在重复绑定限制；不要把可解析的拓扑当作完整模型验收。
+仅 EP 激活的 TP1 worker 复用已有本地 PIK 上下文。完整模型验收还需核对实际采样与权重发布。
 
 | 检查 | 入口与判定 |
 | --- | --- |

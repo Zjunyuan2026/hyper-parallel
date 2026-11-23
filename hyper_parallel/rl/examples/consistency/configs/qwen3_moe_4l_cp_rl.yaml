@@ -114,7 +114,7 @@ train:
       source_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention
       implementation:
         _target_: rl.unified_execution.models.bindings.replace_attention_with_pik
-        num_leaves: 8
+        num_leaves: auto
         leaf_layout: strided
         fill_uninitialized_memory: false
   - match: '*.self_attn'
@@ -131,7 +131,6 @@ train:
       kind: method
       implementation:
         _target_: rl.unified_execution.runtimes.hyper_parallel.moe.unified_ep_compute_fn
-        mc2_capacity: 256
   - match: '*.self_attn.o_proj.forward'
     replace:
       kind: method

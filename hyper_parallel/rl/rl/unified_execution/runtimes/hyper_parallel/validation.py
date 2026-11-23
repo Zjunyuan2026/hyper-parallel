@@ -31,10 +31,9 @@ from rl.unified_execution.core.contract import fingerprint, parse_unified_payloa
 from rl.unified_execution.core.execution_plan import (
     pik_row_matches,
     pik_row_options,
-    unified_ep_options,
+    has_unified_ep,
 )
 from rl.unified_execution.models import get_model_family
-from rl.workers.adapters.log_probs import bind_token_log_probs
 
 
 def _module_type(module: Any) -> str:
@@ -63,25 +62,22 @@ def model_structure(model: Any) -> dict[str, Any]:
 
 @lru_cache(maxsize=1)
 def _forward_wrapper_targets() -> dict[CodeType, str]:
-    """Identify HP wrapper implementations and the closure callable they execute."""
+    """Identify HP boundaries. Local regions may execute a replacement instead of __wrapped__."""
     targets = {}
     # HP has no public wrapper-introspection API. Code identities preserve its
     # TP/SP boundaries while preventing __wrapped__ from hiding custom compute.
     factories = {
-        "_wrap_production_forward": ("production_forward", "original_forward"),
-        "_wrap_validate_forward": ("validate_forward", "original_forward"),
+        "_wrap_production_forward": ("production_forward", "__wrapped__"),
+        "_wrap_validate_forward": ("validate_forward", "__wrapped__"),
         "_wrap_local_region_forward": ("local_region_forward", "compute_fn"),
-        "_wrap_module_forward": ("local_param_forward", "original_forward"),
-        "_install_inner_adapter": ("adapted", "user_fwd"),
+        "_wrap_module_forward": ("local_param_forward", "__wrapped__"),
+        "_install_inner_adapter": ("adapted", "__wrapped__"),
     }
     for factory_name, (wrapper_name, target_name) in factories.items():
         factory = getattr(forward_rewriter, factory_name)
         for constant in factory.__code__.co_consts:
             if isinstance(constant, CodeType) and constant.co_name == wrapper_name:
                 targets[constant] = target_name
-    for constant in bind_token_log_probs.__code__.co_consts:
-        if isinstance(constant, CodeType) and constant.co_name == "token_log_probs_forward":
-            targets[constant] = "original_forward"
     return targets
 
 
@@ -111,13 +107,16 @@ def _forward_leaf(module: nn.Module, path: str) -> Any:
         if id(function) in visited:
             raise ValueError(f"Unified training found a cyclic forward wrapper at {path}")
         visited.add(id(function))
+        if function is getattr(module, "_rl_token_log_probs_forward", None):
+            function = function.__wrapped__
+            continue
         target = _forward_wrapper_targets().get(getattr(function, "__code__", None))
         if target is None:
             return function
-        function = inspect.getclosurevars(function).nonlocals[target]
+        function = function.__wrapped__ if target == "__wrapped__" else inspect.getclosurevars(function).nonlocals[target]
 
 
-def validate_attention_execution_path(model: nn.Module) -> tuple[nn.Module, list[nn.Module]]:
+def validate_attention_execution_path(model: nn.Module, *, rollout_forward: Callable | None = None) -> tuple[nn.Module, list[nn.Module]]:
     """Audit the shared Qwen3 forward chain without loading a provider or installing adapters.
 
     Args:
@@ -146,7 +145,8 @@ def validate_attention_execution_path(model: nn.Module) -> tuple[nn.Module, list
         layer = _unwrap_activation_module(wrapped_layer)
         _require_forward_path(layer, (owners["layer"].forward,), f"layers.{index}.forward")
         attention = _unwrap_activation_module(getattr(layer, family.attention_attribute))
-        _require_forward_path(attention, (owners["attention"].forward, GQAAttention.forward),
+        allowed = (owners["attention"].forward, GQAAttention.forward)
+        _require_forward_path(attention, allowed + ((rollout_forward,) if rollout_forward is not None else ()),
                               f"layers.{index}.self_attn.forward")
         attentions.append(attention)
     return decoder, attentions
@@ -169,7 +169,7 @@ def capture_training_structure(model: Any, payload: dict, *, inference: bool = F
     if family.moe:
         ep_size = payload.get("expert_parallelism", {}).get("inference" if inference else "training", 1)
         _validate_moe_components(model, family.execution_types(), family.router_adapter, ep_size,
-                                 unified_ep_options(payload["plan_overrides"]), ep_validator)
+                                 has_unified_ep(payload["plan_overrides"]), ep_validator)
     _validate_pik_components(model, payload, inference=inference)
     structure = model_structure(model)
     replaced = set(getattr(model, "_hp_replaced_module_fqns", ()))
@@ -189,7 +189,7 @@ def capture_training_structure(model: Any, payload: dict, *, inference: bool = F
 
 
 def _validate_moe_components(model: nn.Module, owners: dict[str, type], router_adapter: str, ep_size: int = 1,
-                             role_recipe: dict | None = None,
+                             role_recipe: bool = False,
                              ep_validator: Callable | None = None) -> None:
     """Require the shared HP expert implementation and authoritative HF routing."""
     # Only a MoE model needs the optional native grouped-expert implementation.
@@ -210,7 +210,7 @@ def _validate_moe_components(model: nn.Module, owners: dict[str, type], router_a
 
 
 def _validate_ep_compute(module: nn.Module, ep_size: int, path: str, router_adapter: str,
-                         role_recipe: dict | None = None,
+                         role_recipe: bool = False,
                          ep_validator: Callable | None = None) -> None:
     """Audit HP's installed EP factory and real router, retaining its communication."""
     # EP dependencies are optional for Dense model execution.
@@ -218,11 +218,11 @@ def _validate_ep_compute(module: nn.Module, ep_size: int, path: str, router_adap
 
     expert_forward = experts._local_swiglu_expert_forward  # pylint: disable=protected-access
     function = _forward_leaf(module, path)
-    if role_recipe is not None:
+    if role_recipe:
         if ep_validator is None:
             raise ValueError("Unified EP audit requires the caller's role validator")
         ep_validator(module, function, ep_size, path,
-                     routing.MOE_ROUTER_ADAPTERS[router_adapter], role_recipe)
+                     routing.MOE_ROUTER_ADAPTERS[router_adapter])
         _require_forward_path(module.experts, (expert_forward,), path + ".experts")
         return
     if not isinstance(function, partial) or function.args != (module,) or function.keywords:
@@ -250,18 +250,16 @@ def _validate_pik_components(model: nn.Module, payload: dict, *, inference: bool
     if options is None:
         return
     # The NPU computation adapter is optional for non-PIK configurations.
-    from rl.unified_execution.models.bindings import PikLinear, pik_row_compute_fn  # pylint: disable=C0415
+    from rl.unified_execution.models.bindings import PikLinear  # pylint: disable=C0415
 
-    codes = {code for code in pik_row_compute_fn.__code__.co_consts
-             if isinstance(code, CodeType) and code.co_name == "compute_fn"}
     topology = payload["parallelism" if inference else "training_parallelism"]
     sequence_cp = 1 if inference else topology["cp"]
     model.unified_sequence_multiple = sequence_cp * (topology["tp"] if topology["sequence_parallel"] else 1)
     for index, wrapped_layer in enumerate(model.model.layers):
         layer = _unwrap_activation_module(wrapped_layer)
         for pattern in pik_row_matches(family):
-            parent_name, child = pattern.split(".")[-2:]
-            parent = getattr(layer, parent_name)
+            parent_name, child = pattern.removeprefix("*.").rsplit(".", 1)
+            parent = layer.get_submodule(parent_name)
             parent = _unwrap_activation_module(parent)
             if not inference and topology["cp"] > 1 and parent_name == get_model_family(family).attention_attribute:
                 cp_mesh = getattr(parent, "unified_cp_mesh", None)
@@ -274,9 +272,9 @@ def _validate_pik_components(model: nn.Module, payload: dict, *, inference: bool
             if topology["tp"] > 1:
                 _validate_pik_boundary(module, f"layers.{index}.{child}", sp=sp)
             function = _forward_leaf(module, f"layers.{index}.{child}")
-            installed = (isinstance(function, partial) and function.args == (module,)
-                         and getattr(function.func, "__code__", None) in codes)
-            if not isinstance(module, PikLinear) or not (installed or function is PikLinear.forward):
+            if isinstance(function, partial) and function.args == (module,) and not function.keywords:
+                function = function.func
+            if not isinstance(module, PikLinear) or function is not PikLinear.forward:
                 raise ValueError(f"PIK row computation was not installed at layer {index} {child}")
             _validate_pik_context(module, options, topology, sp, index, child)
 

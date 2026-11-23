@@ -148,15 +148,9 @@ def configure(config: dict, world: int) -> dict:
         raise ValueError("MAX_PROMPT + MAX_NEW_TOKENS must not exceed MAX_MODEL_LEN")
     inference.update(max_model_len=context,
                      max_num_batched_tokens=integer("PREFILL_TOKENS", 128 if runner == "internal" else 512))
-    # Legacy EP_CAPACITY bounded every input; the new limit applies only to MC2.
-    capacity = integer("MC2_CAPACITY", min(integer("EP_CAPACITY", 256), 256))
-    backend = os.environ.get("INFERENCE_EP_BACKEND", "auto")
-    if capacity > 256 or backend not in ("auto", "mc2", "allgather"):
-        raise ValueError("MC2_CAPACITY must be <= 256 and INFERENCE_EP_BACKEND must be auto, mc2 or allgather")
-    for rule in train["plan_overrides"]:
-        implementation = rule.get("replace", {}).get("implementation", {})
-        if implementation.get("_target_", "").endswith("unified_ep_compute_fn"):
-            implementation.update(mc2_capacity=capacity, inference_backend=backend)
+    obsolete = [name for name in ("MC2_CAPACITY", "EP_CAPACITY", "INFERENCE_EP_BACKEND") if name in os.environ]
+    if obsolete:
+        raise ValueError(f"Unset removed expert transport options {obsolete}; inference now uses native Ascend experts")
     if boolean("REQUIRE_LEARNING", False):
         if runner != "internal" or train["max_steps"] < 2 or candidates < 2:
             raise ValueError("Real learning acceptance requires internal GSM8K, >=2 steps and >=2 candidates")

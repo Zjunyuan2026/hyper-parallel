@@ -17,34 +17,54 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from functools import partial
 from typing import Any
 
 import torch
 from torch import nn
 
+from hyper_parallel.components.modules.gqa_attention import GQAAttention
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import Replicate
 from hyper_parallel.distributed._builder.tp_collective_lowering import create_tp_collective_lowerer
 from hyper_parallel.distributed.recipe_spec import resolve_placements
+from hyper_parallel.models.replacement import module_replacement
 from rl.unified_execution.core.batch_invariant import initialize_batch_invariant, verify_batch_invariant
-from rl.unified_execution.core.validation import capture_training_structure
 from rl.unified_execution.models import get_model_family
+from rl.unified_execution.models.bindings import PikLinear
 from rl.unified_execution.runtimes.hyper_parallel.builder import build_inference_model
+from rl.unified_execution.runtimes.hyper_parallel.validation import capture_training_structure
 from rl.unified_execution.runtimes.vllm.attention.bridge import install_paged_attention
-from rl.unified_execution.runtimes.vllm.moe import validate_inference_ep
+from rl.unified_execution.runtimes.vllm.attention.gqa import bind_qk_norm_rope
+from rl.unified_execution.runtimes.vllm.moe import register_inference_experts, validate_inference_ep
 from rl.unified_execution.runtimes.vllm.parallel import build_parallel_context, payload_from_vllm_config
 from rl.unified_execution.runtimes.vllm.weights import LogicalWeightLoader
 
 logger = logging.getLogger(__name__)
 
 
+def rollout_factory(factory: Callable) -> Callable:
+    """Bind rollout arithmetic to the components produced by an HP replacement."""
+
+    @module_replacement
+    def build(*, module, module_fqn, context):
+        result = factory(module=module, module_fqn=module_fqn, context=context)
+        for child in result.modules():
+            if type(child) is PikLinear:
+                child.optimized_rollout = True
+            elif isinstance(child, GQAAttention):
+                bind_qk_norm_rope(child)
+        return result
+
+    return build
+
+
 class HyperParallelQwen3ForCausalLM(nn.Module):
     """Reuse HP embedding, decoder, RoPE, normalization, MLP and LM head.
 
-    Only the attention interface is replaced. vLLM owns paged KV cache,
-    scheduled request boundaries, sampling and the flattened token schedule.
+    vLLM owns paged KV, scheduling, sampling and supported rollout MoE kernels.
+    Expert weights are published into the shared model's local shards.
     """
 
     def __init__(self, *, vllm_config: Any, prefix: str = "") -> None:
@@ -69,12 +89,17 @@ class HyperParallelQwen3ForCausalLM(nn.Module):
         hp_model = build_inference_model(
             vllm_config.model_config.hf_config, payload["plan_overrides"], attn_implementation="eager",
             parallel_context=self.parallel_context,
+            adapt_factory=rollout_factory if self.unified_numeric_policy is not None else None,
         )
+
+        self.native_experts = None
+        if family.moe and self.parallel_context.ep_size > 1:
+            self.native_experts = register_inference_experts(hp_model, self.parallel_context, prefix)
 
         # Audit the shared model before installing the inference-only cache bridge.
         self.unified_structure_report = capture_training_structure(
             hp_model, payload, inference=True,
-            ep_validator=partial(validate_inference_ep, runtime=self.parallel_context.expert_runtime),
+            ep_validator=partial(validate_inference_ep, native=self.native_experts),
         )
         expected = payload.get("training_structure")
         if expected is not None and self.unified_structure_report != expected:

@@ -1,4 +1,19 @@
-# Qwen3-MoE 训推一致性
+# Qwen3 训推一致性
+
+## Qwen3-4B
+
+[稠密 4B 配方](configs/qwen3_4b_rl.yaml) 使用完整 Qwen3-4B 权重，两张 NPU 同置运行两步 GRPO。默认训练 TP2/SP、推理 TP2，均为 BF16、Level 3 和 V4。PIK 的 `num_leaves: auto` 在此配置解析为 2，覆盖 Attention 的 `o_proj` 和 MLP 的 `down_proj`。在已安装 Hyper-RL 和 V4 的运行容器中，从仓库根目录运行：
+
+```bash
+torchrun --standalone --local-addr=127.0.0.1 --nproc-per-node=2 \
+  hyper_parallel/rl/examples/consistency/scripts/run_consistency.py \
+  hyper_parallel/rl/examples/consistency/configs/qwen3_4b_rl.yaml \
+  --report /results/qwen3_4b_consistency.json
+```
+
+权重和数据分别挂载到 `/models/Qwen3-4B` 和 `/data/gsm8k`。
+
+## Qwen3-MoE
 
 四层 Qwen3-MoE 运行两步正常 GRPO，验证不同训推并行配置下的实际采样 token log-prob 完全一致。
 模型保留原始 128 专家、top-k8 和权重，只裁剪 decoder 层数。
@@ -30,7 +45,7 @@ docker image inspect --format '{{.Id}} {{.Architecture}}' "$image"
 npu-smi info
 ```
 
-构建和运行脚本均校验镜像 ID：
+参考环境的镜像 ID 为
 `sha256:f139fa4776cf71fa1ebf00c47fa1f4c313deec48267c2102a1a42d968634fb08`。
 依赖版本见[运行环境](../../docs/unified_execution_guide.md#运行环境)。镜像已包含采样器的
 `q.record_stream(...)` 修复，不需要再执行 `patch_sampler.py`。
@@ -98,8 +113,12 @@ export RESULT_ROOT=/tmp/hyper-rl-consistency/train-sp
 bash hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_docker.sh
 ```
 
+可通过 `IMAGE` 指定含所需数值算子和 vLLM 接口的本地镜像。
 `DEVICES` 必须列出四张不同的空闲卡，可按本机情况修改。`RESULT_ROOT` 首次运行至少预留 10 GiB，
 用于裁剪权重和实验记录；需要持久保存时改为自己的数据目录。Docker 存储还需有镜像、构建及容器运行空间。
+同卡部署若在创建 rollout 通信组时出现 HCCL `EI0020` 监听端口冲突，可以给本次运行追加
+`--rollout.vllm.server_hccl_if_base_port=64000 --rollout.vllm.server_hccl_npu_socket_port_range=64000-64150`。
+请按本机可用端口选择，与训练进程的 HCCL 端口段错开。
 
 启动器依次检查输入、wheel 校验和、镜像身份和设备占用，创建独立容器，安装当前 checkout 与 RL 插件，
 将补丁 wheel 安装到 `/opt/hp-v4`，供训练进程和 vLLM worker 共同加载，然后裁剪权重并执行两步训练。
@@ -107,6 +126,32 @@ bash hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_docker.sh
 固定镜像缺少当前 HP 要求的 PEFT 依赖，启动器会下载固定版本 `peft==0.21.2` 和
 `accelerate==1.12.0`，以 `--no-deps` 安装并执行 `pip check`；不会升级 Torch/NPU/V4 等数值依赖。
 首次启动会进行图编译与捕获，需要等待；过程日志写入 `run/train.log`。
+
+启动器在容器内、导入 Torch 和启动 torchrun 之前计算 CPU 线程预算，结果保存为
+`run/cpu-threads.json`。它读取进程 affinity（包含 cpuset 限制）、SMT 物理核心关系及
+可见 cgroup v1/v2 的最紧上级 CPU 配额。开启训练 CPU offload 时，默认取可用核心的
+50%（向下取整），按本机训练进程数均分，每进程最多 8 线程、至少 1 线程。
+例如 192 核、8 个训练 rank 时，每 rank 分配 8 线程，总计 64 线程。
+关闭 offload 时自动使用 1 线程；显式设置的 OMP/MKL 线程数不受自动分配上限约束。
+CPU offload 的判断使用与训练入口相同的 YAML 和命令行覆盖。
+
+可用下列环境变量覆盖线程预算：
+
+| 变量 | 含义 |
+| --- | --- |
+| `OMP_NUM_THREADS` | 手动指定每个训练进程的线程数；未设置或 `auto` 时自动分配 |
+| `MKL_NUM_THREADS` | 显式数值优先于 OMP；启动器将两个变量统一为最终训练线程数 |
+| `HYPER_RL_CPU_RESERVE` | 自动分配时预留的核心预算，默认预留一半；非负整数只可进一步增加预留，不能突破 50% 预算 |
+| `HYPER_RL_VLLM_CPU_THREADS` | 独立的推理 OMP/MKL 线程数，启动器默认 1，不继承较大的训练线程数 |
+
+例如 `OMP_NUM_THREADS=8 bash hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_docker.sh`
+可保留手动训练预算（显式设置了 MKL 时以 MKL 为准）。未使用该启动器的入口可在容器内、
+torchrun 之前调用 `python -m rl.utils.cpu_threads --config CONFIG --local-world-size N`：
+标准输出是最终线程数，标准错误输出包含资源计算依据。将结果设置到 OMP/MKL 后再启动训练。
+
+这是启动时的计算线程预算，不是运行中抢占空闲 CPU 或分配互斥核集合，也不改变 NUMA 绑定。
+同一启动器的共享 affinity 只除以本机进程数一次；不要在已经分别绑核的 worker 中再次均分。
+共享机器应通过容器限额或手动预算限制资源。自动值不保证是内存带宽约束下的性能最优值。
 
 默认使用普通并行基线配置。两份 YAML 都显式包含完整替换配方，不通过隐藏的配置继承补充训练参数。
 运行其他组合时只覆盖下面列出的拓扑字段，保持共享数值实现不变。
@@ -129,6 +174,10 @@ bash hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_docker.sh
 两份文件是 [普通基线](configs/qwen3_moe_4l_rl.yaml) 和 [CP/PCP 配置](configs/qwen3_moe_4l_cp_rl.yaml)。
 后者的 CP wrapper 声明为 `when: cp`，因此 G 中 CP1 不安装该 wrapper。
 EP2 自然在 TP2 组内；EP4 跨两个 PCP 平面。两端 CP 不必相同。
+
+两份配方的 PIK 使用 `num_leaves: auto`，按本次训练和推理的最大 TP 确定共享 G。
+TP 必须为 2 的幂（包括 1）。若要在不同最大 TP 的独立实验间比较逐位结果，应显式固定同一个 G；
+自动模式不保证不同 G 的实验互相逐位相同。
 
 保留上文模型、数据、wheel 和 DEVICES 设置；每个用例使用独立 RESULT_ROOT，**依次**运行：
 
@@ -159,7 +208,7 @@ CONFIG="$context" RESULT_ROOT=/tmp/hyper-rl-consistency/D bash "$runner" \
 CONFIG="$context" RESULT_ROOT=/tmp/hyper-rl-consistency/E bash "$runner" \
   --rollout.vllm.expert_parallel_size=2
 
-# F：推理 SP，调度预算大于默认 MC2 容量 256。
+# F：推理 SP，提高每轮调度的 token 预算。
 CONFIG="$context" RESULT_ROOT=/tmp/hyper-rl-consistency/F bash "$runner" \
   --rollout.vllm.sequence_parallel=true --rollout.vllm.max_num_batched_tokens=512
 
@@ -169,28 +218,11 @@ CONFIG="$context" RESULT_ROOT=/tmp/hyper-rl-consistency/G bash "$runner" \
 ```
 
 这些是可分别复现的验证组合，不表示一次启动会穷举全部拓扑。
-F 提高调度上界，但短 prompt、max_num_seqs 和实际流量决定是否真的超过 MC2 容量；
-不能仅凭 budget=512 就声称已执行 AllGather。后端切换和大 bucket 图回放由下面的 EP 设备测试强制覆盖。
+F 提高调度上界，实际送入 MoE 的行数取决于 prompt、并发数和调度结果。
 
-## EP 后端与图模式对照
+## EP 与图模式对照
 
-两份配方都使用 `unified_ep_compute_fn`，默认 `mc2_capacity: 256`、`inference_backend: auto`。
-训练保持动态路由；推理在 MC2 可用且当前 bucket 适合时使用 MC2，其余合法尺寸由 AllGather 承接。
-具体条件与数值合并规则见 [MoE 实现](../../docs/unified_execution_moe.md#后端选择与容量)。
-
-对照 eager 与图模式，可对任一上述命令增加 `--rollout.vllm.enforce_eager=true`，并使用新的结果目录。
-两种模式使用相同的 MC2/AllGather 算法选择。
-需要显式选择 AllGather 或修改 MC2 容量时，修改选中 YAML 的 MoE replacement 条目：
-
-```yaml
-implementation:
-  _target_: rl.unified_execution.runtimes.hyper_parallel.moe.unified_ep_compute_fn
-  mc2_capacity: 256
-  inference_backend: allgather
-```
-
-CLI loader 不支持通过列表下标覆盖 `plan_overrides`；不要使用 `--train.plan_overrides.4...`。
-修改后使用独立结果目录，实际解析配置会保存在 `run/config.yaml` 中。
+两份配方都使用 `unified_ep_compute_fn`。训练使用动态 AllToAll，推理使用 vLLM-Ascend 原生专家。TP、SP、PCP 与 DP 改变源行和专家的归属。对照 eager 与图模式时，可给上述命令增加 `--rollout.vllm.enforce_eager=true` 并更换结果目录。两种模式执行同一个专家入口。[MoE 实现](../../docs/unified_execution_moe.md#推理端的原生专家计算)
 
 ## 检查结果
 
@@ -227,8 +259,8 @@ rg 'CONSISTENCY_CHECK|CONSISTENCY_PASS' "$RESULT_ROOT/run/train.log"
 在已安装本仓及固定数值依赖的环境中，显式选择空闲设备：
 
 ```bash
-# 真实 EP 路由、MC2/AllGather、大小 bucket 切换、图回放与训练梯度。
-RL_EP_ST_DEVICES=0,1,2,3 RL_EP_ST_SIZE=4 \
+# 真实 EP 路由、不等长及空源行、图回放与训练梯度。
+RL_EP_ST_DEVICES=0,1,2,3 RL_EP_ST_SIZE=4 RL_EP_ST_MODEL=/path/to/Qwen3-MoE-4L \
   pytest -q hyper_parallel/rl/tests/st/test_unified_expert_parallel.py
 
 # CP Attention、完整测试模型的 CP1/CP2 logits 与逐参数梯度。
@@ -252,7 +284,7 @@ RL_PCP_ST_DEVICES=0,1,2,3 \
 
 A3 ???????????????? V4/runtime wheels ??? ID ???
 ?????????????????????? token?reward ??????
-A2 ?????? A3 ?????A3 ??? MC2 ????? auto ????? AllGather?
+A3 uses the native Ascend expert path; the former MC2/AllGather selector is removed.
 ?????????????? A2 fullmesh????? mc2 ???????????
 
 ?????????????????????
@@ -284,9 +316,6 @@ CONFIG ?????????? CP>1 ???????? CP Attention ???
 | --- | --- |
 | TRAIN_CP / --train-cp | ?? CP1/2/4 |
 | ROLLOUT_PCP / --rollout-pcp | ?? PCP1/2/4?DCP ??? 1 |
-| INFERENCE_EP_BACKEND | auto?allgather ? mc2??? auto |
-| MC2_CAPACITY | MC2 ?????? 1?256 |
-| EP_CAPACITY | ???????????? MC2 ????? 256???????? |
 | GENERATION_TIMEOUT | ????? HTTP request_timeout??? 1800 ? |
 | --transport auto/ipc | ????????colocated ???????????? IPC |
 
@@ -319,7 +348,7 @@ Select original prepared training rows and allow complete answers:
 
 ```bash
 export MAX_PROMPT=512 MAX_NEW_TOKENS=1536 MAX_MODEL_LEN=2048
-export PREFILL_TOKENS=128 MC2_CAPACITY=256
+export PREFILL_TOKENS=128
 export MAX_NUM_SEQS=4 KV_CACHE_MEMORY_BYTES=1073741824
 export MICRO_BATCH_SIZE=1 RESPONSE_MINI_BATCH_SIZE=8 PROMPTS_PER_RANK=1
 unset GLOBAL_PROMPT_BATCH_SIZE
@@ -557,6 +586,31 @@ The controller prints `RESULT_DIRECTORY`; inspect `node0/run/consistency.json`,
 `summary.json` passes only when the consistency report covers all requested steps and every owned
 container exits successfully. Cleanup removes only containers created by this invocation.
 
+The A3 entries also integrate the [PR1533 execution optimizations](https://github.com/mindspore-ai/hyper-parallel/commit/c98e6591b0a360cb942dc478ba3f4155d0b84db0).
+The selected-node entry retains full-model loading and node-local HTTP/IPC control. Inference uses
+the native Ascend expert path; `MC2_CAPACITY`, `EP_CAPACITY` and `INFERENCE_EP_BACKEND` are removed
+and must be unset for the single-node entry. PIK `num_leaves: auto` resolves jointly from both roles;
+TP4 training and TP2 rollout select four leaves. This changes the plan from an explicit eight-leaf
+baseline, so acceptance requires fresh sampled-token consistency within the new run.
+
+Before Torch import, the shared worker resolves CPU threads for the effective `CPU_OFFLOAD` setting
+using the local `DEVICE_COUNT`, not the global world. `OMP_NUM_THREADS` / `MKL_NUM_THREADS` accept
+`auto` or explicit positive integers; automatic device-resident training uses one thread per rank.
+`HYPER_RL_VLLM_CPU_THREADS` independently limits inference threads. Each node saves its detected
+budget in `nodeN/run/cpu-threads.json`.
+
+Use `--steps 5` to collect four samples after excluding the first step. Compare the same selected
+hosts, model, prompt batch, candidate count, token limits and residency policy. The controller
+prints `CLUSTER_TIMING` and saves `mean_seconds`, `warm_step_samples`, and generated-token totals
+in the top-level summary. Missing measurements are omitted, never treated as zero. Different
+generated lengths can change timings; the upstream update does not directly replace weight publication.
+
+To inspect timings for either an old or new retained run without launching containers:
+
+```bash
+python3 hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_cluster.py --summarize /path/to/qwen3-cluster-directory
+```
+
 CPU/mocked regressions validate orchestration, not multi-node numerical parity or performance.
-Real-device cluster RL acceptance remains pending. This entry does not implement a 50-step full
+Real-device cluster RL acceptance of the updated execution path remains pending. This entry does not implement a 50-step full
 GSM8K epoch, train/validation splitting, or final test evaluation; those require the separate data plan.

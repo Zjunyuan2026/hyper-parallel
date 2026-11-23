@@ -28,7 +28,8 @@ import yaml
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 import rl
-from rl.config.resolve import build_runtime_config
+from rl.config.resolve import build_runtime_config, resolve_unified_execution_config
+from rl.unified_execution.runtimes.hyper_parallel.builder import normalized_compute_setup
 from rl.unified_execution.models.bindings import PikLinear, pik_row_compute_fn, replace_pik_linear
 from rl.unified_execution.core.contract import build_unified_payload, parse_unified_payload
 from rl.unified_execution.core.execution_plan import PIK_MODULE_TARGET, pik_row_matches, pik_row_options
@@ -127,6 +128,45 @@ class TestPikModel(unittest.TestCase):
         self.assertEqual(parse_unified_payload(payload), payload)
         self.assertEqual(pik_row_options(payload["plan_overrides"])["num_leaves"], 8)
 
+    def test_grouped_layout_patterns_preserve_the_pik_contract(self) -> None:
+        expected = build_unified_payload(self.config)
+        plan = self.config["train"]["plan_overrides"]
+        target = "*.self_attn.o_proj.forward"
+        sibling = "*.mlp.down_proj.forward"
+        for rule in [entry for entry in plan if entry["match"] == target]:
+            other = next(entry for entry in plan if entry["match"] == sibling and entry.get("when") == rule.get("when"))
+            rule["match"] = [target, sibling]
+            plan.remove(other)
+
+        resolved = resolve_unified_execution_config(self.config)
+        plan = resolved["train"]["plan_overrides"]
+        self.assertEqual(plan, resolved["rollout"]["vllm"]["unified_execution"]["plan_overrides"])
+        self.assertEqual(pik_row_options(plan), pik_row_options(expected["plan_overrides"]))
+        self.assertTrue(normalized_compute_setup(plan).module_replacements)
+
+    def test_automatic_leaves_are_shared_by_both_roles(self) -> None:
+        """Use the larger TP degree even when the other role runs with TP1."""
+        for entry in self.config["train"]["plan_overrides"]:
+            implementation = entry.get("replace", {}).get("implementation", {})
+            if "num_leaves" in implementation:
+                implementation["num_leaves"] = "auto"
+
+        for train_tp, rollout_tp in ((1, 4), (4, 2)):
+            with self.subTest(train_tp=train_tp, rollout_tp=rollout_tp):
+                self.config["train"]["accelerator"].update(tp=train_tp, sequence_parallel=False)
+                self.config["rollout"]["vllm"].update(tensor_parallel_size=rollout_tp, sequence_parallel=False)
+                resolved = resolve_unified_execution_config(self.config)
+                payload = resolved["rollout"]["vllm"]["unified_execution"]
+                self.assertEqual(pik_row_options(resolved["train"]["plan_overrides"])["num_leaves"], 4)
+                self.assertEqual(payload["plan_overrides"], resolved["train"]["plan_overrides"])
+        self.assertEqual(pik_row_options(self.config["train"]["plan_overrides"])["num_leaves"], "auto")
+
+    def test_automatic_leaves_reject_non_power_of_two_tp(self) -> None:
+        """An even TP alone cannot guarantee complete balanced subtrees."""
+        self.config["rollout"]["vllm"]["tensor_parallel_size"] = 6
+        with self.assertRaisesRegex(ValueError, "powers of two"):
+            build_unified_payload(self.config)
+
     def test_reject_incomplete_or_different_arithmetic(self) -> None:
         """Reject partial, conditional or inconsistent PIK replacement plans."""
         plan = self.config["train"]["plan_overrides"]
@@ -171,6 +211,15 @@ class TestPikModel(unittest.TestCase):
             module.weight = torch.nn.Parameter(torch.zeros_like(parameter))
             torch.testing.assert_close(module(x), module.bias.expand(2, 3, 4))
 
+    def test_ep_only_boundary_reuses_tp1_context(self) -> None:
+        """An EP mesh installs HP method boundaries even when TP is local."""
+        context = SimpleNamespace(world_size=1, sequence_parallel=False)
+        with patch("rl.unified_execution.models.bindings.prepare_pik", return_value=context) as prepare:
+            module = PikLinear(torch.nn.Linear(8, 4), PikPlan(), parallel=False, fill_uninitialized_memory=False)
+            pik_row_compute_fn(module=module, mesh=None, tp_mesh=None, cp_mesh=None, ep_mesh=object())
+        self.assertIs(module.pik_context, context)
+        prepare.assert_called_once()
+
     def test_parallel_requires_explicit_binding(self) -> None:
         """Never fall back to TP1 when HP failed to apply the parallel plan."""
         module = PikLinear(torch.nn.Linear(8, 4), PikPlan(), parallel=True, fill_uninitialized_memory=True)
@@ -199,7 +248,8 @@ class TestPikModel(unittest.TestCase):
                 payload = build_unified_payload(config)
                 self.assertEqual(parse_unified_payload(payload), payload)
                 self.assertEqual(pik_row_matches("qwen3_moe"), ("*.self_attn.o_proj",))
-                self.assertEqual(pik_row_options(payload["plan_overrides"])["num_leaves"], 8)
+                expected_leaves = 4 if recipe.name == "qwen3_moe_4l_rl.yaml" else 8
+                self.assertEqual(pik_row_options(payload["plan_overrides"])["num_leaves"], expected_leaves)
                 added = deepcopy(next(entry for entry in self.config["train"]["plan_overrides"]
                                       if entry.get("match") == "*.mlp.down_proj"))
                 config["train"]["plan_overrides"].append(added)

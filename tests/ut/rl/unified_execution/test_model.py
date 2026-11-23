@@ -27,7 +27,7 @@ from rl.unified_execution.runtimes.hyper_parallel.builder import build_inference
 from rl.unified_execution.runtimes.vllm.model import HyperParallelQwen3ForCausalLM
 from rl.unified_execution.runtimes.vllm.attention.bridge import paged_attention_forward
 from rl.unified_execution.runtimes.vllm.parallel import InferenceParallelContext
-from rl.unified_execution.core.validation import capture_training_structure
+from rl.unified_execution.runtimes.hyper_parallel.validation import capture_training_structure
 from rl.workers.engine.materialization import register_qwen3_materialization
 from rl.workers.engine.model import build_role_model
 from torch import nn

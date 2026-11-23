@@ -14,6 +14,7 @@
 # ============================================================================
 """Training-role dynamic EP binding and execution-path validation."""
 
+from functools import partial
 from typing import Any, Callable
 
 from hyper_parallel.distributed.recipe_spec import local_compute
@@ -21,35 +22,27 @@ from rl.unified_execution.models.bindings import bind_expert_ownership, validate
 from rl.unified_execution.ops.moe.training_ep import training_ep
 
 
+def _training_forward(router_fn: Callable, options: dict, module: Any, hidden_states: Any) -> Any:
+    states = hidden_states.reshape(-1, hidden_states.shape[-1])
+    indices, weights = router_fn(module, states)
+    return training_ep(module, states, indices, weights, **options).view(hidden_states.shape)
+
+
 def bind_training_ep(module: Any, ep_mesh: Any) -> Callable:
-    """Bind differentiable routing at construction time; eval never changes the role."""
+    """Bind routing and ownership once, including for Actor probability evaluation."""
     router_fn, options = bind_expert_ownership(module, ep_mesh)
-    transport = training_ep
-
-    def compute_fn(module: Any, hidden_states: Any) -> Any:
-        """Route flattened token rows and restore the HP boundary shape."""
-        states = hidden_states.reshape(-1, hidden_states.shape[-1])
-        indices, weights = router_fn(module, states)
-        output = transport(module, states, indices, weights, **options)
-        return output.view(hidden_states.shape)
-
-    return compute_fn
+    return partial(_training_forward, router_fn, options)
 
 
 @local_compute
 def unified_ep_compute_fn(*, module: Any, mesh: Any, tp_mesh: Any, cp_mesh: Any,
-                          ep_mesh: Any, mc2_capacity: int = 256, inference_backend: str = "auto") -> Callable:
-    """Train with HP dynamic EP; shared inference options never limit training rows."""
+                          ep_mesh: Any) -> Callable:
+    """Bind HP's differentiable expert routing for training and Actor scoring."""
     del mesh, tp_mesh, cp_mesh
-    if not isinstance(mc2_capacity, int) or isinstance(mc2_capacity, bool) or mc2_capacity < 1:
-        raise ValueError("MC2 capacity must be a positive integer")
-    if inference_backend not in ("auto", "mc2", "allgather"):
-        raise ValueError("Unified EP inference_backend must be auto, mc2 or allgather")
     return bind_training_ep(module, ep_mesh)
 
 
 def validate_training_ep(module: Any, function: Any, ep_size: int, path: str,
-                         router_fn: Callable, recipe: dict) -> None:
+                         router_fn: Callable) -> None:
     """Require the differentiable transport even during Actor probability evaluation."""
-    del recipe
-    validate_expert_binding(module, function, ep_size, path, router_fn, bind_training_ep, training_ep)
+    validate_expert_binding(module, function, ep_size, path, router_fn, _training_forward)

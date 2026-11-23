@@ -24,7 +24,7 @@ Paths are relative to `hyper_parallel/rl/`; `tests/ut/rl/` is relative to the re
 | MoE R3 | `train.router_replay.mode` | `rl/workers/adapters/router_*`, `rl/rollout/router_capture.py` | Router replay and MoE tests |
 | Save and resume | `train.checkpoint` | `rl/trainer/checkpoint.py`, `rl/async_runtime/protocol.py` | Schema, precision, topology, version, RNG, and buffer recovery tests |
 | Qwen3 共享架构 | `consistency: {schema_version: 1, mode: architecture}` | `rl/unified_execution/`；共用公开 builder、`train.plan_overrides` 和 TP/SP | `tests/ut/rl/unified_execution/test_contract.py`、`examples/consistency/scripts/run_qwen3_moe_docker.sh` |
-| Qwen3-MoE 共享架构 | `examples/consistency/configs/qwen3_moe_4l_rl.yaml` | `rl/unified_execution/models/` 描述模型，复用公共 builder、HP TP/SP/EP 和 GroupedExperts；训练动态 EP，推理 MC2/AllGather 有效行 GMM 支持图捕获 | `tests/ut/rl/unified_execution/test_contract.py`、`tests/ut/rl/unified_execution/test_weights.py`、`examples/consistency/scripts/run_qwen3_moe_docker.sh` |
+| Qwen3-MoE 共享架构 | `examples/consistency/configs/qwen3_moe_4l_rl.yaml` | `rl/unified_execution/models/` 描述模型，复用公共 builder、HP TP/SP/EP 和 GroupedExperts；训练动态 EP，推理使用 vLLM-Ascend 原生路由与专家计算，按槽位顺序合并并支持图捕获 | `tests/ut/rl/unified_execution/test_contract.py`、`tests/ut/rl/unified_execution/test_weights.py`、`examples/consistency/scripts/run_qwen3_moe_docker.sh` |
 | Prefill 分段图 | `compilation_config.mode: 3`、`cudagraph_mode: FULL_AND_PIECEWISE` | `rl/unified_execution/runtimes/vllm/entrypoints.py`；HP forward 进入 vLLM 分段编译 | `examples/consistency/scripts/run_qwen3_moe_docker.sh` |
 | Level 3 batch invariant | `consistency.mode: batch_invariant`；provider=`torch_npu_level3`，fill=false | `rl/unified_execution/core/batch_invariant.py`；Trainer 与推理 worker 独立初始化和核验 | `tests/ut/rl/unified_execution/test_batch_invariant.py`、`tests/ut/rl/rollout/test_unified_runtime.py`、两步 RL 示例 |
 | 独立 PIK | `PikPlan` / `prepare_pik` / `pik_linear`；不自动替换模型 | `rl/unified_execution/ops/pik/`；Level 3 BMM、Triton 固定树、HCCL 搬运 | `tests/ut/rl/unified_execution/test_pik.py`、`tests/st/test_pik.py`；详见 Unified Execution README |
@@ -61,19 +61,13 @@ For the implemented role-specific EP paths, see the
 
 ## Unified MoE EP transports
 
-- Recipe: `rl.unified_execution.runtimes.hyper_parallel.moe.unified_ep_compute_fn`, with MC2 fast-path `mc2_capacity` and
-  `inference_backend` options in `train.plan_overrides`.
-- Training: [training_ep.py](../hyper_parallel/rl/rl/unified_execution/ops/moe/training_ep.py) reuses HP dispatch
-  and autograd; original FP32 router weights enter the ordered slot merge.
-- Inference: [mc2_ep.py](../hyper_parallel/rl/rl/unified_execution/ops/moe/mc2_ep.py) and
-  [allgather_ep.py](../hyper_parallel/rl/rl/unified_execution/ops/moe/allgather_ep.py) provide graph paths; [expert_parallel.py](../hyper_parallel/rl/rl/unified_execution/runtimes/vllm/parallel.py)
-  checks capability and scheduler/graph bounds, and owns a separate MC2 communicator with HP rank order.
-  [moe.py](../hyper_parallel/rl/rl/unified_execution/runtimes/vllm/moe.py) selects the
-  per-batch transport from native host metadata; legal larger batches use AllGather.
-- Merge: [combine.py](../hyper_parallel/rl/rl/unified_execution/ops/moe/combine.py) preserves owner selection
-  and FP32 slot order; [CPU checks](../tests/ut/rl/unified_execution/test_moe_combine.py) cover order and gradients.
-- Checks: [CPU role contract](../tests/ut/rl/unified_execution/test_unified_ep.py),
-  [mc2_capacity and compiled dispatch](../tests/ut/rl/unified_execution/test_expert_execution.py),
+- The shared recipe binds `unified_ep_compute_fn` in the Actor plan.
+- [Training EP](../hyper_parallel/rl/rl/unified_execution/ops/moe/training_ep.py) uses differentiable HP dispatch.
+  [Native rollout experts](../hyper_parallel/rl/rl/unified_execution/runtimes/vllm/native_moe.py) run native routing
+  and GEMMs, then return unweighted expert slots to their source rows for ordered combination.
+  [Graph registration](../hyper_parallel/rl/rl/unified_execution/runtimes/vllm/moe.py) binds the published experts by layer path.
+- Checks include the [role contract](../tests/ut/rl/unified_execution/test_unified_ep.py),
+  [row ownership and FP32 slot order](../tests/ut/rl/unified_execution/test_expert_execution.py),
   [device transport acceptance](../hyper_parallel/rl/tests/st/test_unified_expert_parallel.py), and
   [two-step publication loop](../hyper_parallel/rl/tests/st/test_prefill_context_parallel.py).
 - Boundaries: [MoE execution contract](../hyper_parallel/rl/docs/unified_execution_moe.md#数值契约).

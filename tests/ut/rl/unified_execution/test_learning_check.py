@@ -37,7 +37,8 @@ class RealLearningChecks(unittest.TestCase):
         self.distributed.get_rank.return_value = 0
         self.distributed.get_world_size.return_value = 1
         self.model = torch.nn.Linear(2, 1, bias=False)
-        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=0.01)
+        # CPU evidence tests must not invoke torch_npu's automatic foreach device probe.
+        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=0.01, foreach=False)
         self.experience = SimpleNamespace(advantages=torch.tensor([[1., 1.], [-1., -1.]]),
                                           action_mask=torch.ones(2, 3))
         self.trainer = SimpleNamespace(

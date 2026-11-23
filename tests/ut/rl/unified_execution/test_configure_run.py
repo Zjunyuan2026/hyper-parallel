@@ -91,12 +91,12 @@ class ConfigureRunTests(unittest.TestCase):
         self.assertEqual(result["data"]["chat_template_kwargs"], {"enable_thinking": False})
         self.assertEqual(result["model"]["registry_name"], "qwen3_30b_a3b")
 
-    def test_internal_lengths_and_ep_capacity_follow_launcher(self) -> None:
+    def test_internal_lengths_and_native_experts_follow_launcher(self) -> None:
         """Direct generation honors length overrides and all selected devices."""
         env = {"RUN_MODEL_PATH": "/models/Qwen3-30B-A3B", "RUNNER": "internal", "STEPS": "5",
                "TRAIN_TP": "2", "TRAIN_EP": "8", "ROLLOUT_TP": "4", "ROLLOUT_EP": "4",
                "MAX_PROMPT": "768", "MAX_NEW_TOKENS": "2048", "MAX_MODEL_LEN": "4096",
-               "EP_CAPACITY": "4096", "PREFILL_TOKENS": "1024"}
+               "PREFILL_TOKENS": "1024"}
         with patch.dict(os.environ, env, clear=True):
             config = CONFIGURE(yaml.safe_load((ROOT / "configs/qwen3_moe_4l_rl.yaml").read_text()), 16)
         self.assertEqual(config["train"]["max_steps"], 5)
@@ -106,16 +106,18 @@ class ConfigureRunTests(unittest.TestCase):
         self.assertEqual(config["rollout"]["vllm"]["max_model_len"], 4096)
         self.assertEqual(config["data"]["max_prompt_length"], 768)
         self.assertEqual(config["rollout"]["max_new_tokens"], 2048)
-        capacities = [rule["replace"]["implementation"]["mc2_capacity"] for rule in config["train"]["plan_overrides"]
-                      if rule.get("replace", {}).get("implementation", {}).get("_target_", "").endswith(
-                          "unified_ep_compute_fn")]
-        self.assertEqual(capacities, [256])
+        experts = [rule["replace"]["implementation"] for rule in config["train"]["plan_overrides"]
+                   if rule.get("replace", {}).get("implementation", {}).get("_target_", "").endswith(
+                       "unified_ep_compute_fn")]
+        self.assertEqual(len(experts), 1)
+        self.assertEqual(set(experts[0]), {"_target_"})
 
     def test_invalid_budgets_fail_before_model_startup(self) -> None:
-        """Reject invalid context budgets and unsupported MC2 options."""
+        """Reject invalid context budgets and removed transport switches before model startup."""
         for overrides in ({"MAX_PROMPT": "512", "MAX_NEW_TOKENS": "1024", "MAX_MODEL_LEN": "1024"},
                           {"MC2_CAPACITY": "257"},
-                          {"INFERENCE_EP_BACKEND": "unsupported"}):
+                          {"INFERENCE_EP_BACKEND": "unsupported"}, {"INFERENCE_EP_BACKEND": "allgather"},
+                          {"EP_CAPACITY": "256"}, {"MC2_CAPACITY": "256"}):
             with self.subTest(overrides=overrides):
                 with patch.dict(os.environ, {"RUN_MODEL_PATH": "/models/full", **overrides}, clear=True):
                     with self.assertRaises(ValueError):
@@ -133,7 +135,7 @@ class ConfigureRunTests(unittest.TestCase):
         """CP peers share samples while PCP replicas each receive publication."""
         env = {"RUN_MODEL_PATH": "/models/full", "TRAIN_TP": "2", "TRAIN_CP": "2",
                "ROLLOUT_TP": "2", "ROLLOUT_PCP": "2", "TRAIN_EP": "2", "ROLLOUT_EP": "4",
-               "GLOBAL_PROMPT_BATCH_SIZE": "8", "INFERENCE_EP_BACKEND": "allgather"}
+               "GLOBAL_PROMPT_BATCH_SIZE": "8"}
         with patch.dict(os.environ, env, clear=True):
             config = CONFIGURE(yaml.safe_load((ROOT / "configs/qwen3_moe_4l_cp_rl.yaml").read_text()), 16)
         self.assertEqual(config["train"]["accelerator"]["cp"], 2)
@@ -144,10 +146,11 @@ class ConfigureRunTests(unittest.TestCase):
         self.assertEqual(config["rollout"]["vllm"]["data_parallel_size"], 4)
         self.assertEqual(config["rollout"]["vllm"]["decode_context_parallel_size"], 1)
         implementations = [r.get("replace", {}).get("implementation", {}) for r in config["train"]["plan_overrides"]]
-        self.assertIn("allgather", [i.get("inference_backend") for i in implementations])
+        self.assertTrue(all("inference_backend" not in item and "mc2_capacity" not in item
+                            for item in implementations))
 
     def test_context_recipe_defaults_and_larger_batches(self) -> None:
-        """Keep native recipe CP defaults; MC2 capacity is not a sequence limit."""
+        """Keep native recipe CP defaults without limiting tokens to an old transport capacity."""
         env = {"RUN_MODEL_PATH": "/models/full", "MAX_MODEL_LEN": "1024", "PREFILL_TOKENS": "512"}
         with patch.dict(os.environ, env, clear=True):
             config = CONFIGURE(yaml.safe_load((ROOT / "configs/qwen3_moe_4l_cp_rl.yaml").read_text()), 4)

@@ -30,11 +30,15 @@ def cards(output: str) -> dict:
     result = {}
     current = None
     for line in output.split("Process id", 1)[0].split("\n"):
-        match = re.match(r"\|\s*(\d+)\s+910B", line)
-        if match:
-            current = int(match[1])
         parts = line.split("|")
-        if current is not None and len(parts) > 3 and re.search(r"[0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:", parts[2]):
+        if len(parts) <= 3:
+            continue
+        if not re.search(r"[0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:", parts[2]):
+            header = re.fullmatch(r"\s*(\d+)\s+\S+\s*", parts[1])
+            if header:
+                current = int(header[1])
+            continue
+        if current is not None:
             numbers = [int(x) for x in re.findall(r"\d+", parts[3])]
             if len(numbers) == 5:
                 result[str(current)] = {"aicore": numbers[0], "hbm_mb": numbers[3], "capacity_mb": numbers[4]}

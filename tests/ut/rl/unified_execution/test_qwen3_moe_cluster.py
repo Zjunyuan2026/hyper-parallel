@@ -108,6 +108,35 @@ class ClusterLauncherTests(unittest.TestCase):
         self.assertEqual(plan["model_layers"], "full")
         self.assertFalse(plan["cpu_offload"])
 
+    def test_timing_summary_excludes_first_step_and_preserves_missing_data(self) -> None:
+        """Startup outliers and incomplete stage counters must not create a speedup claim."""
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            metrics = directory / "node0/run/steps.jsonl"
+            metrics.parent.mkdir(parents=True)
+            rows = [{"perf/time_per_step": 900, "timing_s/gen": 800},
+                    {"perf/time_per_step": 60, "timing_s/gen": 10, "timing_s/weight_sync": 30},
+                    {"perf/time_per_step": 70, "timing_s/gen": 20}]
+            metrics.write_text("\n".join(json.dumps(row) for row in rows))
+            result = CONTROLLER.summarize_timings(directory)
+        self.assertEqual(result["warm_step_samples"], 2)
+        self.assertEqual(result["mean_seconds"], {"perf/time_per_step": 65, "timing_s/gen": 15})
+
+    def test_summary_mode_reads_results_without_ssh_or_docker(self) -> None:
+        """Previously saved A3 runs remain readable without any runtime dependencies."""
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            (directory / "summary.json").write_text(json.dumps({"passed": False, "hosts": ["192.0.2.1"]}))
+            output = io.StringIO()
+            with patch.object(sys, "argv", [str(SCRIPT), "--summarize", str(directory)]), \
+                 patch.object(CONTROLLER, "execute", side_effect=AssertionError("unexpected remote call")), \
+                 contextlib.redirect_stdout(output):
+                CONTROLLER.main()
+            result = json.loads(output.getvalue())
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["warm_step_samples"], 0)
+        self.assertEqual(result["mean_seconds"], {})
+
     def test_success_requires_complete_steps_and_successful_exits_on_all_nodes(self) -> None:
         """A rank-zero success file alone must not hide partial training or a failed peer."""
         cases = ((3, True, 0, True), (2, True, 0, False), (3, False, 0, False), (3, True, 1, False))

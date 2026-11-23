@@ -158,7 +158,7 @@ def _validate(x, weight, bias, context):
     return axis
 
 
-def _forward(x, weight, bias, context, axis):
+def _forward(x, weight, bias, context, axis, *, two_leaf_rollout=False):
     """Compute local leaves, combine rank roots, then cast and add bias.
 
     x [..., K/TP] and weight [N, K/TP] produce flattened FP32 rank roots [M, N].
@@ -168,12 +168,20 @@ def _forward(x, weight, bias, context, axis):
     ordered = x.movedim(axis, 0)
     shape = list(ordered.shape[:-1])
     flat = ordered.reshape(-1, ordered.shape[-1])
-    partial = local_gemm(flat, weight, plan=context.plan,
-                         local_leaves=context.plan.num_leaves // context.world_size)
-
-    # Communicate rank roots without changing the predetermined reduction tree.
-    root = combine_partials(partial, context.group, context.world_size, context.rank,
-                            scatter=context.sequence_parallel, transport=context.transport)
+    if two_leaf_rollout:
+        # Each rank owns exactly one BF16 leaf. With only two operands, SUM
+        # has the same single rounding as the reference FP32 node cast to BF16.
+        # Keep the SP slice along the original sequence axis, before adding bias.
+        root = torch.nn.functional.linear(flat, weight)
+        dist.all_reduce(root, group=context.group)
+        if context.sequence_parallel:
+            local_rows = root.shape[0] // 2
+            root = root.narrow(0, context.rank * local_rows, local_rows)
+    else:
+        partial = local_gemm(flat, weight, plan=context.plan,
+                             local_leaves=context.plan.num_leaves // context.world_size)
+        root = combine_partials(partial, context.group, context.world_size, context.rank,
+                                scatter=context.sequence_parallel, transport=context.transport)
 
     # Casting and bias addition are part of the shared forward rounding contract.
     output = root.to(torch.bfloat16)
@@ -213,9 +221,10 @@ class _PikLinear(torch.autograd.Function):
 
 
 def pik_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None,
-               *, context: PikContext) -> torch.Tensor:
+               *, context: PikContext, rollout: bool = False) -> torch.Tensor:
     """Compute fixed-tree X@W.T using local K shards and a prepared static context.
 
+    Rollout may collapse a two-leaf tree into a BF16 SUM of its two BF16 leaves.
     SP returns this rank's slice along context.sequence_dim. Its backward gathers dY;
     replicated output backward expects the same full dY on TP ranks. Bias gradient is
     already complete and must not be summed across TP again. Gradients follow usual
@@ -225,4 +234,7 @@ def pik_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None 
     capture. The operator does not own or cache caller weights.
     """
     axis = _validate(x, weight, bias, context)
+    if (rollout and not torch.is_grad_enabled() and context.world_size == context.plan.num_leaves == 2
+            and context.plan.leaf_layout == "strided" and context.transport == "all_gather"):
+        return _forward(x, weight, bias, context, axis, two_leaf_rollout=True)
     return _PikLinear.apply(x, weight, bias, context, axis)

@@ -29,7 +29,7 @@ from hyper_parallel.distributed._builder.forward_rewriter import _ForwardRewrite
 from hyper_parallel.distributed.context_parallel.collectives import flex_cp_allgather
 from hyper_parallel.distributed.recipe_spec import inner_wrapper
 from rl.unified_execution.core.batch_invariant import normalize_policy, verify_batch_invariant
-from rl.unified_execution.core.validation import validate_attention_execution_path
+from rl.unified_execution.runtimes.hyper_parallel.validation import validate_attention_execution_path
 from rl.unified_execution.ops.attention.flash_attention_npu_v4 import (
     dense_attention,
     require_attention_provider,

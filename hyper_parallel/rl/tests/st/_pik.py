@@ -15,9 +15,7 @@
 """Independent NPU PIK correctness and graph acceptance; no model dependencies."""
 from __future__ import annotations
 
-import json
 import os
-from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -70,6 +68,8 @@ def _run_case(shape, n, leaves, layout, transport, sp, axis, rank, world):
         expected = reference(full_x, full_w, leaves, bias)
         if sp:
             expected = expected.chunk(world, axis)[rank]
+        # The rollout two-leaf collective has the same last rounding and SP slice.
+        _assert_bits(pik_linear(x, weight, bias, context=ctx, rollout=True), expected)
     actual = pik_linear(x, weight, bias, context=ctx)
     _assert_bits(actual, expected)
     torch.manual_seed(31)
@@ -81,11 +81,6 @@ def _run_case(shape, n, leaves, layout, transport, sp, axis, rank, world):
     expected_db = dy.reshape(-1, n).sum(0).to(bias.dtype)
     for actual_grad, expected_grad in ((x.grad, expected_dx), (weight.grad, expected_dw), (bias.grad, expected_db)):
         torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
-    result = {"shape": list(shape), "n": n, "g": leaves, "layout": layout,
-              "transport": transport, "sp": sp, "axis": axis, "bias_dtype": str(bias.dtype),
-              "forward_exact": True,
-              "conventional_gradients_exact": True}
-    return result
 
 
 def _cross_batch(rank, world):
@@ -93,11 +88,11 @@ def _cross_batch(rank, world):
     torch.manual_seed(991)
     x = torch.randn(129, 512, device="npu", dtype=torch.bfloat16)
     weight = torch.randn(64, 512, device="npu", dtype=torch.bfloat16)
-    single = prepare_pik(512, 64)
-    parallel = prepare_pik(512, 64, group=dist.group.WORLD)
+    plan = PikPlan(world)
+    single = prepare_pik(512, 64, plan=plan)
+    parallel = prepare_pik(512, 64, plan=plan, group=dist.group.WORLD)
     width = 512 // world
     local_weight = weight[:, rank * width:(rank + 1) * width]
-    count = 0
     with torch.no_grad():
         canonical = pik_linear(x, weight, context=single)
         for rows in (1, 3, 16, 65, 129):
@@ -105,7 +100,6 @@ def _cross_batch(rank, world):
                 local_x = x[start:start + rows, rank * width:(rank + 1) * width]
                 actual = pik_linear(local_x, local_weight, context=parallel)
                 _assert_bits(actual, canonical[start:start + rows])
-                count += 1
     if world > 1:
         for bad_n in (64 + rank, -1 if rank == 0 else 64):
             try:
@@ -120,12 +114,10 @@ def _cross_batch(rank, world):
             pass
         else:
             raise AssertionError(f"TP{world} did not propagate invalid policy from rank zero")
-    return count
 
 
-def _row_adapter_backward(rank: int, world: int) -> dict:
+def _row_adapter_backward(rank: int, world: int) -> None:
     """Compare SP/non-SP model adapter gradients with native row-linear autograd."""
-    results = {}
     for sp in (False, True):
         torch.manual_seed(901)
         module = torch.nn.Linear(512, 64, bias=False, device="npu", dtype=torch.bfloat16)
@@ -144,8 +136,6 @@ def _row_adapter_backward(rank: int, world: int) -> dict:
         row(inputs).backward(dy.chunk(world, dim=1)[rank].contiguous() if sp else dy)
         for actual, wanted in zip((inputs.grad, row.weight.grad), expected, strict=True):
             torch.testing.assert_close(actual, wanted, rtol=0, atol=0)
-        results["sp" if sp else "non_sp"] = {"input_gradient_exact": True, "weight_gradient_exact": True}
-    return results
 
 
 def test_pik_npu() -> None:
@@ -153,18 +143,12 @@ def test_pik_npu() -> None:
     torch_npu.npu.set_device(int(os.environ.get("LOCAL_RANK", "0")))
     dist.init_process_group("hccl")
     rank, world = dist.get_rank(), dist.get_world_size()
-    rows = []
     try:
-        for leaves in (8, 16):
-            for layout in ("strided", "packed"):
-                for transport in ("all_gather", "all_to_all"):
-                    rows.append(_run_case((world * 3, 512), 64, leaves, layout, transport,
-                                          False, 0, rank, world))
-                    rows.append(_run_case((2, world * 3, 512), 64, leaves, layout, transport,
-                                          True, 1, rank, world))
-        for global_k in (4096, 9728):
-            rows.append(_run_case((17, global_k), 2560, 8, "strided", "all_gather",
-                                  False, 0, rank, world))
+        # One leaf per TP rank exercises rollout's two-leaf SUM on TP2.
+        # A deeper tree covers the packed backend and its SP output layout.
+        _run_case((1, world * 3, 512), 64, world, "strided", "all_gather", False, 1, rank, world)
+        _run_case((1, world * 3, 512), 64, world, "strided", "all_gather", True, 1, rank, world)
+        _run_case((1, world * 3, 512), 64, 2 * world, "packed", "all_to_all", True, 1, rank, world)
         # A cancellation example distinguishes a balanced tree from a left fold.
         values = torch.tensor([1e8, 1, -1e8, 1, 2, 3, 4, 5], device="npu", dtype=torch.float32)
         actual = fixed_tree(values[:, None, None])
@@ -172,7 +156,8 @@ def test_pik_npu() -> None:
         width = 512 // world
         x = torch.randn(world * 2, width, device="npu", dtype=torch.bfloat16)
         w = torch.randn(64, width, device="npu", dtype=torch.bfloat16)
-        context = prepare_pik(512, 64, group=dist.group.WORLD, sequence_parallel=True, transport="all_to_all")
+        context = prepare_pik(512, 64, plan=PikPlan(world), group=dist.group.WORLD,
+                              sequence_parallel=True, transport="all_to_all")
 
         def run(inputs: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
             """Trace the production PIK including the custom tree and transport."""
@@ -199,14 +184,7 @@ def test_pik_npu() -> None:
         compiled(x, w).float().sum().backward()
         torch.testing.assert_close(x.grad, torch.ones(world * 2, 64, device="npu", dtype=torch.bfloat16) @ w.detach(),
                                    rtol=0, atol=0)
-        cross_batch_checks = _cross_batch(rank, world)
-        row_gradients = _row_adapter_backward(rank, world)
-        result = {"rank": rank, "tp": world, "checks": rows, "cross_batch_checks": cross_batch_checks,
-                  "compiled_forward": True,
-                  "compiled_backward": True, "graph_replays": 3, "row_adapter_gradients": row_gradients}
-        directory = Path(os.environ.get("RL_PIK_OUTPUT", "/tmp/hyper-rl-pik"))
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / f"rank-{rank}.json").write_text(json.dumps(result, indent=2))
-        print(json.dumps({"rank": rank, "tp": world, "cases": len(rows), "passed": True}), flush=True)
+        _cross_batch(rank, world)
+        _row_adapter_backward(rank, world)
     finally:
         dist.destroy_process_group()

@@ -19,6 +19,15 @@ rm -f /results/run/consistency.json
 printf "%s\n" "${V4_WHEEL_SHA256}" > /results/run/v4-wheel.sha256
 unset VLLM_PLUGINS
 export PYTHONPATH=/opt/hp-v4:/workspace/hyper_parallel/rl:/workspace:${PYTHONPATH:-}
+# Resolve before Torch import, using the effective offload override and local ranks only.
+cpu_overrides=()
+if [[ -v CPU_OFFLOAD ]]; then cpu_overrides+=("--train.accelerator.cpu_offload=${CPU_OFFLOAD}"); fi
+for option in "$@"; do
+    if [[ $option == --train.accelerator.cpu_offload=* ]]; then cpu_overrides+=("$option"); fi
+done
+cpu_threads=$(python -m rl.utils.cpu_threads --config /run-config.yaml \
+    --local-world-size "$DEVICE_COUNT" --report /results/run/cpu-threads.json "${cpu_overrides[@]}")
+export OMP_NUM_THREADS="$cpu_threads" MKL_NUM_THREADS="$cpu_threads"
 python -m pip install --no-deps --no-compile --target /opt/hp-v4 /wheels/*.whl
 # Keep editable metadata in the container; source remains the mounted checkout.
 mkdir /tmp/hp-install

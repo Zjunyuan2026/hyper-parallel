@@ -35,6 +35,7 @@ import torch.distributed as dist
 
 from rl.data.contracts import RouterTrace, resize_router_trace
 from rl.unified_execution.core.batch_invariant import verify_batch_invariant
+from rl.utils.cpu_threads import configure_inference_cpu_threads
 from rl.workers.engine.model import (
     ModelRegistration,
     VLLMModelRegistration,
@@ -992,6 +993,7 @@ class VLLMGenerationEngine:
                 and os.environ.get("VLLM_BATCH_INVARIANT") == "1"):
             raise ValueError("Unified Level 3 conflicts with inherited VLLM_BATCH_INVARIANT=1")
         server_environment = os.environ.copy()
+        configure_inference_cpu_threads(server_environment)
         if int(self._config.get("context_parallel_size", 1)) > 1:
             server_environment["VLLM_USE_V2_MODEL_RUNNER"] = "1"
         for variable in _DISTRIBUTED_ENVIRONMENT_VARIABLES:

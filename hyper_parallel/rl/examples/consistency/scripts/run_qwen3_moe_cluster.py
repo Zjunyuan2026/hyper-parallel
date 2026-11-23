@@ -22,9 +22,11 @@ import argparse
 import hashlib
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import signal
+import statistics
 import subprocess
 import tarfile
 import tempfile
@@ -38,6 +40,28 @@ ROOT = Path(__file__).resolve().parents[5]
 SCRIPTS = "hyper_parallel/rl/examples/consistency/scripts"
 WHEEL = "flash_attn_npu-0.5.0+hpbi1-cp312-cp312-linux_aarch64.whl"
 WHEEL_SHA256 = "5ef04a872b1be2c812bb0c36c17ba4776a4b5f9b9eabb24eab0a56a139a497c9"
+
+
+def summarize_timings(directory: Path) -> dict:
+    """Read global-rank-zero metrics without treating missing measurements as zero."""
+    path = directory / "node0/run/steps.jsonl"
+    rows = ([json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            if path.is_file() else [])
+    warm = rows[1:]
+    keys = sorted({key for row in warm for key in row
+                   if key.startswith("timing_s/") or key == "perf/time_per_step"})
+    means = {}
+    for key in keys:
+        values = [row.get(key) for row in warm]
+        if all(isinstance(value, (int, float)) and not isinstance(value, bool)
+               and math.isfinite(value) and value >= 0 for value in values):
+            means[key] = statistics.mean(values)
+    tokens = [row.get("rollout/generated_tokens") for row in warm]
+    generated = (sum(tokens) if tokens and all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                                             and math.isfinite(value) and value >= 0 for value in tokens) else None)
+    return {"recorded_steps": len(rows), "warm_step_samples": len(warm), "mean_seconds": means,
+            "warm_generated_tokens": generated,
+            "timing_scope": "Excludes first step, container setup and model startup; not full-dataset throughput"}
 
 
 def stage_source(directory: Path, wheel: Path) -> tuple[Path, str]:
@@ -102,7 +126,11 @@ def docker_command(args: argparse.Namespace, node_rank: int, address: str,
         "ASCEND_RT_VISIBLE_DEVICES": ",".join(map(str, range(16))),
         "HCCL_SOCKET_IFNAME": args.interface, "GLOO_SOCKET_IFNAME": args.interface,
         "HCCL_NPU_SOCKET_PORT_RANGE": "auto", "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
-        "HCCL_DETERMINISTIC": "true", "HCCL_BUFFSIZE": "512", "OMP_NUM_THREADS": "1",
+        "HCCL_DETERMINISTIC": "true", "HCCL_BUFFSIZE": "512",
+        "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "auto"),
+        "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS", "auto"),
+        "HYPER_RL_CPU_RESERVE": os.environ.get("HYPER_RL_CPU_RESERVE", "auto"),
+        "HYPER_RL_VLLM_CPU_THREADS": os.environ.get("HYPER_RL_VLLM_CPU_THREADS", "1"),
         "VLLM_HOST_IP": "127.0.0.1", "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
         "HYPER_RL_DIAGNOSTICS_DIR": "/results/run", "V4_WHEEL_SHA256": WHEEL_SHA256,
         "RESULT_UID": str(os.getuid()), "RESULT_GID": str(os.getgid()), "PLOT_TRAINING": "false",
@@ -175,7 +203,13 @@ def run(args: argparse.Namespace) -> Path:
                         (directory / f"node{index}.log").write_text(output.stdout + output.stderr, encoding="utf-8")
                 except (subprocess.SubprocessError, OSError) as error:
                     print(f"{command[1]} incomplete for {host}/{name}: {error}", flush=True)
+        try:
+            result.update(summarize_timings(directory))
+        except (OSError, ValueError) as error:
+            result["timing_error"] = str(error)
         (directory / "summary.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+        timing_keys = ("warm_step_samples", "mean_seconds", "warm_generated_tokens", "timing_error")
+        print("CLUSTER_TIMING", json.dumps({key: result[key] for key in timing_keys if key in result}), flush=True)
         print("CLUSTER_RESULT", json.dumps({"passed": result["passed"], "directory": str(directory)}), flush=True)
     if not result["passed"]:
         raise RuntimeError(f"Cluster training failed; inspect {directory}/node*.log and node*/run")
@@ -185,9 +219,10 @@ def run(args: argparse.Namespace) -> Path:
 def main() -> None:
     """Parse a portable controller command; dry-run never contacts hosts or loads models."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--hosts", required=True, type=lambda value: value.split(","))
+    parser.add_argument("--hosts", type=lambda value: value.split(","))
     parser.add_argument("--select-nodes", type=int, default=4)
-    parser.add_argument("--master-addr", required=True)
+    parser.add_argument("--master-addr")
+    parser.add_argument("--summarize", type=Path, help="Read saved timing and acceptance without launching anything")
     parser.add_argument("--interface", default="data0.172")
     parser.add_argument("--master-port", type=int, default=29751)
     parser.add_argument("--image", default="hyper-rl:consistency-v0.30.0-cann9.2.1-a3-runtime-arm64")
@@ -201,6 +236,15 @@ def main() -> None:
     parser.add_argument("--timeout", type=int, default=14400)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if args.summarize is not None:
+        directory = args.summarize.resolve()
+        result = json.loads((directory / "summary.json").read_text(encoding="utf-8"))
+        result = {key: result.get(key) for key in ("passed", "hosts", "revision", "steps")}
+        result.update(directory=str(directory), **summarize_timings(directory))
+        print(json.dumps(result, indent=2), flush=True)
+        return
+    if not args.hosts or not args.master_addr:
+        parser.error("--hosts and --master-addr are required to launch training")
     for address in [*args.hosts, args.master_addr]:
         ipaddress.IPv4Address(address)
     if (len(set(args.hosts)) != len(args.hosts) or not 2 <= args.select_nodes <= len(args.hosts)
