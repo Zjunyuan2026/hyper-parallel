@@ -44,6 +44,10 @@ class FormalPlotTests(unittest.TestCase):
             }))
             rows = [{"step": step, "reward/mean": 0.5, "train/total_loss": -0.1,
                      "perf/time_per_step": 100.0} for step in (1, 2)]
+            rows[-1].update({"validation/accuracy": 0.734, "validation/total": 500, "validation/correct": 367})
+            (root / "evaluations.jsonl").write_text(json.dumps({
+                "step": 0, "validation/accuracy": 0.6, "validation/total": 500, "validation/correct": 300,
+            }) + "\n")
             (root / "steps.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
             result = sys.modules["plot_training"].render(root, root / "plots")
             self.assertTrue(result["accepted"])
@@ -51,7 +55,12 @@ class FormalPlotTests(unittest.TestCase):
             self.assertIsNone(result["strict_zero_for_all_recorded_steps"])
             self.assertFalse((root / "plots/consistency.png").exists())
             self.assertTrue((root / "plots/step-time.png").is_file())
-            self.assertEqual(len(list((root / "plots").glob("*.png"))), 6)
+            self.assertEqual(len(list((root / "plots").glob("*.png"))), 7)
+            self.assertTrue(result["final_test_verified"])
+            self.assertEqual(result["final_test_accuracy"], 0.734)
+            self.assertEqual([row["step"] for row in result["test_evaluations"]], [0, 2])
+            for name in ("test-accuracy.svg", "training-curves.svg"):
+                self.assertIn("73.40% (367/500)", (root / "plots" / name).read_text(encoding="utf-8"))
             for path in (root / "plots").glob("*.png"):
                 width, height = struct.unpack(">II", path.read_bytes()[16:24])
                 self.assertEqual(width * 4, height * 6)
@@ -73,7 +82,7 @@ class FormalPlotTests(unittest.TestCase):
             self.assertEqual(len(list((root / "plots").glob("*.svg"))), 8)
             self.assertIn("No complete test evidence", (root / "plots/overview.svg").read_text(encoding="utf-8"))
             sys.modules["plot_training"].render(root, root / "ordinary")
-            for folder, expected in ((root / "plots", 8), (root / "ordinary", 6)):
+            for folder, expected in ((root / "plots", 8), (root / "ordinary", 7)):
                 self.assertEqual(len(list(folder.glob("*.png"))), expected)
                 self.assertEqual(len(list(folder.glob("*.svg"))), expected)
                 for path in folder.glob("*.png"):
@@ -82,3 +91,5 @@ class FormalPlotTests(unittest.TestCase):
                 for path in folder.glob("*.svg"):
                     attributes = ElementTree.parse(path).getroot().attrib
                     self.assertAlmostEqual(float(attributes["width"][:-2]) / float(attributes["height"][:-2]), 1.5)
+            self.assertIn("Final test result unavailable",
+                          (root / "ordinary/test-accuracy.svg").read_text(encoding="utf-8"))

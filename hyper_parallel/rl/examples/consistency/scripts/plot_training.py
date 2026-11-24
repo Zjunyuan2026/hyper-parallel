@@ -24,7 +24,7 @@ import yaml
 from matplotlib.axes import Axes
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
-from matplotlib.ticker import MaxNLocator
+from matplotlib.ticker import MaxNLocator, PercentFormatter
 
 
 def read_rows(path: Path) -> list[dict]:
@@ -105,6 +105,15 @@ def topology_caption(directory: Path) -> str:
             f'SP={rollout.get("sequence_parallel", False)}')
 
 
+def read_evaluations(directory: Path, rows: list[dict]) -> list[dict]:
+    """Include step-zero evaluation and retain compatibility with older per-step logs."""
+    path = directory / "evaluations.jsonl"
+    saved = ([json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+             if path.is_file() else [])
+    by_step = {row["step"]: row for row in [*rows, *saved] if "validation/accuracy" in row}
+    return [by_step[step] for step in sorted(by_step)]
+
+
 def moving_average(values: list[float], window: int) -> list[float]:
     """Average trailing steps; use available initial steps and preserve invalid-window gaps."""
     if window < 1:
@@ -153,6 +162,17 @@ def draw_panel(axis: Axes, kind: str, rows: list[dict], status: dict, smooth_win
     elif kind == "step-time":
         draw_series(axis, rows, (("perf/time_per_step", "Training step time", "#2563eb"),))
         axis.set_ylabel("Seconds")
+    elif kind == "test-accuracy":
+        evaluations = status.get("test_evaluations", [])
+        draw_series(axis, evaluations, (("validation/accuracy", "GSM8K test accuracy", "#2563eb"),))
+        axis.set_ylabel("Test accuracy")
+        axis.yaxis.set_major_formatter(PercentFormatter(xmax=1))
+        axis.set_ylim(0, 1)
+        accuracy = status.get("final_test_accuracy")
+        label = (f'Final test: {accuracy:.2%} ({status["final_test_correct"]}/{status["final_test_total"]})'
+                 if accuracy is not None else "Final test result unavailable")
+        axis.text(0.03, 0.06, label, transform=axis.transAxes, fontsize=10,
+                  bbox={"facecolor": "white", "alpha": 0.9, "edgecolor": "#d1d5db"})
     else:
         draw_series(axis, rows, (("training/rollout_log_probs_diff_max", "Max logp difference", "#059669"),
                                 ("training/rollout_log_probs_diff_mean", "Mean logp difference", "#2563eb")))
@@ -168,7 +188,7 @@ def draw_panel(axis: Axes, kind: str, rows: list[dict], status: dict, smooth_win
                          marker="x", color="#dc2626", label="Invalid evidence or nonzero difference", zorder=5)
             axis.legend(fontsize=8)
     requested = status["requested_steps"] or len(rows)
-    axis.set_xlim(0.5, max(requested, len(rows)) + 0.5)
+    axis.set_xlim(-0.5 if kind == "test-accuracy" else 0.5, max(requested, len(rows)) + 0.5)
     axis.set_title(kind.capitalize(), loc="left", fontsize=11)
 
 
@@ -185,7 +205,7 @@ def _save_figure(output: Path, kind: str, rows: list[dict], status: dict, headin
     for axis, panel in zip(axes, panels if dashboard else (panel_kind,)):
         draw_panel(axis, panel, rows, status, smooth_window)
     if dashboard:
-        axes[-1].axis("off")
+        draw_panel(axes[-1], "test-accuracy", rows, status)
     caption = "\n".join(textwrap.fill(line, width=100 if dashboard else 65) for line in heading.splitlines())
     figure.suptitle(caption, fontsize=10, color="#166534" if status["accepted"] else "#b45309")
     for extension in ("png", "svg"):
@@ -199,13 +219,24 @@ def render(directory: Path, output: Path, smooth_window: int = 5) -> dict:
         raise ValueError("Smoothing window must be positive")
     rows = read_rows(directory / "steps.jsonl")
     status = run_status(directory, rows)
+    evaluations = read_evaluations(directory, rows)
+    final = next((row for row in evaluations if row["step"] == status["requested_steps"]), {})
+    accuracy = number(final, "validation/accuracy")
+    total = number(final, "validation/total")
+    correct = number(final, "validation/correct")
+    valid = (math.isfinite(accuracy) and 0 <= accuracy <= 1 and total == 500
+             and math.isfinite(correct) and 0 <= correct <= total and correct == int(correct)
+             and math.isclose(accuracy, correct / total, abs_tol=1e-12))
+    status.update(test_evaluations=evaluations, final_test_accuracy=accuracy if valid else None,
+                  final_test_total=int(total) if valid else None, final_test_correct=int(correct) if valid else None,
+                  final_test_verified=bool(valid and status["completed_run"]))
     output.mkdir(parents=True, exist_ok=True)
     caption = topology_caption(directory)
     heading = (f'{status["status"]}: {len(rows)}/{status["requested_steps"] or "?"} recorded steps\n'
                + caption)
     timing_or_consistency = "step-time" if status.get("strict_consistency_enabled") is False else "consistency"
-    figures = ("reward", "loss", timing_or_consistency, "training-curves", "reward-raw", "loss-raw")
-    for kind in figures[:4]:
+    figures = ("reward", "loss", timing_or_consistency, "training-curves", "test-accuracy", "reward-raw", "loss-raw")
+    for kind in figures[:5]:
         _save_figure(output, kind, rows, status, heading, smooth_window)
     for kind in ("reward-raw", "loss-raw"):
         _save_figure(output, kind, rows, status, heading, 1)

@@ -207,7 +207,8 @@ def docker_command(args: argparse.Namespace, node_rank: int, address: str,
     if getattr(args, "baseline_5step", False):
         environment.update(BASELINE_5STEP="true", PREFILL_TOKENS="8192")
     if getattr(args, "native_baseline", False):
-        environment.update(NATIVE_BASELINE="true", PREFILL_TOKENS="8192", CPU_OFFLOAD="false", TRAIN_SP="false")
+        environment.update(NATIVE_BASELINE="true", PREFILL_TOKENS="8192", CPU_OFFLOAD="false",
+                           TRAIN_SP="false", TRAIN_CP="2")
     if getattr(args, "baseline_5step", False) or getattr(args, "native_baseline", False):
         environment.pop("KV_CACHE_MEMORY_BYTES", None)
         environment["MAX_NUM_SEQS"] = "64"
@@ -302,7 +303,8 @@ def run(args: argparse.Namespace) -> Path:
         for index, host in enumerate(args.hosts):
             require_idle(execute(host, index == 0, ["npu-smi", "info"]).stdout, host)
     plan = {"hosts": args.hosts, "addresses": addresses, "image_id": image_id, "revision": revision,
-            "world_size": len(args.hosts) * 16, "training": "TP4/CP2/EP4; DP=world/8; EDP=world/4",
+            "world_size": len(args.hosts) * 16,
+            "training": "TP4/CP2/EP4; DP=world/8; EDP=world/4",
             "rollout_per_node": ("native TP2/DP8/EP16" if getattr(args, "native_baseline", False)
                                  else "TP2/DP8/EP16" if getattr(args, "baseline_5step", False)
                                  else "TP2/DP8/EP8"), "cpu_offload": args.cpu_offload,
@@ -371,6 +373,9 @@ def run(args: argparse.Namespace) -> Path:
                     verified = verified and path.is_file() and path.stat().st_size > 0
             result["plots_verified"] = verified
             result["passed"] = result["passed"] and verified
+            if getattr(args, "baseline_5step", False) or getattr(args, "native_baseline", False):
+                result["final_test_verified"] = evidence.get("final_test_verified") is True
+                result["passed"] = result["passed"] and result["final_test_verified"]
     finally:
         for index, host, name in launched:
             for command in (["docker", "logs", name], ["docker", "rm", "-f", name]):

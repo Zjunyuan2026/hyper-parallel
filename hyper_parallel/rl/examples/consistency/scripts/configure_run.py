@@ -184,10 +184,10 @@ def configure(config: dict, world: int) -> dict:
                                    save_final=False, verify_reload=False, load_path=None)
     if boolean("NATIVE_BASELINE", False):
         if (boolean("BASELINE_5STEP", False) or boolean("FORMAL_GSM8K", False)
-                or world != 64 or dp_size != 8 or not 1 <= train["max_steps"] <= 50
-                or runner != "internal" or train["prompt_batch_size"] != 16
+                or world != 64 or train_tp != 4 or train_cp != 2 or dp_size != 8
+                or not 1 <= train["max_steps"] <= 50 or runner != "internal" or train["prompt_batch_size"] != 16
                 or candidates != 8 or train["micro_batch_size"] != 2 or mini != 128):
-            raise ValueError("Native baseline requires 64 ranks, 1..50 steps, batch 128 and micro/mini=2/128")
+            raise ValueError("Native baseline requires TP4/CP2/DP8, 1..50 steps, batch 128 and micro/mini=2/128")
         native_path = Path(__file__).resolve().parents[2] / "gsm8k/configs/qwen3_30b_a3b_gsm8k_vllm.yaml"
         native = yaml.safe_load(native_path.read_text())
         config.pop("consistency", None)

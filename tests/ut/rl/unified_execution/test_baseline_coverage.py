@@ -15,12 +15,17 @@
 """Audit full-epoch coverage using the production sampler and actual baseline observer."""
 
 import ast
+import csv
 import json
+import logging
+import os
 import random
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[4]
 
@@ -37,6 +42,21 @@ def load_class(path: str, name: str, bindings: dict):
 
 class BaselineCoverageTests(unittest.TestCase):
     """Accept real DP sample order, and reject duplicates and incomplete epochs."""
+
+    def test_observer_retains_initial_and_final_test_results(self) -> None:
+        observer_type = load_class("hyper_parallel/rl/examples/consistency/scripts/run_consistency.py",
+                                   "MetricsObserver", {"os": os, "json": json, "csv": csv,
+                                                       "logging": logging, "time": time})
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {"RANK": "0"}):
+            root = Path(temporary)
+            observer = observer_type(SimpleNamespace(log=lambda *_args, **_kwargs: None), root)
+            observer.log({"validation/accuracy": 0.6, "validation/total": 500, "validation/correct": 300}, step=0)
+            self.assertFalse((root / "steps.jsonl").exists())
+            observer.log({"reward/mean": 0.2}, step=1)
+            observer.log({"validation/accuracy": 0.734, "validation/total": 500, "validation/correct": 367}, step=2)
+            evaluations = [json.loads(line) for line in (root / "evaluations.jsonl").read_text().splitlines()]
+            self.assertEqual([row["step"] for row in evaluations], [0, 2])
+            self.assertEqual(evaluations[-1]["validation/accuracy"], 0.734)
 
     def test_pilot_and_full_epoch_coverage(self) -> None:
         for steps in (2, 5, 50):

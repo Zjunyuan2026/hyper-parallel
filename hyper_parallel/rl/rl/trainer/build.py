@@ -14,56 +14,88 @@
 # ============================================================================
 """The sole construction boundary for all RL training modes."""
 import functools
-import os
 import json
 import logging
-from pathlib import Path
+import os
 import random
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, Mapping, Optional
+
 import torch
 import torch.distributed as dist
-from rl.workers.targets import TargetPreparer
-from rl.workers.engine.residency import TrainingResidency
+
+from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo
+from hyper_parallel.trainer.config import normalize_distributed_setup_overrides
+from hyper_parallel.trainer.runtime.distributed import (
+    create_distributed_setup_from_config,
+    initialize_distributed,
+)
 from rl.agentic.codex import CodexRuntime
 from rl.agentic.ds_harness import DeepSeekRuntime
 from rl.algorithm.distillation import compose_training_algorithm
 from rl.algorithm.loss import build_algorithm
-from rl.distillation.config import parse_distillation_config
-from rl.distillation.teacher import TeacherManager
-from rl.trainer.checkpoint import CheckpointResources, RLCheckpointManager
-from rl.config.schema import build_model_registration, required_mapping, router_replay_mode, uses_colocated_vllm
-from rl.config.resolve import build_runtime_config, resolve_router_replay_config, resolve_unified_execution_config
 from rl.config.limits import resolve_vllm_automatic_limits
+from rl.config.resolve import (
+    build_runtime_config,
+    resolve_router_replay_config,
+    resolve_unified_execution_config,
+)
+from rl.config.schema import (
+    build_model_registration,
+    required_mapping,
+    router_replay_mode,
+    uses_colocated_vllm,
+)
 from rl.config.validate import validate_config
 from rl.data.experience import ExperiencePreparer
-from rl.data.prompts import PromptDataset, build_train_dataloader, collate_prompt_samples
-from rl.trainer.evaluation import Evaluator
-from rl.reward_model import RewardModelClient, load_reward_function, scorer_fingerprint
-from rl.rollout.topology import resolve_vllm_rollout_topology
-from rl.workers.engine.model import load_tokenizer, build_role_model
-from rl.workers.engine.optimizer import build_role_optimizer
-from rl.workers.engine.offload import TrainingStateOffload
-from rl.workers.actor import Actor
-from rl.workers.critic import Critic
-from rl.workers.adapters.router_adapter import install_router_replay
-from rl.rollout.registry import build_rollout_engine
-from rl.rollout.manager import CodexRolloutManager, DeepSeekRolloutManager, RolloutManager
-from rl.utils.monitoring.tracker import TrainingTracker
-from rl.utils.monitoring.config import sanitize_config
-from rl.trainer.state import RLTrainerState
-from rl.trainer.distributed import run_synchronized
-from rl.trainer.lifecycle import RunLifecycle
-from rl.weight_sync.publication import PolicyPublication
+from rl.data.prompts import (
+    PromptDataset,
+    build_train_dataloader,
+    collate_prompt_samples,
+)
+from rl.distillation.config import parse_distillation_config
 from rl.distillation.runtime import TeacherScorer
+from rl.distillation.teacher import TeacherManager
+from rl.reward_model import RewardModelClient, load_reward_function, scorer_fingerprint
 from rl.reward_model.runtime import RewardScorer
+from rl.rollout.manager import (
+    CodexRolloutManager,
+    DeepSeekRolloutManager,
+    RolloutManager,
+)
+from rl.rollout.registry import build_rollout_engine
+from rl.rollout.topology import resolve_vllm_rollout_topology
+from rl.trainer.checkpoint import CheckpointResources, RLCheckpointManager
+from rl.trainer.distributed import run_synchronized
+from rl.trainer.evaluation import Evaluator
+from rl.trainer.lifecycle import RunLifecycle
+from rl.trainer.state import RLTrainerState
+from rl.unified_execution.core.batch_invariant import (
+    initialize_batch_invariant,
+    verify_batch_invariant,
+)
+from rl.unified_execution.runtimes.hyper_parallel.attention import (
+    guard_training_numerics,
+    install_training_attention,
+)
 from rl.unified_execution.runtimes.hyper_parallel.moe import validate_training_ep
-from rl.unified_execution.runtimes.hyper_parallel.validation import capture_training_structure
-from rl.unified_execution.runtimes.hyper_parallel.attention import guard_training_numerics, install_training_attention
-from rl.unified_execution.core.batch_invariant import initialize_batch_invariant, verify_batch_invariant
-from hyper_parallel.core.fully_shard.hsdp_utils import GroupInfo
-from hyper_parallel.trainer.config import normalize_distributed_setup_overrides
-from hyper_parallel.trainer.runtime.distributed import create_distributed_setup_from_config, initialize_distributed
+from rl.unified_execution.runtimes.hyper_parallel.validation import (
+    capture_training_structure,
+)
+from rl.utils.monitoring.config import sanitize_config
+from rl.utils.monitoring.tracker import TrainingTracker
+from rl.weight_sync.publication import PolicyPublication
+from rl.workers.actor import Actor
+from rl.workers.adapters.context_parallel import bind_native_context_parallel
+from rl.workers.adapters.router_adapter import install_router_replay
+from rl.workers.critic import Critic
+from rl.workers.engine.model import build_role_model, load_tokenizer
+from rl.workers.engine.offload import TrainingStateOffload
+from rl.workers.engine.optimizer import build_role_optimizer
+from rl.workers.engine.residency import TrainingResidency
+from rl.workers.targets import TargetPreparer
+
 
 def _configure_batch_invariant_communication(config: Mapping[str, Any]) -> None:
     """Align HCCL options before Trainer and rollout process groups initialize."""
@@ -416,6 +448,10 @@ class _TrainerBuilder:
             self._install_unified_training(actor_model, unified) # Replace V4 shared kernel
         self._record_role_config("actor", self.runtime_config, self.distributed_setup)
         reference_model = self._build_reference_model(train_config)
+        if unified is None and self.parallel_dims.cp_size > 1:
+            bind_native_context_parallel(actor_model, self.mesh["cp"])
+            if reference_model is not None:
+                bind_native_context_parallel(reference_model, self.mesh["cp"])
         if reference_model is not None and unified is not None:
             self._install_unified_training(reference_model, unified)
         critic_model = None

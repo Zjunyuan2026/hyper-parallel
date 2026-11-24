@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""CPU-only native control-path tests without importing Torch or creating process groups."""
+"""CPU native control-path and CP coordinate tests without creating process groups."""
 
 import ast
 import json
@@ -20,17 +20,24 @@ import os
 import tempfile
 import time
 import unittest
+from collections.abc import Mapping
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+
+import torch
+import yaml
+from torch.nn import functional
 
 ROOT = Path(__file__).resolve().parents[4]
 
 
 def load_function(path: str, name: str, bindings: dict):
     """Compile the actual function with mocked optional runtime dependencies."""
-    tree = ast.parse((ROOT / path).read_text())
-    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == name)
+    tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
+    function = next(node for node in tree.body
+                    if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name == name)
     future = ast.parse("from __future__ import annotations").body
     module = ast.fix_missing_locations(ast.Module(body=[*future, function], type_ignores=[]))
     exec(compile(module, path, "exec"), bindings)
@@ -39,6 +46,88 @@ def load_function(path: str, name: str, bindings: dict):
 
 class NativeBaselineTests(unittest.TestCase):
     """Verify native admission and reporting without weakening unified probability gates."""
+
+    def test_native_cp_masks_boundary_targets_and_gradients(self) -> None:
+        """Real CPU tensors verify both shards against the global next-token computation."""
+        bindings = {"torch": torch, "functional": functional, "DataLoaderParallelContext": SimpleNamespace}
+        load_function("hyper_parallel/data/parallel/batch_parallel.py", "CPBatchSharder", bindings)
+        path = "hyper_parallel/rl/rl/workers/adapters/context_parallel.py"
+        bind = load_function(path, "bind_native_context_parallel", bindings)
+        compute = load_function(path, "compute_cp_token_log_probs", bindings)
+        prepare_mask = load_function(
+            "hyper_parallel/models/qwen3_moe/adapter/distributed/context_parallel.py",
+            "_prepare_qwen3_moe_flash_attention_cp_mask", {"torch": torch})
+        sequences = torch.tensor([[0, 0, 2, 3, 4, 5, 6, 7], [0, 1, 2, 3, 4, 5, 6, 7]])
+        padding_mask = sequences.ne(0)
+        weights = torch.arange(64, dtype=torch.float32).reshape(8, 8).div(16).requires_grad_()
+        reference_weights = weights.detach().clone().requires_grad_()
+        calls = []
+
+        class Model:
+            config = SimpleNamespace(model_type="qwen3_moe")
+
+            def __call__(self, **kwargs):
+                calls.append(kwargs)
+                return {"logits": weights[kwargs["input_ids"]]}
+
+        model = Model()
+        parts = []
+        for rank in range(2):
+            mesh = SimpleNamespace(size=lambda: 2, get_local_rank=lambda rank=rank: rank)
+            bind(model, mesh)
+            self.assertIs(model.unified_cp_mesh, mesh)
+            parts.append(compute(model, sequences, padding_mask, mesh))
+            call = calls[-1]
+            torch.testing.assert_close(call["input_ids"], sequences[:, rank * 4:(rank + 1) * 4])
+            torch.testing.assert_close(call["position_ids"], torch.arange(rank * 4, (rank + 1) * 4).view(1, 4))
+            self.assertFalse(call["use_cache"])
+            mask = call["attention_mask"]
+            self.assertEqual(mask.shape, (2, 1, 4, 8))
+            expected = ((torch.arange(8).view(1, 1, 1, 8)
+                         <= torch.arange(rank * 4, (rank + 1) * 4).view(1, 1, 4, 1))
+                        & padding_mask.view(2, 1, 1, 8))
+            torch.testing.assert_close(mask, expected)
+            self.assertIs(prepare_mask(mask, 4, 8, rank * 4, sequences.device, True), mask)
+        actual = torch.cat(parts, dim=1)[:, :-1]
+        expected = reference_weights[sequences].log_softmax(-1)[:, :-1].gather(
+            -1, sequences[:, 1:].unsqueeze(-1)).squeeze(-1)
+        torch.testing.assert_close(actual, expected)
+        # Query 3 on rank 0 must predict token 4 on rank 1, with gradients retained.
+        torch.testing.assert_close(parts[0][:, -1], expected[:, 3])
+        actual.sum().backward()
+        expected.sum().backward()
+        torch.testing.assert_close(weights.grad, reference_weights.grad)
+        with self.assertRaisesRegex(ValueError, "CP2"):
+            bind(model, SimpleNamespace(size=lambda: 1))
+        model.config = SimpleNamespace(model_type="other")
+        with self.assertRaisesRegex(ValueError, "Qwen3 MoE"):
+            bind(model, SimpleNamespace(size=lambda: 2))
+
+    def test_actual_native_cp_contract_requires_complete_attention_recipe(self) -> None:
+        """Exercise the exact contract that failed before build_trainer on A3."""
+        path = "hyper_parallel/rl/rl/unified_execution/core/contract.py"
+        bindings = {"Mapping": Mapping}
+        load_function(path, "_mapping", bindings)
+        load_function(path, "native_moe_cp_enabled", bindings)
+        validate = load_function(path, "validate_unified_config", bindings)
+        recipe = ROOT / "hyper_parallel/rl/examples/gsm8k/configs/qwen3_30b_a3b_gsm8k_native.yaml"
+        config = yaml.safe_load(recipe.read_text())
+        validate(config)
+        self.assertEqual(config["train"]["accelerator"]["cp"], 2)
+        self.assertNotIn("consistency", config)
+        missing = deepcopy(config)
+        missing["train"]["plan_overrides"] = [rule for rule in config["train"]["plan_overrides"]
+                                               if rule.get("when") != "cp"]
+        with self.assertRaisesRegex(ValueError, "cp=1"):
+            validate(missing)
+        wrong = deepcopy(config)
+        wrong["model"]["name"] = "qwen3_5"
+        with self.assertRaisesRegex(ValueError, "cp=1"):
+            validate(wrong)
+        wrong = deepcopy(config)
+        wrong["rollout"]["vllm"]["context_parallel_size"] = 2
+        with self.assertRaisesRegex(ValueError, "PCP"):
+            validate(wrong)
 
     def test_node_local_native_ep_allows_device_residency(self) -> None:
         """Native resident mode requires node-local expert parallelism; other guards remain enforced."""

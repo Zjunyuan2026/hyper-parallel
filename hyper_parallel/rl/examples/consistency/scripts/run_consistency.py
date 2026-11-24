@@ -222,7 +222,14 @@ class MetricsObserver:
     def log(self, metrics: dict, *, step: int, **kwargs: Any) -> None:
         """Keep the original tracker and write rank-zero step metrics."""
         self.tracker.log(metrics, step=step, **kwargs)
-        if int(os.environ.get("RANK", "0")) != 0 or step == 0:
+        if int(os.environ.get("RANK", "0")) != 0:
+            return
+        if "validation/accuracy" in metrics:
+            evaluation = {"step": step, **{key: value for key, value in metrics.items()
+                                          if key.startswith("validation/")}}
+            with (self.directory / "evaluations.jsonl").open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(evaluation, default=str) + "\n")
+        if step == 0:
             return
         row = {"step": step, "recorded_at_unix": time.time(), **metrics}
         self.rows.append(row)

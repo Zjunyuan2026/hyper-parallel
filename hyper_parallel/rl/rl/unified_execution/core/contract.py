@@ -23,8 +23,8 @@ from typing import Any
 
 from rl.unified_execution.core.batch_invariant import normalize_policy
 from rl.unified_execution.core.execution_plan import (
-    resolve_pik_leaves,
     has_unified_ep,
+    resolve_pik_leaves,
     validate_cp_plan,
     validate_pcp_plan,
     validate_pik_contract,
@@ -137,7 +137,8 @@ def _validate_model_parallelism(config, family, train, accelerator, vllm, traini
     if family.moe:
         _validate_moe_parallelism(training, inference)
         if vllm.get("enable_expert_parallel", False) or vllm.get("enable_eplb", False):
-            raise ValueError("Unified MoE does not use vLLM engine flags for expert ownership. Configure expert_parallel_size.")
+            raise ValueError("Unified MoE does not use vLLM engine flags for expert ownership. "
+                             "Configure expert_parallel_size.")
         if train.get("router_replay", {}).get("mode", "off") not in ("off", "disabled", None):
             raise ValueError("Unified MoE router replay is not integrated")
         expert = _expert_options(config)
@@ -160,12 +161,38 @@ def _validate_precision(train: Mapping, vllm: Mapping) -> None:
         raise ValueError("Unified execution requires BF16 training and rollout computation")
 
 
+def native_moe_cp_enabled(config: Mapping[str, Any]) -> bool:
+    """Admit ordinary CP2 only with the explicit native MoE attention recipe."""
+    train = _mapping(config, "train")
+    accelerator = _mapping(train, "accelerator")
+    vllm = _mapping(_mapping(config, "rollout"), "vllm")
+    if (_mapping(config, "model").get("name") != "qwen3_moe"
+            or _mapping(config, "algorithm").get("name") != "grpo"
+            or vllm.get("model_implementation") != "native"
+            or accelerator.get("cp", 1) != 2 or accelerator.get("sequence_parallel", False)
+            or train.get("token_log_probs_mode", "dense") != "dense"):
+        return False
+    targets = {}
+    for rule in train.get("plan_overrides", []):
+        implementation = rule.get("replace", {}).get("implementation", {})
+        if isinstance(implementation, Mapping):
+            targets[(str(rule.get("match")), rule.get("when"))] = implementation.get("_target_")
+    return (
+        targets.get(("*.self_attn", None)) ==
+        "hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement.replace_qwen3_moe_flash_attention"
+        and targets.get(("*.self_attn.forward", "cp")) ==
+        "hyper_parallel.models.qwen3_moe.adapter.distributed.context_parallel.qwen3_moe_flash_attention_cp_mask_wrapper"
+    )
+
+
 def validate_unified_config(config: Mapping[str, Any]) -> None:
     """Validate model execution independently of numerical acceptance topologies."""
     if "consistency" not in config:
-        if _mapping(_mapping(config, "train"), "accelerator").get("cp", 1) != 1:
+        if (_mapping(_mapping(config, "train"), "accelerator").get("cp", 1) != 1
+                and not native_moe_cp_enabled(config)):
             raise ValueError(
-                "Hyper-RL invalid topology: cp=1 is required without explicit unified batch-invariant execution"
+                "Hyper-RL invalid topology: cp=1 is required without unified execution "
+                "or the explicit native Qwen3-MoE CP2 attention recipe"
             )
         vllm = _mapping(_mapping(config, "rollout"), "vllm")
         if vllm.get("context_parallel_size", 1) != 1:

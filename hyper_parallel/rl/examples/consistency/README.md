@@ -3,6 +3,25 @@
 训练绘图脚本导出的所有 PNG/SVG（含总览图、原始曲线图）统一使用宽:高 **6:4**。
 单项图为 6×4 英寸，普通总览图为 12×8、formal 总览图为 18×12 英寸。
 已有运行的图片需要用更新后的绘图脚本重新生成；数据和坐标数值保持原样。
+两个 6400/500 模式均额外生成 `test-accuracy.png/svg`，以百分比显示固定 500 题的测试曲线。
+图内及 `training-curves.png/svg` 总览的第四个面板标注最终百分比及答对题数，例如 `73.40% (367/500)`。
+`evaluations.jsonl` 保存训练前第 0 步和训练中/最终的评估结果；旧日志可从 `steps.jsonl` 恢复已有评估点。
+缺少最终完整 500 题结果时明确标注 unavailable，不能报告整体成功；图中的示例百分比不代表实测成绩。
+
+6400 题完整 50 步训推一致运行：
+
+```bash
+python3 hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_cluster.py --hosts 80.5.21.101,80.5.21.102,80.5.21.103,80.5.21.104,80.5.21.106,80.5.21.107,80.5.21.108 --master-addr 172.27.3.101 --interface data0.172 --select-nodes 4 --baseline-5step --steps 50 --micro-batch-size 2 --max-prompt 1024 --max-new-tokens 1024
+```
+
+第一组完全结束后，6400 题完整 50 步原生 vLLM 运行：
+
+```bash
+python3 hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_cluster.py --hosts 80.5.21.101,80.5.21.102,80.5.21.103,80.5.21.104,80.5.21.106,80.5.21.107,80.5.21.108 --master-addr 172.27.3.101 --interface data0.172 --select-nodes 4 --native-baseline --steps 50 --micro-batch-size 2 --max-prompt 1024 --max-new-tokens 1024
+```
+
+两组均每步 128 题、每题 8 回答，50 步使用 6400 题；每 10 步及训练前评估固定 500 题。
+不保存训练模型或 checkpoint，指标和 6:4 PNG/SVG 保存在各自独立结果目录。
 
 ## Qwen3-30B-A3B：原生 vLLM 对照训练（不启用训推一致）
 
@@ -28,11 +47,13 @@ python3 hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_cluster.py 
 `old_log_prob_source=actor`，`collect_log_probs=false`；仍计算训练锚点和 Reference 概率，
 但不收集独立采样概率，也不要求训练/推理概率一致。
 训练 TP4/CP2/DP8/EP4，关闭 SP；推理每节点 native DP8/TP2，启用原生专家并行（EP16），关闭 EPLB。
+CP2 仅用于训练端：Actor 和 Reference 使用普通 HyperParallel CP Attention、全局位置及因果 mask，
+先全局移动 next-token 目标再按 CP 切分，保留跨 rank 边界的预测目标；推理侧保持 PCP1。
+该路径不安装 unified Attention，也不启用训推一致检查。
 推理 token budget 8192、序列上限 64，`gpu_memory_utilization=0.6`，移除固定 KV cache 字节数，
 由 vLLM 自动估算缓存容量。prompt/回答上限均为 1024。
 
-按当前原生共置支持边界启用 CPU offload，Reference 也继承此策略。
-该内存策略、专家并行范围与 unified 对照不同，不能将时间差全部归因于是否启用一致性。
+Actor 和 Reference 均关闭 CPU offload，保持与 unified 对照一致；实际内存用量需实机确认。
 无需修补版 V4 wheel；不使用 unified 的专家通信开关，原生 vLLM-Ascend 内部算子由镜像实现选择。
 当前仅完成 CPU 配置/启动流程验证，四节点 native IPC、通信及内存仍需 A3 实机验收。
 
