@@ -20,9 +20,7 @@ from pathlib import Path
 
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
-
 from plot_training import draw_panel, draw_series, read_rows, run_status
-
 
 KINDS = ("reward", "loss", "consistency", "validation", "step-time", "stage-time", "coverage", "overview")
 
@@ -67,21 +65,22 @@ def render(directory: Path, output: Path) -> dict:
 
     for kind in KINDS:
         dashboard = kind == "overview"
-        figure = Figure(figsize=(16, 12) if dashboard else (11, 5), layout="constrained")
+        figure = Figure(figsize=(18, 12) if dashboard else (6, 4), layout="constrained")
         FigureCanvasAgg(figure)
-        axes = figure.subplots(4, 2).flatten() if dashboard else [figure.subplots()]
+        axes = figure.subplots(3, 3).flatten() if dashboard else [figure.subplots()]
         for axis, selected in zip(axes, KINDS[:-1] if dashboard else (kind,)):
             panel(axis, selected)
         if dashboard:
             tests = [row for row in formal.get("evaluations", []) if row["split"] == "test"]
             accuracy = tests[0].get("validation/accuracy") if len(tests) == 1 else None
+            axes[-2].axis("off")
             axes[-1].axis("off")
-            axes[-1].text(0.05, 0.8, "Official final test: 1319 questions\n"
+            axes[-2].text(0.05, 0.8, "Official final test: 1319 questions\n"
                           + (f"Accuracy: {accuracy:.2%}" if accuracy is not None else "No complete test evidence")
                           + "\nFinal checkpoint: step 50\nTraining: 6726; held-out validation: 747",
-                          transform=axes[-1].transAxes, fontsize=12)
+                          transform=axes[-2].transAxes, fontsize=12)
         figure.suptitle(("COMPLETE" if accepted else "INCOMPLETE / FAILED")
-                       + " ? GSM8K, full MoE, 4 nodes, micro-batch 1")
+                       + "\nGSM8K, full MoE, 4 nodes, micro-batch 1", fontsize=10)
         for extension in ("png", "svg"):
             figure.savefig(output / f"{kind}.{extension}", dpi=150, facecolor="white")
         figure.clear()

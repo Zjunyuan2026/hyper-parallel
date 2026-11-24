@@ -18,7 +18,7 @@ Paths are relative to `hyper_parallel/rl/`; `tests/ut/rl/` is relative to the re
 | Agent and actual trajectories | `agentic`, examples | `rl/agentic/`, `rl/data/` | `tests/ut/rl/agentic/`, `data/` |
 | Native-vLLM | `model_implementation: native` | `rl/rollout/vllm.py`, `vllm_plugin.py` | Rollout runtime, plugin, and sampler tests |
 | full_gather IPC/HCCL | weight_sync, deployment | `rl/weight_sync/` | Transaction, transport, worker, and MoE mapping tests |
-| Experimental node-local rollout | `rollout.vllm.node_local_world_size`, `examples/consistency/scripts/run_qwen3_moe_cluster.py` | `rl/rollout/vllm.py`, `rl/weight_sync/sync.py`, `ipc.py` | `test_node_control.py`, `test_qwen3_moe_cluster.py`; cluster RL device acceptance pending |
+| Experimental node-local rollout | `rollout.vllm.node_local_world_size`, `examples/consistency/scripts/run_qwen3_moe_cluster.py` | `rl/rollout/vllm.py`, `rl/weight_sync/sync.py`, `ipc.py` | `test_node_control.py`, `test_qwen3_moe_cluster.py`, `test_native_baseline.py`; native baseline disables CPU offload; cluster RL device acceptance pending |
 | RM | `reward_model` | `rl/reward_model/runtime.py` | `tests/ut/rl/reward_model/` |
 | Teacher / OPD / MOPD | `distillation` | `rl/distillation/`, `rl/algorithm/distillation.py` | `tests/ut/rl/distillation/` |
 | MoE R3 | `train.router_replay.mode` | `rl/workers/adapters/router_*`, `rl/rollout/router_capture.py` | Router replay and MoE tests |

@@ -25,12 +25,12 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+import torch.distributed as dist
 import yaml
-
+from examples.consistency.scripts.learning_check import LearningObserver
 from rl.config.loader import load_config
 from rl.trainer.build import build_trainer
 from rl.trainer.distributed import run_synchronized
-from examples.consistency.scripts.learning_check import LearningObserver
 
 
 def check_metrics(metrics: dict[str, float]) -> dict[str, float]:
@@ -70,6 +70,7 @@ def run(config: dict[str, Any], report_path: Path, *, track_updates: bool = Fals
         report_path.with_name("config.yaml").write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
     phases = PhaseRecorder(report_path.parent)
     trainer = phases.call("build_trainer", lambda: build_trainer(config))
+    baseline = BaselineCoverage(trainer, report_path.parent) if os.environ.get("BASELINE_5STEP") == "true" else None
     formal = None
     if os.environ.get("FORMAL_GSM8K") == "true":
         # Optional task workflow; ordinary consistency runs retain their existing schedule.
@@ -113,6 +114,8 @@ def run(config: dict[str, Any], report_path: Path, *, track_updates: bool = Fals
     observer = MetricsObserver(trainer._tracker, report_path.parent)
     trainer._tracker = observer
     trainer.train()
+    if baseline is not None:
+        baseline.finish()
     if formal is not None:
         formal.finish()
     if (trainer.state.global_step != requested_steps
@@ -132,6 +135,46 @@ def run(config: dict[str, Any], report_path: Path, *, track_updates: bool = Fals
                   "scope": "sampled-token log probabilities before each optimizer update"}
         report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         logging.info("CONSISTENCY_PASS report=%s", report_path)
+
+
+class BaselineCoverage:
+    """Audit actual request-owner batches against the ordered 6400-question sampler."""
+
+    def __init__(self, trainer: Any, directory: Path) -> None:
+        self.directory = directory
+        self.rank = dist.get_rank()
+        self.steps = trainer.state.max_steps
+        self.records = []
+        if len(trainer.train_dataloader.dataset) != 6400 or self.steps not in (5, 50):
+            raise ValueError("Unified baseline requires 6400 questions and 5 or 50 steps")
+        original = trainer._generate_training_rollout
+
+        def generate(batch, timings):
+            step = trainer.state.global_step + 1
+            local = batch["sample_indices"] if trainer.rollout_engine.is_request_owner else None
+            gathered = [None] * dist.get_world_size()
+            dist.all_gather_object(gathered, local)
+            owners = [rows for rows in gathered if rows is not None]
+            indices = [index for rows in owners for index in rows]
+            if len(owners) != 8 or sorted(indices) != list(range((step - 1) * 128, step * 128)):
+                raise ValueError("Actual baseline question coverage differs from the ordered 128-question batch")
+            result = original(batch, timings)
+            self.records.append({"step": step, "indices": indices})
+            trainer._run_rank_synchronized("write baseline coverage", self.write)
+            return result
+
+        trainer._generate_training_rollout = generate
+
+    def write(self) -> None:
+        """Persist each completed generation batch on the global coordinator."""
+        if self.rank == 0:
+            (self.directory / "coverage.json").write_text(json.dumps(self.records) + "\n", encoding="utf-8")
+
+    def finish(self) -> None:
+        """Reject missing or repeated questions after training, without using closed process groups."""
+        seen = [index for record in self.records for index in record["indices"]]
+        if len(self.records) != self.steps or sorted(seen) != list(range(self.steps * 128)):
+            raise ValueError("Unified baseline coverage is incomplete")
 
 
 class PhaseRecorder:

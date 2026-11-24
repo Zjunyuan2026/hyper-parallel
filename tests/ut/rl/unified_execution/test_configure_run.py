@@ -15,13 +15,12 @@
 """Check portable GSM8K configuration without importing the device runtime."""
 
 import os
-from pathlib import Path
 import runpy
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import yaml
-
 
 ROOT = Path(__file__).resolve().parents[4] / "hyper_parallel/rl/examples/consistency"
 # This is a standalone configuration CLI; its contract needs no Torch installation.
@@ -30,6 +29,96 @@ CONFIGURE = runpy.run_path(str(ROOT / "scripts/configure_run.py"))["configure"]
 
 class ConfigureRunTests(unittest.TestCase):
     """Keep task selection and token/transport budgets independent of topology."""
+
+    def test_native_baseline_removes_unified_execution(self) -> None:
+        """Native runs use ordinary MoE training, no strict probability gate and fixed ordered data."""
+        environment = {"RUN_MODEL_PATH": "/models/Qwen3-30B-A3B", "TRAIN_TP": "4", "TRAIN_CP": "2",
+                       "TRAIN_EP": "4", "TRAIN_SP": "false", "ROLLOUT_TP": "2", "ROLLOUT_PCP": "1",
+                       "ROLLOUT_EP": "8", "ROLLOUT_LOCAL_WORLD_SIZE": "16", "GLOBAL_PROMPT_BATCH_SIZE": "128",
+                       "MICRO_BATCH_SIZE": "2", "RESPONSE_MINI_BATCH_SIZE": "128", "CANDIDATES": "8",
+                       "NATIVE_BASELINE": "true", "STEPS": "2", "CPU_OFFLOAD": "true",
+                       "MAX_PROMPT": "1024", "MAX_NEW_TOKENS": "1024", "MAX_MODEL_LEN": "2048",
+                       "MAX_NUM_SEQS": "4", "KV_CACHE_MEMORY_BYTES": str(2 * 1024**3)}
+        recipe = ROOT.parent / "gsm8k/configs/qwen3_30b_a3b_gsm8k_native.yaml"
+        with patch.dict(os.environ, environment, clear=True):
+            config = CONFIGURE(yaml.safe_load(recipe.read_text()), 64)
+        self.assertNotIn("consistency", config)
+        self.assertNotIn("expert_parallel_size", config["rollout"]["vllm"])
+        self.assertNotIn("unified_execution", config["rollout"]["vllm"])
+        self.assertEqual(config["rollout"]["vllm"]["model_implementation"], "native")
+        self.assertFalse(config["rollout"]["collect_log_probs"])
+        self.assertFalse(config["train"]["accelerator"]["cpu_offload"])
+        self.assertFalse(config["train"]["accelerator"]["sequence_parallel"])
+        self.assertEqual(config["train"]["micro_batch_size"], 2)
+        self.assertEqual(config["train"]["optimizer"]["weight_decay"], 0.01)
+        self.assertEqual(config["algorithm"]["kl_coef"], 0.001)
+        self.assertEqual(config["data"]["max_train_samples"], 6400)
+        self.assertFalse(config["data"]["shuffle"])
+        self.assertNotIn("unified_execution", str(config["train"]["plan_overrides"]))
+        self.assertEqual(config["rollout"]["vllm"]["max_num_batched_tokens"], 1024)
+        with patch.dict(os.environ, {**environment, "STEPS": "50"}, clear=True):
+            full = CONFIGURE(yaml.safe_load(recipe.read_text()), 64)
+        self.assertEqual(full["train"]["max_steps"], 50)
+        self.assertEqual(full["train"]["prompt_batch_size"] * 8 * 50, 6400)
+        with patch.dict(os.environ, {**environment, "FORMAL_GSM8K": "true"}, clear=True), self.assertRaises(ValueError):
+            CONFIGURE(yaml.safe_load(recipe.read_text()), 64)
+
+    def test_baseline_pilot_keeps_independent_sampling_probabilities(self) -> None:
+        """The 4B sampling protocol changes data, not the MoE arithmetic or probability gate."""
+        environment = {"RUN_MODEL_PATH": "/models/Qwen3-30B-A3B", "TRAIN_TP": "4", "TRAIN_CP": "2",
+                       "TRAIN_EP": "4", "ROLLOUT_TP": "2", "ROLLOUT_PCP": "1", "ROLLOUT_EP": "8",
+                       "ROLLOUT_LOCAL_WORLD_SIZE": "16", "GLOBAL_PROMPT_BATCH_SIZE": "128",
+                       "MICRO_BATCH_SIZE": "2", "RESPONSE_MINI_BATCH_SIZE": "128", "CANDIDATES": "8",
+                       "BASELINE_5STEP": "true", "STEPS": "5", "CPU_OFFLOAD": "false",
+                       "MAX_PROMPT": "1024", "MAX_NEW_TOKENS": "1024", "MAX_MODEL_LEN": "2048"}
+        with patch.dict(os.environ, environment, clear=True):
+            config = CONFIGURE(yaml.safe_load((ROOT / "configs/qwen3_moe_4l_cp_rl.yaml").read_text()), 64)
+        self.assertEqual(config["data"]["max_train_samples"], 6400)
+        self.assertFalse(config["data"]["shuffle"])
+        self.assertEqual(config["evaluation"]["max_samples"], 500)
+        self.assertEqual(config["train"]["micro_batch_size"], 2)
+        self.assertEqual(config["train"]["prompt_batch_size"] * 8, 128)
+        self.assertEqual(config["rollout"]["vllm"]["max_num_batched_tokens"], 1024)
+        self.assertTrue(config["rollout"]["collect_log_probs"])
+        self.assertEqual(config["train"]["old_log_prob_source"], "actor")
+        self.assertEqual(config["consistency"]["mode"], "batch_invariant")
+        self.assertEqual(config["train"]["accelerator"]["cp"], 2)
+        self.assertEqual(config["rollout"]["vllm"]["expert_parallel_size"], 16)
+        self.assertFalse(config["train"]["accelerator"]["reference_cpu_offload"])
+        self.assertFalse(config["train"]["accelerator"]["offload_during_rollout"])
+        self.assertEqual(config["train"]["checkpoint"]["save_steps"], 5)
+        self.assertEqual(config["algorithm"]["kl_coef"], 0.001)
+        self.assertEqual(config["algorithm"]["kl_type"], "low_var_kl")
+        self.assertEqual(config["train"]["optimizer"], {
+            "lr": 1e-6, "lr_min": 0.0, "lr_decay_style": "constant", "lr_warmup_ratio": 0.0,
+            "weight_decay": 0.01, "max_grad_norm": 1.0, "eps": 1e-8, "betas": [0.9, 0.999],
+            "foreach": None, "fp32_main_params": True, "no_decay_params": [],
+        })
+        self.assertEqual(config["algorithm"], {
+            "name": "grpo", "advantage_epsilon": 1e-6, "clip_ratio_low": 0.2, "clip_ratio_high": 0.2,
+            "clip_ratio_c": 3.0, "kl_coef": 0.001, "kl_type": "low_var_kl", "loss_aggregation": "token-mean",
+        })
+        self.assertEqual(config["train"]["seed"], 42)
+        self.assertTrue(config["train"]["gradient_sync_each_micro_batch"])
+        self.assertIsNone(config["rollout"]["seed"])
+        self.assertEqual(config["rollout"]["vllm"]["seed"], 17)
+        with patch.dict(os.environ, {**environment, "STEPS": "50"}, clear=True):
+            full = CONFIGURE(yaml.safe_load((ROOT / "configs/qwen3_moe_4l_cp_rl.yaml").read_text()), 64)
+        self.assertEqual(full["train"]["max_steps"], 50)
+        self.assertEqual(full["evaluation"]["every_n_steps"], 10)
+        self.assertEqual(full["train"]["checkpoint"]["save_steps"], 5)
+        self.assertTrue(full["train"]["checkpoint"]["save_final"])
+        self.assertEqual(full["train"]["prompt_batch_size"] * 8 * 50, 6400)
+        self.assertEqual(full["algorithm"], config["algorithm"])
+        self.assertEqual(full["train"]["optimizer"], config["train"]["optimizer"])
+        recipe = ROOT.parent / "gsm8k/configs/qwen3_30b_a3b_gsm8k_unified_5step.yaml"
+        with patch.dict(os.environ, environment, clear=True):
+            materialized = CONFIGURE(yaml.safe_load(recipe.read_text()), 64)
+        for section in ("model", "data", "rollout", "train", "consistency", "evaluation", "algorithm"):
+            self.assertEqual(materialized[section], config[section])
+        with (patch.dict(os.environ, {**environment, "MICRO_BATCH_SIZE": "1"}, clear=True),
+              self.assertRaises(ValueError)):
+            CONFIGURE(yaml.safe_load((ROOT / "configs/qwen3_moe_4l_cp_rl.yaml").read_text()), 64)
 
     def test_formal_data_evaluation_and_checkpoint_settings(self) -> None:
         """Formal mode holds out validation and enables complete greedy evaluation and saves."""
@@ -50,6 +139,9 @@ class ConfigureRunTests(unittest.TestCase):
         self.assertFalse(config["evaluation"]["do_sample"])
         self.assertEqual(config["train"]["checkpoint"]["save_steps"], 10)
         self.assertTrue(config["train"]["checkpoint"]["save_final"])
+        self.assertEqual(config["algorithm"]["kl_coef"], 0.0)
+        self.assertEqual(config["train"]["optimizer"]["weight_decay"], 0.0)
+        self.assertFalse(config["train"]["optimizer"].get("fp32_main_params", False))
 
     def test_target_batch_preflight_uses_complete_local_mini_batches(self) -> None:
         """Large prompt batches do not silently multiply the number of optimizer updates."""

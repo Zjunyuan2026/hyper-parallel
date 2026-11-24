@@ -52,7 +52,7 @@ def configure(config: dict, world: int) -> dict:
     train_cp = integer("TRAIN_CP", accelerator.get("cp", 1))
     rollout_pcp = integer("ROLLOUT_PCP", inference.get("context_parallel_size", 1))
     train_ep = integer("TRAIN_EP", accelerator["ep"])
-    rollout_ep = integer("ROLLOUT_EP", inference["expert_parallel_size"])
+    rollout_ep = integer("ROLLOUT_EP", inference.get("expert_parallel_size", 1))
     if any(size not in (1, 2, 4) for size in (train_tp, rollout_tp, train_cp, rollout_pcp)):
         raise ValueError("This recipe supports TP/CP/PCP sizes 1, 2 or 4 only")
     if world < 1 or any(world % size for size in (
@@ -158,6 +158,57 @@ def configure(config: dict, world: int) -> dict:
                                       require_mixed_rewards=True, max_step=1)
         if os.environ.get("LEARNING_PROMPT_ROWS"):
             config["data"]["train_path"] = "/results/run/learning-data/train.parquet"
+    if boolean("BASELINE_5STEP", False):
+        accelerator.update(cpu_offload=False, reference_cpu_offload=False, offload_during_rollout=False)
+        inference["expert_parallel_size"] = 16
+        config["algorithm"]["kl_coef"] = 0.001
+        train["optimizer"].update(weight_decay=0.01, fp32_main_params=True, no_decay_params=[])
+        train.update(seed=42, gradient_sync_each_micro_batch=True)
+        config["rollout"]["seed"] = None
+        inference["seed"] = 17
+        if (boolean("FORMAL_GSM8K", False) or world != 64 or dp_size != 8
+                or train["max_steps"] not in (5, 50) or runner != "internal"
+                or train["prompt_batch_size"] != 16 or candidates != 8
+                or train["micro_batch_size"] != 2 or mini != 128):
+            raise ValueError("Baseline requires 64 ranks, 5 or 50 steps, 128 questions, 8 answers and micro/mini=2/128")
+        config["data"].update(train_path="/baseline-run/data/train.parquet",
+                              test_path="/baseline-run/data/test.parquet", max_train_samples=6400, shuffle=False)
+        inference["max_num_batched_tokens"] = 1024
+        config["rollout"]["collect_log_probs"] = True
+        train["old_log_prob_source"] = "actor"
+        config["evaluation"].update(enabled=True, max_samples=500, batch_size=16,
+                                    max_new_tokens=config["rollout"]["max_new_tokens"], temperature=0.0,
+                                    do_sample=False, before_train=True,
+                                    every_n_steps=5 if train["max_steps"] == 5 else 10, at_end=True)
+        train["checkpoint"].update(output_dir="/baseline-run/checkpoints", save_steps=5,
+                                   save_final=train["max_steps"] == 50, verify_reload=False, load_path=None)
+    if boolean("NATIVE_BASELINE", False):
+        if (boolean("BASELINE_5STEP", False) or boolean("FORMAL_GSM8K", False)
+                or world != 64 or dp_size != 8 or not 1 <= train["max_steps"] <= 50
+                or runner != "internal" or train["prompt_batch_size"] != 16
+                or candidates != 8 or train["micro_batch_size"] != 2 or mini != 128):
+            raise ValueError("Native baseline requires 64 ranks, 1..50 steps, batch 128 and micro/mini=2/128")
+        native_path = Path(__file__).resolve().parents[2] / "gsm8k/configs/qwen3_30b_a3b_gsm8k_vllm.yaml"
+        native = yaml.safe_load(native_path.read_text())
+        config.pop("consistency", None)
+        train["plan_overrides"] = native["train"]["plan_overrides"]
+        accelerator.update(cpu_offload=False, reference_cpu_offload=False,
+                           offload_during_rollout=False, sequence_parallel=False)
+        train.update(seed=42, old_log_prob_source="actor", gradient_sync_each_micro_batch=True)
+        train["optimizer"].update(weight_decay=0.01, fp32_main_params=True, no_decay_params=[])
+        config["algorithm"]["kl_coef"] = 0.001
+        config["data"].update(train_path="/baseline-run/data/train.parquet",
+                              test_path="/baseline-run/data/test.parquet", max_train_samples=6400, shuffle=False)
+        config["rollout"].update(seed=None, collect_log_probs=False)
+        for field in ("expert_parallel_size", "unified_execution", "sequence_parallel", "compilation_config"):
+            inference.pop(field, None)
+        inference.update(model_implementation="native", enable_expert_parallel=True, enable_eplb=False,
+                         batch_invariant=False, seed=17, max_num_batched_tokens=1024)
+        config["evaluation"].update(enabled=True, max_samples=500, batch_size=16,
+                                    max_new_tokens=config["rollout"]["max_new_tokens"], temperature=0.0,
+                                    do_sample=False, before_train=True, every_n_steps=10, at_end=True)
+        train["checkpoint"].update(output_dir="/baseline-run/checkpoints", save_steps=5,
+                                   save_final=True, verify_reload=False, load_path=None)
     if boolean("FORMAL_GSM8K", False):
         if (world != 64 or dp_size != 8 or train["max_steps"] != 50 or runner != "internal"
                 or train["prompt_batch_size"] != 17 or candidates != 4

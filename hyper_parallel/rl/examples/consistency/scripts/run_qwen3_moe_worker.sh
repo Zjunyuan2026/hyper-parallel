@@ -16,9 +16,14 @@ source /usr/local/Ascend/cann/set_env.sh
 set -u
 mkdir -p /results/run
 rm -f /results/run/consistency.json
-printf "%s\n" "${V4_WHEEL_SHA256}" > /results/run/v4-wheel.sha256
+if [[ "${NATIVE_BASELINE:-false}" != true ]]; then
+    printf "%s\n" "${V4_WHEEL_SHA256}" > /results/run/v4-wheel.sha256
+fi
 unset VLLM_PLUGINS
-export PYTHONPATH=/opt/hp-v4:/workspace/hyper_parallel/rl:/workspace:${PYTHONPATH:-}
+export PYTHONPATH=/workspace/hyper_parallel/rl:/workspace:${PYTHONPATH:-}
+if [[ "${NATIVE_BASELINE:-false}" != true ]]; then
+    export PYTHONPATH=/opt/hp-v4:$PYTHONPATH
+fi
 # Resolve before Torch import, using the effective offload override and local ranks only.
 cpu_overrides=()
 if [[ -v CPU_OFFLOAD ]]; then cpu_overrides+=("--train.accelerator.cpu_offload=${CPU_OFFLOAD}"); fi
@@ -28,7 +33,9 @@ done
 cpu_threads=$(python -m rl.utils.cpu_threads --config /run-config.yaml \
     --local-world-size "$DEVICE_COUNT" --report /results/run/cpu-threads.json "${cpu_overrides[@]}")
 export OMP_NUM_THREADS="$cpu_threads" MKL_NUM_THREADS="$cpu_threads"
-python -m pip install --no-deps --no-compile --target /opt/hp-v4 /wheels/*.whl
+if [[ "${NATIVE_BASELINE:-false}" != true ]]; then
+    python -m pip install --no-deps --no-compile --target /opt/hp-v4 /wheels/*.whl
+fi
 # Keep editable metadata in the container; source remains the mounted checkout.
 mkdir /tmp/hp-install
 cp setup.py requirements.txt README.md MANIFEST.in /tmp/hp-install/
@@ -74,11 +81,17 @@ if (( ${NNODES:-1} > 1 )); then
             --master_port="$MASTER_PORT" --local-addr="$NODE_ADDR" --max_restarts=0)
 fi
 set +e
+training_script=hyper_parallel/rl/examples/consistency/scripts/run_consistency.py
+training_report=/results/run/consistency.json
+if [[ "${NATIVE_BASELINE:-false}" == true ]]; then
+    training_script=hyper_parallel/rl/examples/gsm8k/scripts/run_qwen3_30b_native.py
+    training_report=/results/run/native-training.json
+fi
 timeout --signal=TERM --kill-after=60s "$RUN_TIMEOUT" \
     python -m torch.distributed.run "${launch[@]}" --nproc_per_node="$DEVICE_COUNT" \
     --log-dir /results/run/torchrun --redirects 3 --tee 3 \
-    hyper_parallel/rl/examples/consistency/scripts/run_consistency.py /results/run/generated-config.yaml \
-    --report /results/run/consistency.json "$@" 2>&1 | tee /results/run/train.log
+    "$training_script" /results/run/generated-config.yaml \
+    --report "$training_report" "$@" 2>&1 | tee /results/run/train.log
 train_status=("${PIPESTATUS[@]}")
 set -e
 printf "TRAIN_EXIT code=%s\n" "${train_status[0]}"

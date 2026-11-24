@@ -16,12 +16,13 @@
 
 import importlib.util
 import json
-from pathlib import Path
+import struct
 import sys
-from tempfile import TemporaryDirectory
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
-
+from xml.etree import ElementTree
 
 SCRIPTS = Path(__file__).resolve().parents[4] / "hyper_parallel/rl/examples/consistency/scripts"
 with patch.object(sys, "path", [str(SCRIPTS), *sys.path]):
@@ -49,3 +50,13 @@ class FormalPlotTests(unittest.TestCase):
             self.assertEqual(len(list((root / "plots").glob("*.png"))), 8)
             self.assertEqual(len(list((root / "plots").glob("*.svg"))), 8)
             self.assertIn("No complete test evidence", (root / "plots/overview.svg").read_text(encoding="utf-8"))
+            sys.modules["plot_training"].render(root, root / "ordinary")
+            for folder, expected in ((root / "plots", 8), (root / "ordinary", 6)):
+                self.assertEqual(len(list(folder.glob("*.png"))), expected)
+                self.assertEqual(len(list(folder.glob("*.svg"))), expected)
+                for path in folder.glob("*.png"):
+                    width, height = struct.unpack(">II", path.read_bytes()[16:24])
+                    self.assertEqual(width * 4, height * 6)
+                for path in folder.glob("*.svg"):
+                    attributes = ElementTree.parse(path).getroot().attrib
+                    self.assertAlmostEqual(float(attributes["width"][:-2]) / float(attributes["height"][:-2]), 1.5)

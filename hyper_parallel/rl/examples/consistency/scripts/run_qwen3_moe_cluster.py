@@ -24,19 +24,17 @@ import ipaddress
 import json
 import math
 import os
-from pathlib import Path
-import signal
 import shutil
+import signal
 import statistics
 import subprocess
 import tarfile
 import tempfile
 import time
-from typing import Optional
 import uuid
+from pathlib import Path
 
 from run_hccl_cluster import execute, interrupt, preflight, require_idle
-
 
 ROOT = Path(__file__).resolve().parents[5]
 SCRIPTS = "hyper_parallel/rl/examples/consistency/scripts"
@@ -50,17 +48,18 @@ def resolve_batch(args: argparse.Namespace, node_count: int) -> dict:
     prompts = args.global_prompt_batch_size if args.global_prompt_batch_size is not None else dp_size
     if prompts < 1 or prompts % dp_size:
         raise ValueError(f"Global prompt batch must be positive and divisible by training DP={dp_size}")
-    responses = prompts // dp_size * 4
+    candidates = 8 if (getattr(args, "baseline_5step", False) or getattr(args, "native_baseline", False)) else 4
+    responses = prompts // dp_size * candidates
     mini = args.response_mini_batch_size if args.response_mini_batch_size is not None else responses
     if args.micro_batch_size < 1 or mini < 1 or responses % mini or mini % args.micro_batch_size:
         raise ValueError("Responses per DP rank must divide into mini-batches and mini-batches into micro-batches")
     return {"training_dp_size": dp_size, "global_prompt_batch_size": prompts,
-            "prompts_per_dp_rank": prompts // dp_size, "candidates": 4,
-            "global_response_batch_size": prompts * 4, "response_mini_batch_size": mini,
+            "prompts_per_dp_rank": prompts // dp_size, "candidates": candidates,
+            "global_response_batch_size": prompts * candidates, "response_mini_batch_size": mini,
             "micro_batch_size": args.micro_batch_size, "optimizer_updates_per_step": responses // mini}
 
 
-def finite_values(rows: list[dict], key: str) -> Optional[list[float]]:
+def finite_values(rows: list[dict], key: str) -> list[float] | None:
     """Return complete nonnegative measurements; partial evidence stays missing."""
     values = [row.get(key) for row in rows]
     if not values or not all(isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -104,21 +103,34 @@ def summarize_timings(directory: Path) -> dict:
             "timing_scope": "Excludes first step, container setup and model startup; not full-dataset throughput"}
 
 
-def stage_source(directory: Path, wheel: Path) -> tuple[Path, str]:
+def stage_source(directory: Path, wheel: Path | None) -> tuple[Path, str]:
     """Copy tracked source and required offline wheels once into shared storage."""
     files = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT, capture_output=True,
                            check=True).stdout.decode().split("\0")
     target = directory / "source"
     target.mkdir()
-    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
-    if digest != WHEEL_SHA256:
-        raise ValueError(f"Unexpected batch-invariant wheel SHA256: {digest}")
+    if wheel is not None:
+        digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+        if digest != WHEEL_SHA256:
+            raise ValueError(f"Unexpected batch-invariant wheel SHA256: {digest}")
     archive = directory / "source.tar"
     with tarfile.open(archive, "w") as bundle:
         for filename in files:
             if filename and not filename.startswith("wheels/"):
                 bundle.add(ROOT / filename, arcname=filename, recursive=False)
-        bundle.add(wheel, arcname=f"wheels/{WHEEL}", recursive=False)
+        # Explicit recipe additions must be staged even before their first commit.
+        baseline_files = (
+            "hyper_parallel/rl/examples/gsm8k/configs/qwen3_30b_a3b_gsm8k_unified_5step.yaml",
+            "hyper_parallel/rl/examples/gsm8k/scripts/prepare_baseline_data.py",
+            "hyper_parallel/rl/examples/gsm8k/scripts/run_qwen3_30b_5step.sh",
+            "hyper_parallel/rl/examples/gsm8k/scripts/run_qwen3_30b_native.py",
+            "hyper_parallel/rl/examples/gsm8k/configs/qwen3_30b_a3b_gsm8k_native.yaml",
+        )
+        for filename in baseline_files:
+            if filename not in files and (ROOT / filename).is_file():
+                bundle.add(ROOT / filename, arcname=filename, recursive=False)
+        if wheel is not None:
+            bundle.add(wheel, arcname=f"wheels/{WHEEL}", recursive=False)
         for dependency in sorted((ROOT / "wheels/runtime").glob("*.whl")):
             bundle.add(dependency, arcname=f"wheels/runtime/{dependency.name}", recursive=False)
     # The archive contains only this checkout's tracked files and explicit wheels.
@@ -137,6 +149,11 @@ def docker_command(args: argparse.Namespace, node_rank: int, address: str,
     source = directory / "source"
     result = directory / f"node{node_rank}"
     batch = resolve_batch(args, len(args.hosts))
+    recipe = ("hyper_parallel/rl/examples/gsm8k/configs/qwen3_30b_a3b_gsm8k_native.yaml"
+              if getattr(args, "native_baseline", False) else
+              "hyper_parallel/rl/examples/gsm8k/configs/qwen3_30b_a3b_gsm8k_unified_5step.yaml"
+              if getattr(args, "baseline_5step", False) else
+              "hyper_parallel/rl/examples/consistency/configs/qwen3_moe_4l_cp_rl.yaml")
     command = ["docker", "run", "-d", "--name", name, "--label", "hyper-rl.cluster=true",
                "--privileged", "--network=host", "--shm-size=64g", "-w", "/workspace"]
     mounts = [(str(source), "/workspace", "ro"), (str(result), "/results", "rw"),
@@ -144,14 +161,15 @@ def docker_command(args: argparse.Namespace, node_rank: int, address: str,
               (str(args.data_root), "/data/gsm8k", "ro"),
               (str(source / "wheels"), "/wheels", "ro"),
               (str(source / "wheels/runtime"), "/runtime-wheels", "ro"),
-              (str(source / "hyper_parallel/rl/examples/consistency/configs/qwen3_moe_4l_cp_rl.yaml"),
-               "/run-config.yaml", "ro"),
+              (str(source / recipe), "/run-config.yaml", "ro"),
               ("/usr/local/Ascend/driver", "/usr/local/Ascend/driver", "ro"),
               ("/usr/local/dcmi", "/usr/local/dcmi", "ro"),
               ("/usr/local/bin/npu-smi", "/usr/local/bin/npu-smi", "ro"),
               ("/etc/ascend_install.info", "/etc/ascend_install.info", "ro")]
     if args.formal_gsm8k:
         mounts.append((str(directory / "formal"), "/formal-run", "rw"))
+    if getattr(args, "baseline_5step", False) or getattr(args, "native_baseline", False):
+        mounts.append((str(directory / "baseline"), "/baseline-run", "rw"))
     for host, container, mode in mounts:
         command.extend(["-v", f"{host}:{container}:{mode}"])
     environment = {
@@ -159,9 +177,12 @@ def docker_command(args: argparse.Namespace, node_rank: int, address: str,
         "NODE_RANK": str(node_rank), "NODE_ADDR": address,
         "MASTER_ADDR": args.master_addr, "MASTER_PORT": str(args.master_port),
         "ROLLOUT_LOCAL_WORLD_SIZE": "16", "TRAIN_TP": "4", "TRAIN_CP": "2", "TRAIN_EP": "4",
-        "TRAIN_SP": "true", "ROLLOUT_TP": "2", "ROLLOUT_PCP": "1", "ROLLOUT_EP": "8",
+        "TRAIN_SP": "true", "ROLLOUT_TP": "2", "ROLLOUT_PCP": "1",
+        "ROLLOUT_EP": ("16" if getattr(args, "baseline_5step", False)
+                       or getattr(args, "native_baseline", False) else "8"),
         "ROLLOUT_SP": "false", "CPU_OFFLOAD": str(args.cpu_offload).lower(), "RUNNER": "internal",
-        "STEPS": str(args.steps), "CANDIDATES": "4", "PROMPTS_PER_RANK": str(batch["prompts_per_dp_rank"]),
+        "STEPS": str(args.steps), "CANDIDATES": str(batch["candidates"]),
+        "PROMPTS_PER_RANK": str(batch["prompts_per_dp_rank"]),
         "GLOBAL_PROMPT_BATCH_SIZE": str(batch["global_prompt_batch_size"]),
         "MICRO_BATCH_SIZE": str(batch["micro_batch_size"]),
         "RESPONSE_MINI_BATCH_SIZE": str(batch["response_mini_batch_size"]),
@@ -183,14 +204,20 @@ def docker_command(args: argparse.Namespace, node_rank: int, address: str,
         "HYPER_RL_DIAGNOSTICS_DIR": "/results/run", "V4_WHEEL_SHA256": WHEEL_SHA256,
         "RESULT_UID": str(os.getuid()), "RESULT_GID": str(os.getgid()), "PLOT_TRAINING": str(args.plot).lower(),
     }
+    if getattr(args, "baseline_5step", False):
+        environment.update(BASELINE_5STEP="true", PREFILL_TOKENS="1024")
+    if getattr(args, "native_baseline", False):
+        environment.update(NATIVE_BASELINE="true", PREFILL_TOKENS="1024", CPU_OFFLOAD="false", TRAIN_SP="false")
     for key, value in environment.items():
         command.extend(["-e", f"{key}={value}"])
-    return command + [image_id, "bash", f"{SCRIPTS}/run_qwen3_moe_worker.sh", "--track-updates"]
+    options = [] if getattr(args, "native_baseline", False) else ["--track-updates"]
+    return command + [image_id, "bash", f"{SCRIPTS}/run_qwen3_moe_worker.sh", *options]
 
 
 def prepare_formal_data(args: argparse.Namespace, directory: Path, image_id: str) -> dict:
-    """Tokenize and split on CPU before launching any training containers."""
-    shared = directory / "formal"
+    """Prepare the selected data protocol on CPU before launching training containers."""
+    baseline = getattr(args, "baseline_5step", False) or getattr(args, "native_baseline", False)
+    shared = directory / ("baseline" if baseline else "formal")
     shared.mkdir()
     name = f"hp-rl-data-{uuid.uuid4().hex[:12]}"
     command = ["docker", "run", "-d", "--name", name, "--network=none", "-w", "/workspace",
@@ -203,9 +230,12 @@ def prepare_formal_data(args: argparse.Namespace, directory: Path, image_id: str
         command.extend(["-v", f"{host}:{target}:{mode}"])
     command.extend([image_id, "bash", "-c",
                     "source /usr/local/Ascend/cann/set_env.sh && exec python "
-                    f"{SCRIPTS}/full_gsm8k.py --source /data/gsm8k --destination /formal-run/data "
-                    f"--model /models/Qwen3-30B-A3B --max-prompt {args.max_prompt}"])
-    print("PREPARE_FORMAL_DATA CPU-only; validating all prompts and split isolation", flush=True)
+                    + ("hyper_parallel/rl/examples/gsm8k/scripts/prepare_baseline_data.py "
+                       if baseline else f"{SCRIPTS}/full_gsm8k.py ")
+                    + "--source /data/gsm8k --destination /formal-run/data "
+                    + ("" if baseline else f"--model /models/Qwen3-30B-A3B --max-prompt {args.max_prompt}")])
+    print("PREPARE_BASELINE_DATA CPU-only; reproducing ordered 6400/500 samples" if baseline else
+          "PREPARE_FORMAL_DATA CPU-only; validating all prompts and split isolation", flush=True)
     try:
         execute(args.hosts[0], True, command)
         deadline = time.monotonic() + 1800
@@ -238,7 +268,7 @@ def run(args: argparse.Namespace) -> Path:
     batch = resolve_batch(args, len(args.hosts))
     args.shared_root.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix="qwen3-cluster-", dir=args.shared_root.resolve()))
-    source, revision = stage_source(directory, args.wheel)
+    source, revision = stage_source(directory, None if getattr(args, "native_baseline", False) else args.wheel)
     print("RESULT_DIRECTORY", directory, flush=True)
     (source / "wheels/runtime").mkdir(parents=True, exist_ok=True)
     token = uuid.uuid4().hex[:12]
@@ -252,29 +282,44 @@ def run(args: argparse.Namespace) -> Path:
             execute(host, index == 0, ["test", "-s", str(path)])
         require_idle(execute(host, index == 0, ["npu-smi", "info"]).stdout, host)
         (directory / f"node{index}/run").mkdir(parents=True)
-    if args.formal_gsm8k:
+    if args.formal_gsm8k or getattr(args, "baseline_5step", False) or getattr(args, "native_baseline", False):
         weight_bytes = sum(path.stat().st_size for path in args.model_root.glob("*.safetensors"))
         free_bytes = shutil.disk_usage(directory).free
+        model_copies = (args.steps // 5 + 1 if getattr(args, "baseline_5step", False) else
+                        (args.steps // 5 + int(args.steps % 5 != 0) + 1)
+                        if getattr(args, "native_baseline", False) else 6)
         print("CHECKPOINT_STORAGE", json.dumps({"shared_free_gb": free_bytes / 1024**3,
-              "model_only_lower_bound_gb": weight_bytes * 6 / 1024**3,
-              "note": "Five checkpoints plus final export; optimizer/rank state needs additional space"}), flush=True)
-        if weight_bytes == 0 or free_bytes < weight_bytes * 6:
+              "model_only_lower_bound_gb": weight_bytes * model_copies / 1024**3,
+              "note": "Model/export lower bound only; optimizer/rank state needs additional space"}), flush=True)
+        if weight_bytes == 0 or free_bytes < weight_bytes * model_copies:
             raise RuntimeError("Insufficient minimum checkpoint space or missing safetensors model weights")
-    manifest = prepare_formal_data(args, directory, image_id) if args.formal_gsm8k else None
+    prepares_data = (args.formal_gsm8k or getattr(args, "baseline_5step", False)
+                     or getattr(args, "native_baseline", False))
+    manifest = prepare_formal_data(args, directory, image_id) if prepares_data else None
     # CPU preparation may take minutes; recheck occupancy immediately before launch.
-    if args.formal_gsm8k:
+    if prepares_data:
         for index, host in enumerate(args.hosts):
             require_idle(execute(host, index == 0, ["npu-smi", "info"]).stdout, host)
     plan = {"hosts": args.hosts, "addresses": addresses, "image_id": image_id, "revision": revision,
             "world_size": len(args.hosts) * 16, "training": "TP4/CP2/EP4; DP=world/8; EDP=world/4",
-            "rollout_per_node": "TP2/DP8/EP8", "cpu_offload": args.cpu_offload,
+            "rollout_per_node": ("native TP2/DP8/EP16" if getattr(args, "native_baseline", False)
+                                 else "TP2/DP8/EP16" if getattr(args, "baseline_5step", False)
+                                 else "TP2/DP8/EP8"), "cpu_offload": args.cpu_offload,
             "steps": args.steps, "model_layers": "full", "model_root": str(args.model_root),
             "data_root": str(args.data_root), "batch": batch, "full_data": args.full_data,
             "max_prompt_tokens": args.max_prompt, "max_new_tokens": args.max_new_tokens,
             "max_model_len": args.max_prompt + args.max_new_tokens, "plot": args.plot,
             "formal_gsm8k": args.formal_gsm8k, "dataset_counts": manifest["counts"] if manifest else None,
+            "baseline_5step": getattr(args, "baseline_5step", False),
+            "native_baseline": getattr(args, "native_baseline", False),
+            "strict_consistency": not getattr(args, "native_baseline", False),
             "shared_free_gb_at_start": shutil.disk_usage(directory).free / 1024**3,
-            "scope": ("One complete GSM8K epoch, held-out validation and final official test" if manifest
+            "scope": ("Native vLLM baseline on 6400/500 samples; strict consistency disabled"
+                      if getattr(args, "native_baseline", False) else
+                      f"Unified {args.steps}-step run over {args.steps * 128} of 6400 questions; "
+                      "fixed 500-question evaluation"
+                      if getattr(args, "baseline_5step", False) else
+                      "One complete GSM8K epoch, held-out validation and final official test" if manifest
                       else "Short consistency run; not full GSM8K training/evaluation")}
     (directory / "plan.json").write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
     print("BATCH_PLAN", json.dumps(batch), flush=True)
@@ -300,13 +345,14 @@ def run(args: argparse.Namespace) -> Path:
                 raise TimeoutError("Cluster run exceeded the controller deadline")
             time.sleep(5)
         result["container_states"] = states
-        report = directory / "node0/run/consistency.json"
+        native = getattr(args, "native_baseline", False)
+        report = directory / ("node0/run/native-training.json" if native else "node0/run/consistency.json")
         if report.exists():
             evidence = json.loads(report.read_text(encoding="utf-8"))
-            result["consistency"] = evidence
+            result["native_training" if native else "consistency"] = evidence
             result["passed"] = (evidence.get("passed") is True
                                 and evidence.get("completed_steps") == args.steps
-                                and len(evidence.get("checks", [])) == args.steps
+                                and (native or len(evidence.get("checks", [])) == args.steps)
                                 and all(not state["Running"] and state["ExitCode"] == 0 for state in states))
         if args.formal_gsm8k:
             formal_path = directory / "node0/run/formal-summary.json"
@@ -354,6 +400,10 @@ def main() -> None:
     parser.add_argument("--steps", type=int)
     parser.add_argument("--formal-gsm8k", action="store_true",
                         help="50 steps over 6726 training questions, 747 validation and 1319 final test")
+    parser.add_argument("--native-baseline", action="store_true",
+                        help="Native vLLM MoE without strict consistency; default 2 steps, up to 50")
+    parser.add_argument("--baseline-5step", action="store_true",
+                        help="Unified 6400/500 baseline; default 5-step pilot, --steps 50 for a complete epoch")
     parser.add_argument("--global-prompt-batch-size", type=int, help="Global questions per step across training DP")
     parser.add_argument("--micro-batch-size", type=int, default=1)
     parser.add_argument("--response-mini-batch-size", type=int,
@@ -367,6 +417,30 @@ def main() -> None:
     parser.add_argument("--timeout", type=int)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if args.native_baseline:
+        if args.formal_gsm8k or args.baseline_5step:
+            parser.error("--native-baseline cannot be combined with unified baseline or formal modes")
+        args.steps = 2 if args.steps is None else args.steps
+        args.global_prompt_batch_size = 128 if args.global_prompt_batch_size is None else args.global_prompt_batch_size
+        args.response_mini_batch_size = 128 if args.response_mini_batch_size is None else args.response_mini_batch_size
+        if (not 1 <= args.steps <= 50 or args.select_nodes != 4 or args.global_prompt_batch_size != 128
+                or args.micro_batch_size != 2 or args.response_mini_batch_size != 128 or args.cpu_offload):
+            parser.error("Native baseline requires four nodes, 1..50 steps, "
+                         "batch 128, micro/mini=2/128 and offload=false")
+        args.cpu_offload = False
+        args.full_data = False
+        args.plot = False
+    if args.baseline_5step:
+        if args.formal_gsm8k:
+            parser.error("--baseline-5step and --formal-gsm8k are mutually exclusive")
+        args.steps = 5 if args.steps is None else args.steps
+        args.global_prompt_batch_size = 128 if args.global_prompt_batch_size is None else args.global_prompt_batch_size
+        args.response_mini_batch_size = 128 if args.response_mini_batch_size is None else args.response_mini_batch_size
+        if (args.steps not in (5, 50) or args.select_nodes != 4 or args.global_prompt_batch_size != 128
+                or args.micro_batch_size != 2 or args.response_mini_batch_size != 128 or args.cpu_offload):
+            parser.error("Baseline requires four nodes, 5 or 50 steps, batch 128, micro/mini=2/128 and offload=false")
+        args.full_data = False
+        args.plot = True
     if args.summarize is not None:
         directory = args.summarize.resolve()
         result = json.loads((directory / "summary.json").read_text(encoding="utf-8"))
@@ -377,7 +451,7 @@ def main() -> None:
         print(json.dumps(result, indent=2), flush=True)
         return
     args.steps = args.steps if args.steps is not None else (50 if args.formal_gsm8k else 3)
-    args.timeout = args.timeout if args.timeout is not None else (86400 if args.formal_gsm8k else 14400)
+    args.timeout = args.timeout if args.timeout is not None else (86400 if args.steps == 50 else 14400)
     if args.formal_gsm8k:
         args.global_prompt_batch_size = 136 if args.global_prompt_batch_size is None else args.global_prompt_batch_size
         args.response_mini_batch_size = 68 if args.response_mini_batch_size is None else args.response_mini_batch_size
@@ -402,11 +476,18 @@ def main() -> None:
                           "selected_nodes": args.select_nodes, "world_size": args.select_nodes * 16,
                           "steps": args.steps, "model_layers": "full", "cpu_offload": args.cpu_offload,
                           "training": f"TP4/CP2/DP{args.select_nodes * 2}/EP4/EDP{args.select_nodes * 4}",
-                          "rollout_per_node": "TP2/DP8/EP8", "shared_root": str(args.shared_root),
+                          "rollout_per_node": ("native TP2/DP8/EP16" if args.native_baseline else
+                                               "TP2/DP8/EP16" if args.baseline_5step else "TP2/DP8/EP8"),
+                          "shared_root": str(args.shared_root),
                           "batch": batch, "full_data": args.full_data, "plot": args.plot,
                           "max_prompt_tokens": args.max_prompt, "max_new_tokens": args.max_new_tokens,
                           "max_model_len": args.max_prompt + args.max_new_tokens,
-                          "formal_gsm8k": args.formal_gsm8k, "timeout": args.timeout}, indent=2))
+                          "formal_gsm8k": args.formal_gsm8k, "baseline_5step": args.baseline_5step,
+                          "max_num_batched_tokens": (1024 if args.baseline_5step or args.native_baseline
+                                                     else args.max_prompt),
+                          "native_baseline": args.native_baseline,
+                          "strict_consistency": not args.native_baseline,
+                          "timeout": args.timeout}, indent=2))
         return
     run(args)
 

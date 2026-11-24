@@ -20,13 +20,12 @@ import importlib.util
 import io
 import json
 import os
-from pathlib import Path
 import sys
 import tempfile
-from types import SimpleNamespace
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
-
 
 ROOT = Path(__file__).resolve().parents[4]
 SCRIPT = ROOT / "hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_cluster.py"
@@ -49,6 +48,75 @@ def arguments(directory: Path) -> argparse.Namespace:
 
 class ClusterLauncherTests(unittest.TestCase):
     """Validate placement, completeness, and bounded failure cleanup without NPU use."""
+
+    def test_native_baseline_selects_non_strict_runner(self) -> None:
+        """Native pilots retain the idle-node selector without claiming numerical parity."""
+        command = [str(SCRIPT), "--hosts", "192.0.2.1,192.0.2.2,192.0.2.3,192.0.2.4",
+                   "--master-addr", "198.51.100.1", "--native-baseline", "--micro-batch-size", "2", "--dry-run"]
+        stream = io.StringIO()
+        with patch.object(sys, "argv", command), patch.object(CONTROLLER, "preflight") as probe, \
+             contextlib.redirect_stdout(stream):
+            CONTROLLER.main()
+        result = json.loads(stream.getvalue())
+        self.assertEqual(result["steps"], 2)
+        self.assertFalse(result["strict_consistency"])
+        self.assertFalse(result["cpu_offload"])
+        self.assertEqual(result["batch"]["global_prompt_batch_size"], 128)
+        probe.assert_not_called()
+        args = arguments(Path("/shared/run"))
+        args.native_baseline = True
+        args.hosts = ["192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.4"]
+        args.global_prompt_batch_size = 128
+        args.micro_batch_size = 2
+        with patch.object(os, "getuid", return_value=0, create=True), \
+             patch.object(os, "getgid", return_value=0, create=True):
+            docker = CONTROLLER.docker_command(args, 0, "198.51.100.1", "image", "owned", Path("/shared/run"))
+        env = dict(value.split("=", 1) for index, value in enumerate(docker) if index and docker[index - 1] == "-e")
+        self.assertEqual(env["NATIVE_BASELINE"], "true")
+        self.assertEqual(env["CPU_OFFLOAD"], "false")
+        self.assertEqual(env["TRAIN_SP"], "false")
+        self.assertNotIn("--track-updates", docker)
+
+    def test_baseline_pilot_dry_run_and_node_environment(self) -> None:
+        """The pilot has eight answers, local rollout and independent immutable data storage."""
+        command = [str(SCRIPT), "--hosts", "192.0.2.1,192.0.2.2,192.0.2.3,192.0.2.4",
+                   "--master-addr", "198.51.100.1", "--baseline-5step", "--micro-batch-size", "2", "--dry-run"]
+        stream = io.StringIO()
+        with patch.object(sys, "argv", command), patch.object(CONTROLLER, "preflight") as probe, \
+             contextlib.redirect_stdout(stream):
+            CONTROLLER.main()
+        result = json.loads(stream.getvalue())
+        self.assertEqual(result["steps"], 5)
+        self.assertEqual(result["batch"]["global_prompt_batch_size"], 128)
+        self.assertEqual(result["batch"]["global_response_batch_size"], 1024)
+        self.assertEqual(result["max_num_batched_tokens"], 1024)
+        self.assertEqual(result["batch"]["micro_batch_size"], 2)
+        probe.assert_not_called()
+        stream = io.StringIO()
+        with patch.object(sys, "argv", command + ["--steps", "50"]), \
+             patch.object(CONTROLLER, "preflight") as probe, contextlib.redirect_stdout(stream):
+            CONTROLLER.main()
+        full = json.loads(stream.getvalue())
+        self.assertEqual(full["steps"], 50)
+        self.assertEqual(full["timeout"], 86400)
+        self.assertTrue(full["strict_consistency"])
+        self.assertEqual(full["batch"], result["batch"])
+        probe.assert_not_called()
+        args = arguments(Path("/shared/run"))
+        args.baseline_5step = True
+        args.hosts = ["192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.4"]
+        args.global_prompt_batch_size = 128
+        args.micro_batch_size = 2
+        with patch.object(os, "getuid", return_value=0, create=True), \
+             patch.object(os, "getgid", return_value=0, create=True):
+            docker = CONTROLLER.docker_command(args, 0, "198.51.100.1", "image", "owned", Path("/shared/run"))
+        env = dict(value.split("=", 1) for index, value in enumerate(docker) if index and docker[index - 1] == "-e")
+        self.assertEqual(env["BASELINE_5STEP"], "true")
+        self.assertEqual(env["ROLLOUT_EP"], "16")
+        self.assertEqual(env["PREFILL_TOKENS"], "1024")
+        self.assertEqual(env["CANDIDATES"], "8")
+        self.assertEqual(env["ROLLOUT_LOCAL_WORLD_SIZE"], "16")
+        self.assertIn("/shared/run/baseline:/baseline-run:rw", [value.replace("\\", "/") for value in docker])
 
     def test_formal_defaults_are_explicit_and_dry_run_allocates_nothing(self) -> None:
         """The formal flag retains measured settings and cannot masquerade as a short pilot."""

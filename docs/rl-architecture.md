@@ -15,6 +15,8 @@ The old consistency machinery, Hyper inference models, and direct_reshard have b
 GRPO/PPO/GSPO, MoE, RM, Teacher, Agent, and both asynchronous modes retain their existing support matrices; directory migration does not expand support.
 
 Experimental synchronous internal Qwen3 MoE runs may set `rollout.vllm.node_local_world_size`.
+The native baseline uses ordinary MoE training without CPU offload and no strict probability gate;
+the unified example retains its shared numerical plan. Native worker models remain vLLM-owned.
 Training meshes and complete-policy tensor publication remain global; each contiguous torchrun node
 group owns its loopback service, HTTP coordinator and IPC device handles. Control failures propagate
 globally before node-local results are admitted. The [consistency example](../hyper_parallel/rl/examples/consistency/README.md#selected-node-full-model-rl-short-run)

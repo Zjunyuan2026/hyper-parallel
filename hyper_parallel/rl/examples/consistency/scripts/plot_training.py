@@ -19,11 +19,11 @@ import json
 import math
 from pathlib import Path
 
+import yaml
 from matplotlib.axes import Axes
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from matplotlib.ticker import MaxNLocator
-import yaml
 
 
 def read_rows(path: Path) -> list[dict]:
@@ -160,11 +160,13 @@ def _save_figure(output: Path, kind: str, rows: list[dict], status: dict, headin
     """Keep figure lifetime bounded for offline PNG/SVG export."""
     dashboard = kind == "training-curves"
     panel_kind = kind.removesuffix("-raw")
-    figure = Figure(figsize=(11, 10 if dashboard else 4.8), layout="constrained")
+    figure = Figure(figsize=(12, 8) if dashboard else (6, 4), layout="constrained")
     FigureCanvasAgg(figure)
-    axes = figure.subplots(3 if dashboard else 1, 1, squeeze=False).flatten()
+    axes = figure.subplots(2 if dashboard else 1, 2 if dashboard else 1, squeeze=False).flatten()
     for axis, panel in zip(axes, ("reward", "loss", "consistency") if dashboard else (panel_kind,)):
         draw_panel(axis, panel, rows, status, smooth_window)
+    if dashboard:
+        axes[-1].axis("off")
     figure.suptitle(heading, fontsize=10, color="#166534" if status["accepted"] else "#b45309")
     for extension in ("png", "svg"):
         figure.savefig(output / f"{kind}.{extension}", dpi=150, facecolor="white")

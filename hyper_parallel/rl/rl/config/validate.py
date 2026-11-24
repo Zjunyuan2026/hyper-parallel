@@ -479,16 +479,22 @@ def _validate_vllm(
     trainer_world_size = _trainer_world_size(accelerator)
     if vllm.get("node_local_world_size") is not None and (
         deployment != "colocated" or model_registration.family != "qwen3_moe"
-        or vllm.get("model_implementation", "native") != "unified"
+        or vllm.get("model_implementation", "native") not in ("native", "unified")
     ):
-        raise ValueError("Node-local rollout requires colocated unified Qwen3 MoE")
+        raise ValueError("Node-local rollout requires colocated native or unified Qwen3 MoE")
     if deployment == "colocated":
-        resident_moe = (model_registration.family == "qwen3_moe"
-                        and vllm.get("model_implementation", "native") == "unified")
+        resident_moe = (model_registration.family == "qwen3_moe" and (
+            vllm.get("model_implementation", "native") == "unified" or (
+                vllm.get("model_implementation", "native") == "native"
+                and vllm.get("node_local_world_size") is not None
+                and vllm.get("enable_expert_parallel", False)
+            )
+        ))
         if not accelerator.get("cpu_offload", False) and (
             model_registration.family != "qwen3" or int(accelerator.get("tp", 1)) != 1
         ) and not resident_moe:
-            raise ValueError("Colocated device-resident training requires Qwen3 dense with TP1 or unified Qwen3 MoE")
+            raise ValueError("Colocated device-resident training requires dense TP1, "
+                             "unified MoE or node-local native EP MoE")
         _validate_colocated_vllm(vllm, accelerator, trainer_world_size, rollout_dp, rollout_tp)
     else:
         _validate_disjoint_vllm(vllm, trainer_world_size, rollout_dp)

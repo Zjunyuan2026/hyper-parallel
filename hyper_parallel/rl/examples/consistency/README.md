@@ -1,5 +1,98 @@
 # Qwen3 训推一致性
 
+训练绘图脚本导出的所有 PNG/SVG（含总览图、原始曲线图）统一使用宽:高 **6:4**。
+单项图为 6×4 英寸，普通总览图为 12×8、formal 总览图为 18×12 英寸。
+已有运行的图片需要用更新后的绘图脚本重新生成；数据和坐标数值保持原样。
+
+## Qwen3-30B-A3B：原生 vLLM 对照训练（不启用训推一致）
+
+独立的[原生配置](../gsm8k/configs/qwen3_30b_a3b_gsm8k_native.yaml)不包含 `consistency`，
+不使用 PIK、Level 3、V4 Attention 或严格 log-prob 相等检查。
+训练使用普通 HyperParallel MoE 模块，推理由 vLLM 原生 Qwen3-MoE 实现执行。
+vLLM 的 HTTP/IPC 权重发布插件仍用于接收训练权重，不替换原生推理计算。
+本入口复用空闲节点筛选，当前节点必须空闲，再从候选中选出三个空闲节点。
+
+两步测试（在候选列表第一台宿主机、仓库根目录执行）：
+
+```bash
+python3 hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_cluster.py --hosts 80.5.21.101,80.5.21.102,80.5.21.106,80.5.21.107,80.5.21.108 --master-addr 172.27.3.101 --interface data0.172 --select-nodes 4 --native-baseline --steps 2 --micro-batch-size 2 --max-prompt 1024 --max-new-tokens 1024
+```
+
+末尾加 `--dry-run` 可只显示计划；正式训练把 `--steps 2` 改为 `--steps 50`。
+原始数据、模型、镜像和共享目录参数沿用集群入口默认值，也可通过 CLI 覆盖。
+数据按 4B 协议从完整 7473/1319 行分别以 `Random(42)` 无放回抽取 6400/500 行，保持顺序。
+每步 128 题、每题 8 回答、micro-batch 2、每 DP rank response mini-batch 128；
+2 步使用前 256 题，50 步恰好覆盖全部 6400 题。
+
+学习率 `1e-6`、KL `0.001`、weight decay `0.01`、FP32 主参数及其余算法/优化器超参数对齐 4B。
+`old_log_prob_source=actor`，`collect_log_probs=false`；仍计算训练锚点和 Reference 概率，
+但不收集独立采样概率，也不要求训练/推理概率一致。
+训练 TP4/CP2/DP8/EP4，关闭 SP；推理每节点 native DP8/TP2，启用原生专家并行（EP16），关闭 EPLB。
+推理 token budget 1024、序列上限 4、KV cache 2 GiB，prompt/回答上限均为 1024。
+
+按当前原生共置支持边界启用 CPU offload，Reference 也继承此策略。
+该内存策略、专家并行范围与 unified 对照不同，不能将时间差全部归因于是否启用一致性。
+无需修补版 V4 wheel；不使用 unified 的专家通信开关，原生 vLLM-Ascend 内部算子由镜像实现选择。
+当前仅完成 CPU 配置/启动流程验证，四节点 native IPC、通信及内存仍需 A3 实机验收。
+
+原生完成报告为 `node0/run/native-training.json`，不生成严格一致性通过结论。
+时间仍记录在 `node0/run/steps.jsonl`、`steps.csv` 和根目录 `summary.json`，可用原耗时统计方式。
+训练前后评估固定 500 题；50 步时每 10 步评估，每 5 步及最终保存 checkpoint。
+两步测试会在第 2 步保存最终 checkpoint。本入口默认不生成一致性图。
+
+## Qwen3-30B-A3B：6400/500 训推一致，5 步试跑或 50 步训练
+
+在 rank-0 宿主机、仓库根目录执行。`--hosts` 第一项必须是当前主机；
+其余候选主机中选择空闲节点，总计四节点、每节点 16 个 rank：
+
+```bash
+bash hyper_parallel/rl/examples/gsm8k/scripts/run_qwen3_30b_5step.sh \
+  --hosts <rank0-ip>,<peer1-ip>,<peer2-ip>,<peer3-ip> \
+  --master-addr <rank0-通信网卡-ip> --interface <通信网卡名> \
+  --model-root /absolute/shared/models/Qwen3-30B-A3B \
+  --data-root /absolute/shared/data/full-gsm8k \
+  --shared-root /absolute/shared/results --wheel /absolute/path/to/patched-v4.whl
+```
+
+末尾添加 `--dry-run` 只显示计划，不连接主机、不启动训练。
+[独立配方](../gsm8k/configs/qwen3_30b_a3b_gsm8k_unified_5step.yaml)复用 MoE 的
+TP4/CP2/DP8/EP4、每节点 rollout TP2/DP8/EP8，完整模型、不做 CPU offload。
+每步全局 128 题，每题 8 个回答，micro-batch **2**，每 DP rank 的 response mini-batch 128。
+prompt/回答上限均为 1024，`max_model_len=2048`，`max_num_batched_tokens=1024`；
+保留当前 MoE 的 `max_num_seqs=4`、2 GiB KV cache、图执行、前缀缓存和 chunked prefill。
+
+输入必须是完整官方 split 的 RL 格式 Parquet（7473/1319 行，含 `prompt`、`extra_info`）。
+[抽样脚本](../gsm8k/scripts/prepare_baseline_data.py)对 train/test 分别重置 `Random(42)`，
+无放回抽取 6400/500 行，保留抽取顺序，训练不 shuffle。
+独立结果目录的 `baseline/data/manifest.json` 保存源文件和输出哈希、抽取索引。
+5 步仅使用抽样训练集的前 640 题；训练前和第 5 步在同一 500 题上贪心评估，
+第 5 步 checkpoint 位于 `baseline/checkpoints/step_5`。需要为模型、优化器和 runtime state 预留磁盘空间。
+完整训练在同一命令末尾添加 `--steps 50`；旧脚本名和 `--baseline-5step` 参数名保留兼容。
+50 步每步 128 题，恰好覆盖全部 6400 题；训练前及第 10/20/30/40/50 步评估同一 500 题。
+每 5 步保存 checkpoint，最终另导出 `baseline/checkpoints/step_50/hf/`，不会覆盖原模型。
+覆盖检查使用实际 request-owner 的样本索引，每步核验 128 道预期题目；
+`node0/run/coverage.json` 保存每步索引，结束时检查无重复、无遗漏，50 步覆盖恰好 6400 题。
+50 步默认超时 86400 秒，预检磁盘空间按十份 checkpoint 加最终模型导出计入模型下限，
+优化器和 runtime state 仍需额外空间。默认 5 步运行、逐步严格概率检查和自动绘图保持不变。
+
+配置生成器保留 `consistency.mode=batch_invariant`、Level 3、V4 和 MoE 模块替换。
+`collect_log_probs=true` 保留独立 sampling 概率，`old_log_prob_source=actor` 重算训练锚点；
+现有一致性入口每步更新前检查有效 token 和 log-prob 最大/平均差，缺失概率或差异非零均失败。
+该检查覆盖采样 token，不等同于全词表 logits 检查，也不保证准确率上升。
+KL 系数为 `0.001`，使用 `low_var_kl`，与完整 MoE GSM8K 训练配方一致；
+训练器会构建冻结的 Reference 模型并计算参考概率，增加内存与计算开销。
+算法与优化器超参数对齐原 PR 的 4B unified 配方：学习率 `1e-6`、constant、无 warmup，
+weight decay `0.01`、梯度裁剪 `1.0`、Adam betas `[0.9, 0.999]`、eps `1e-8`，
+`fp32_main_params=true`、`no_decay_params=[]`。GRPO clip low/high 为 `0.2`、clip C 为 `3.0`，
+advantage epsilon `1e-6`、token-mean 聚合、每步 policy update epoch 为 1。
+训练 seed 为 42，rollout request seed 为 null，vLLM seed 为 17；每 micro-batch 同步梯度。
+这不保证跨模型或跨硬件复现相同采样结果。
+MoE 保留自身的 TP4/CP2、专家实现与内存策略；4B 的三个 `2048` 动态 token budget
+当前只支持 Dense TP1，不复制到 MoE。FP32 主参数和 Reference 会增加内存占用，需实机验证。
+最终配置保存在 `node*/run/generated-config.yaml`，逐步一致性证据在 `node0/run/consistency.json`。
+
+该入口与下文 `--formal-gsm8k` 的 50 步流程互斥，原 50 步数据划分及运行参数保持不变。
+
 ## Qwen3-4B
 
 [稠密 4B 配方](configs/qwen3_4b_rl.yaml) 使用完整 Qwen3-4B 权重，两张 NPU 同置运行两步 GRPO。默认训练 TP2/SP、推理 TP2，均为 BF16、Level 3 和 V4。PIK 的 `num_leaves: auto` 在此配置解析为 2，覆盖 Attention 的 `o_proj` 和 MLP 的 `down_proj`。在已安装 Hyper-RL 和 V4 的运行容器中，从仓库根目录运行：
