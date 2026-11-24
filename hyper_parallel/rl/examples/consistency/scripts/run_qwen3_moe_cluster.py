@@ -205,9 +205,12 @@ def docker_command(args: argparse.Namespace, node_rank: int, address: str,
         "RESULT_UID": str(os.getuid()), "RESULT_GID": str(os.getgid()), "PLOT_TRAINING": str(args.plot).lower(),
     }
     if getattr(args, "baseline_5step", False):
-        environment.update(BASELINE_5STEP="true", PREFILL_TOKENS="1024")
+        environment.update(BASELINE_5STEP="true", PREFILL_TOKENS="8192")
     if getattr(args, "native_baseline", False):
-        environment.update(NATIVE_BASELINE="true", PREFILL_TOKENS="1024", CPU_OFFLOAD="false", TRAIN_SP="false")
+        environment.update(NATIVE_BASELINE="true", PREFILL_TOKENS="8192", CPU_OFFLOAD="false", TRAIN_SP="false")
+    if getattr(args, "baseline_5step", False) or getattr(args, "native_baseline", False):
+        environment.pop("KV_CACHE_MEMORY_BYTES", None)
+        environment["MAX_NUM_SEQS"] = "64"
     for key, value in environment.items():
         command.extend(["-e", f"{key}={value}"])
     options = [] if getattr(args, "native_baseline", False) else ["--track-updates"]
@@ -282,12 +285,10 @@ def run(args: argparse.Namespace) -> Path:
             execute(host, index == 0, ["test", "-s", str(path)])
         require_idle(execute(host, index == 0, ["npu-smi", "info"]).stdout, host)
         (directory / f"node{index}/run").mkdir(parents=True)
-    if args.formal_gsm8k or getattr(args, "baseline_5step", False) or getattr(args, "native_baseline", False):
+    if args.formal_gsm8k:
         weight_bytes = sum(path.stat().st_size for path in args.model_root.glob("*.safetensors"))
         free_bytes = shutil.disk_usage(directory).free
-        model_copies = (args.steps // 5 + 1 if getattr(args, "baseline_5step", False) else
-                        (args.steps // 5 + int(args.steps % 5 != 0) + 1)
-                        if getattr(args, "native_baseline", False) else 6)
+        model_copies = 6
         print("CHECKPOINT_STORAGE", json.dumps({"shared_free_gb": free_bytes / 1024**3,
               "model_only_lower_bound_gb": weight_bytes * model_copies / 1024**3,
               "note": "Model/export lower bound only; optimizer/rank state needs additional space"}), flush=True)
@@ -358,6 +359,18 @@ def run(args: argparse.Namespace) -> Path:
             formal_path = directory / "node0/run/formal-summary.json"
             result["formal"] = json.loads(formal_path.read_text()) if formal_path.is_file() else {}
             result["passed"] = result["passed"] and result["formal"].get("passed") is True
+        if args.plot:
+            plots = directory / "node0/run/plots"
+            marker = plots / "plot-summary.json"
+            evidence = json.loads(marker.read_text()) if marker.is_file() else {}
+            figures = evidence.get("figures", [])
+            verified = bool(figures) and evidence.get("accepted", evidence.get("passed")) is True
+            for kind in figures:
+                for extension in ("png", "svg"):
+                    path = plots / f"{kind}.{extension}"
+                    verified = verified and path.is_file() and path.stat().st_size > 0
+            result["plots_verified"] = verified
+            result["passed"] = result["passed"] and verified
     finally:
         for index, host, name in launched:
             for command in (["docker", "logs", name], ["docker", "rm", "-f", name]):
@@ -403,7 +416,7 @@ def main() -> None:
     parser.add_argument("--native-baseline", action="store_true",
                         help="Native vLLM MoE without strict consistency; default 2 steps, up to 50")
     parser.add_argument("--baseline-5step", action="store_true",
-                        help="Unified 6400/500 baseline; default 5-step pilot, --steps 50 for a complete epoch")
+                        help="Unified 6400/500 baseline; default 2-step pilot, --steps 50 for a complete epoch")
     parser.add_argument("--global-prompt-batch-size", type=int, help="Global questions per step across training DP")
     parser.add_argument("--micro-batch-size", type=int, default=1)
     parser.add_argument("--response-mini-batch-size", type=int,
@@ -429,16 +442,17 @@ def main() -> None:
                          "batch 128, micro/mini=2/128 and offload=false")
         args.cpu_offload = False
         args.full_data = False
-        args.plot = False
+        args.plot = True
     if args.baseline_5step:
         if args.formal_gsm8k:
             parser.error("--baseline-5step and --formal-gsm8k are mutually exclusive")
-        args.steps = 5 if args.steps is None else args.steps
+        args.steps = 2 if args.steps is None else args.steps
         args.global_prompt_batch_size = 128 if args.global_prompt_batch_size is None else args.global_prompt_batch_size
         args.response_mini_batch_size = 128 if args.response_mini_batch_size is None else args.response_mini_batch_size
-        if (args.steps not in (5, 50) or args.select_nodes != 4 or args.global_prompt_batch_size != 128
+        if (args.steps not in (2, 5, 50) or args.select_nodes != 4 or args.global_prompt_batch_size != 128
                 or args.micro_batch_size != 2 or args.response_mini_batch_size != 128 or args.cpu_offload):
-            parser.error("Baseline requires four nodes, 5 or 50 steps, batch 128, micro/mini=2/128 and offload=false")
+            parser.error("Baseline requires four nodes, 2, 5 or 50 steps, "
+                         "batch 128, micro/mini=2/128 and offload=false")
         args.full_data = False
         args.plot = True
     if args.summarize is not None:
@@ -483,9 +497,12 @@ def main() -> None:
                           "max_prompt_tokens": args.max_prompt, "max_new_tokens": args.max_new_tokens,
                           "max_model_len": args.max_prompt + args.max_new_tokens,
                           "formal_gsm8k": args.formal_gsm8k, "baseline_5step": args.baseline_5step,
-                          "max_num_batched_tokens": (1024 if args.baseline_5step or args.native_baseline
+                          "max_num_batched_tokens": (8192 if args.baseline_5step or args.native_baseline
                                                      else args.max_prompt),
                           "native_baseline": args.native_baseline,
+                          "max_num_seqs": 64 if args.baseline_5step or args.native_baseline else 4,
+                          "gpu_memory_utilization": 0.6 if args.baseline_5step or args.native_baseline else 0.35,
+                          "kv_cache_auto": args.baseline_5step or args.native_baseline,
                           "strict_consistency": not args.native_baseline,
                           "timeout": args.timeout}, indent=2))
         return

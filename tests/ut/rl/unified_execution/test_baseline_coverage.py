@@ -38,10 +38,15 @@ def load_class(path: str, name: str, bindings: dict):
 class BaselineCoverageTests(unittest.TestCase):
     """Accept real DP sample order, and reject duplicates and incomplete epochs."""
 
-    def test_fifty_batches_cover_all_6400_questions(self) -> None:
+    def test_pilot_and_full_epoch_coverage(self) -> None:
+        for steps in (2, 5, 50):
+            with self.subTest(steps=steps):
+                self._exercise_coverage(steps)
+
+    def _exercise_coverage(self, steps: int) -> None:
         sampler = load_class("hyper_parallel/rl/rl/data/prompts.py", "_DistributedPromptSampler", {"random": random})
         shards = [list(sampler(6400, rank=rank, world_size=8, seed=42, shuffle=False)) for rank in range(8)]
-        trainer = SimpleNamespace(state=SimpleNamespace(max_steps=50, global_step=0),
+        trainer = SimpleNamespace(state=SimpleNamespace(max_steps=steps, global_step=0),
                                   train_dataloader=SimpleNamespace(dataset=[None] * 6400),
                                   rollout_engine=SimpleNamespace(is_request_owner=True),
                                   _generate_training_rollout=lambda _batch, _timings: "generated",
@@ -57,13 +62,13 @@ class BaselineCoverageTests(unittest.TestCase):
                               "BaselineCoverage", {"dist": dist, "json": json})
         with tempfile.TemporaryDirectory() as temporary:
             observer = coverage(trainer, Path(temporary))
-            for step in range(50):
+            for step in range(steps):
                 trainer.state.global_step = step
                 self.assertEqual(trainer._generate_training_rollout({"sample_indices": []}, {}), "generated")
             observer.finish()
             records = json.loads((Path(temporary) / "coverage.json").read_text())
-            self.assertEqual(len(records), 50)
-            self.assertEqual(len({index for row in records for index in row["indices"]}), 6400)
+            self.assertEqual(len(records), steps)
+            self.assertEqual(len({index for row in records for index in row["indices"]}), steps * 128)
             trainer.state.global_step = 0
             shards[1][0] = shards[0][0]
             with self.assertRaisesRegex(ValueError, "coverage"):

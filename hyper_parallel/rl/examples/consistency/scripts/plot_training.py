@@ -17,6 +17,7 @@
 import argparse
 import json
 import math
+import textwrap
 from pathlib import Path
 
 import yaml
@@ -44,6 +45,18 @@ def number(row: dict, key: str) -> float:
 
 def run_status(directory: Path, rows: list[dict]) -> dict:
     """Distinguish complete acceptance, partial failure and unverified live metrics."""
+    native_report = directory / "native-training.json"
+    if native_report.is_file():
+        state = json.loads(native_report.read_text(encoding="utf-8"))
+        requested = state.get("completed_steps")
+        complete = (state.get("passed") is True and requested == len(rows)
+                    and state.get("strict_consistency") is False
+                    and state.get("model_implementation") == "native")
+        return {"recorded_steps": len(rows), "requested_steps": requested, "completed_run": complete,
+                "accepted": complete, "strict_consistency_enabled": False,
+                "strict_zero_for_all_recorded_steps": None, "invalid_or_nonzero_steps": [],
+                "status": "COMPLETE (NATIVE)" if complete else "PARTIAL / COMPLETION UNVERIFIED",
+                "scope": "Native training completion; train/rollout consistency was not checked"}
     state = {}
     for name in ("summary.json", "consistency.json"):
         path = directory / name
@@ -83,10 +96,12 @@ def topology_caption(directory: Path) -> str:
     config = yaml.safe_load(path.read_text(encoding="utf-8"))
     train = config["train"]["accelerator"]
     rollout = config["rollout"]["vllm"]
+    ep = rollout.get("expert_parallel_size", rollout["data_parallel_size"] * rollout["tensor_parallel_size"]
+                     if rollout.get("enable_expert_parallel", False) else 1)
     return (f'Train: TP{train["tp"]} DP{train["dp_shard"]} EP{train["ep"]} '
             f'CP{train.get("cp", 1)} SP={train["sequence_parallel"]}\n'
             f'Rollout: TP{rollout["tensor_parallel_size"]} DP{rollout["data_parallel_size"]} '
-            f'EP{rollout["expert_parallel_size"]} PCP{rollout.get("context_parallel_size", 1)} '
+            f'EP{ep} PCP{rollout.get("context_parallel_size", 1)} '
             f'SP={rollout.get("sequence_parallel", False)}')
 
 
@@ -135,6 +150,9 @@ def draw_panel(axis: Axes, kind: str, rows: list[dict], status: dict, smooth_win
                                 ("train/policy_loss", "Policy loss", "#7c3aed"),
                                 ("train/kl_loss", "KL loss", "#64748b")), smooth_window)
         axis.set_ylabel("Loss (signed)")
+    elif kind == "step-time":
+        draw_series(axis, rows, (("perf/time_per_step", "Training step time", "#2563eb"),))
+        axis.set_ylabel("Seconds")
     else:
         draw_series(axis, rows, (("training/rollout_log_probs_diff_max", "Max logp difference", "#059669"),
                                 ("training/rollout_log_probs_diff_mean", "Mean logp difference", "#2563eb")))
@@ -163,11 +181,13 @@ def _save_figure(output: Path, kind: str, rows: list[dict], status: dict, headin
     figure = Figure(figsize=(12, 8) if dashboard else (6, 4), layout="constrained")
     FigureCanvasAgg(figure)
     axes = figure.subplots(2 if dashboard else 1, 2 if dashboard else 1, squeeze=False).flatten()
-    for axis, panel in zip(axes, ("reward", "loss", "consistency") if dashboard else (panel_kind,)):
+    panels = ("reward", "loss", "step-time" if status.get("strict_consistency_enabled") is False else "consistency")
+    for axis, panel in zip(axes, panels if dashboard else (panel_kind,)):
         draw_panel(axis, panel, rows, status, smooth_window)
     if dashboard:
         axes[-1].axis("off")
-    figure.suptitle(heading, fontsize=10, color="#166534" if status["accepted"] else "#b45309")
+    caption = "\n".join(textwrap.fill(line, width=100 if dashboard else 65) for line in heading.splitlines())
+    figure.suptitle(caption, fontsize=10, color="#166534" if status["accepted"] else "#b45309")
     for extension in ("png", "svg"):
         figure.savefig(output / f"{kind}.{extension}", dpi=150, facecolor="white")
     figure.clear()
@@ -183,7 +203,9 @@ def render(directory: Path, output: Path, smooth_window: int = 5) -> dict:
     caption = topology_caption(directory)
     heading = (f'{status["status"]}: {len(rows)}/{status["requested_steps"] or "?"} recorded steps\n'
                + caption)
-    for kind in ("reward", "loss", "consistency", "training-curves"):
+    timing_or_consistency = "step-time" if status.get("strict_consistency_enabled") is False else "consistency"
+    figures = ("reward", "loss", timing_or_consistency, "training-curves", "reward-raw", "loss-raw")
+    for kind in figures[:4]:
         _save_figure(output, kind, rows, status, heading, smooth_window)
     for kind in ("reward-raw", "loss-raw"):
         _save_figure(output, kind, rows, status, heading, 1)
@@ -200,6 +222,12 @@ def render(directory: Path, output: Path, smooth_window: int = 5) -> dict:
     status["updates_verified_by_following_rollout"] = [
         row["step"] for row in observations if row["publication_completed"] and row["next_step_logp_verified"]]
     status["update_consistency_witnessed"] = bool(status["updates_verified_by_following_rollout"])
+    for kind in figures:
+        for extension in ("png", "svg"):
+            path = output / f"{kind}.{extension}"
+            if not path.is_file() or path.stat().st_size == 0:
+                raise RuntimeError(f"Missing training figure: {path}")
+    status["figures"] = list(figures)
     (output / "plot-summary.json").write_text(json.dumps(status, indent=2) + "\n", encoding="utf-8")
     return status
 

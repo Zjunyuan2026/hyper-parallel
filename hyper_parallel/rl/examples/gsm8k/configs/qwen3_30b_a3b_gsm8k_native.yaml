@@ -1,4 +1,4 @@
-# Native vLLM; 6400/500 GSM8K; four nodes, 64 ranks; 2-step pilot or 50-step epoch.
+# Qwen3-30B-A3B, 6400/500 data; default 2-step test; auto KV cache at 0.6.
 model:
   registry_name: qwen3_30b_a3b
   name: qwen3_moe
@@ -46,12 +46,11 @@ rollout:
     batch_invariant: false
     enable_prefix_caching: true
     enable_chunked_prefill: true
-    gpu_memory_utilization: 0.35
-    kv_cache_memory_bytes: 2147483648
+    gpu_memory_utilization: 0.6
     max_model_len: 2048
     block_size: 128
-    max_num_seqs: 4
-    max_num_batched_tokens: 1024
+    max_num_seqs: 64
+    max_num_batched_tokens: 8192
     logprobs_mode: raw_logprobs
     startup_timeout: 1800
     request_timeout: 600
@@ -64,6 +63,17 @@ rollout:
     enable_expert_parallel: true
     enable_eplb: false
     seed: 17
+    compilation_config:
+      mode: 3
+      cudagraph_mode: FULL_AND_PIECEWISE
+      cudagraph_capture_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
   collect_log_probs: false
 agentic:
   runner: internal
@@ -187,8 +197,8 @@ train:
   checkpoint:
     load_path: null
     output_dir: /baseline-run/checkpoints
-    save_steps: 5
-    save_final: true
+    save_steps: 0
+    save_final: false
     verify_reload: false
   old_log_prob_source: actor
   gradient_sync_each_micro_batch: true

@@ -34,6 +34,28 @@ with patch.object(sys, "path", [str(SCRIPTS), *sys.path]):
 class FormalPlotTests(unittest.TestCase):
     """Eight charts require both numerical consistency and formal completion evidence."""
 
+    def test_native_exports_images_without_claiming_consistency(self) -> None:
+        """Native reward/loss/time figures must exist and preserve the requested 6:4 ratio."""
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "native-training.json").write_text(json.dumps({
+                "passed": True, "completed_steps": 2, "strict_consistency": False,
+                "model_implementation": "native",
+            }))
+            rows = [{"step": step, "reward/mean": 0.5, "train/total_loss": -0.1,
+                     "perf/time_per_step": 100.0} for step in (1, 2)]
+            (root / "steps.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+            result = sys.modules["plot_training"].render(root, root / "plots")
+            self.assertTrue(result["accepted"])
+            self.assertFalse(result["strict_consistency_enabled"])
+            self.assertIsNone(result["strict_zero_for_all_recorded_steps"])
+            self.assertFalse((root / "plots/consistency.png").exists())
+            self.assertTrue((root / "plots/step-time.png").is_file())
+            self.assertEqual(len(list((root / "plots").glob("*.png"))), 6)
+            for path in (root / "plots").glob("*.png"):
+                width, height = struct.unpack(">II", path.read_bytes()[16:24])
+                self.assertEqual(width * 4, height * 6)
+
     def test_exports_all_figures_without_claiming_missing_test_results(self) -> None:
         """A complete short log cannot certify training coverage, validation and final test."""
         with TemporaryDirectory() as temporary:

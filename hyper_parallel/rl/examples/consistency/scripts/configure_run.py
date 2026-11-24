@@ -167,21 +167,21 @@ def configure(config: dict, world: int) -> dict:
         config["rollout"]["seed"] = None
         inference["seed"] = 17
         if (boolean("FORMAL_GSM8K", False) or world != 64 or dp_size != 8
-                or train["max_steps"] not in (5, 50) or runner != "internal"
+                or train["max_steps"] not in (2, 5, 50) or runner != "internal"
                 or train["prompt_batch_size"] != 16 or candidates != 8
                 or train["micro_batch_size"] != 2 or mini != 128):
-            raise ValueError("Baseline requires 64 ranks, 5 or 50 steps, 128 questions, 8 answers and micro/mini=2/128")
+            raise ValueError("Baseline requires 64 ranks, 2, 5 or 50 steps, "
+                             "128 questions, 8 answers and micro/mini=2/128")
         config["data"].update(train_path="/baseline-run/data/train.parquet",
                               test_path="/baseline-run/data/test.parquet", max_train_samples=6400, shuffle=False)
-        inference["max_num_batched_tokens"] = 1024
         config["rollout"]["collect_log_probs"] = True
         train["old_log_prob_source"] = "actor"
         config["evaluation"].update(enabled=True, max_samples=500, batch_size=16,
                                     max_new_tokens=config["rollout"]["max_new_tokens"], temperature=0.0,
                                     do_sample=False, before_train=True,
                                     every_n_steps=5 if train["max_steps"] == 5 else 10, at_end=True)
-        train["checkpoint"].update(output_dir="/baseline-run/checkpoints", save_steps=5,
-                                   save_final=train["max_steps"] == 50, verify_reload=False, load_path=None)
+        train["checkpoint"].update(output_dir="/baseline-run/checkpoints", save_steps=0,
+                                   save_final=False, verify_reload=False, load_path=None)
     if boolean("NATIVE_BASELINE", False):
         if (boolean("BASELINE_5STEP", False) or boolean("FORMAL_GSM8K", False)
                 or world != 64 or dp_size != 8 or not 1 <= train["max_steps"] <= 50
@@ -203,12 +203,19 @@ def configure(config: dict, world: int) -> dict:
         for field in ("expert_parallel_size", "unified_execution", "sequence_parallel", "compilation_config"):
             inference.pop(field, None)
         inference.update(model_implementation="native", enable_expert_parallel=True, enable_eplb=False,
-                         batch_invariant=False, seed=17, max_num_batched_tokens=1024)
+                         batch_invariant=False, seed=17)
         config["evaluation"].update(enabled=True, max_samples=500, batch_size=16,
                                     max_new_tokens=config["rollout"]["max_new_tokens"], temperature=0.0,
                                     do_sample=False, before_train=True, every_n_steps=10, at_end=True)
-        train["checkpoint"].update(output_dir="/baseline-run/checkpoints", save_steps=5,
-                                   save_final=True, verify_reload=False, load_path=None)
+        train["checkpoint"].update(output_dir="/baseline-run/checkpoints", save_steps=0,
+                                   save_final=False, verify_reload=False, load_path=None)
+    if boolean("BASELINE_5STEP", False) or boolean("NATIVE_BASELINE", False):
+        inference.pop("kv_cache_memory_bytes", None)
+        inference.update(gpu_memory_utilization=0.6, max_num_seqs=64, max_num_batched_tokens=8192,
+                         enforce_eager=False, compilation_config={
+                             "mode": 3, "cudagraph_mode": "FULL_AND_PIECEWISE",
+                             "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32, 64],
+                         })
     if boolean("FORMAL_GSM8K", False):
         if (world != 64 or dp_size != 8 or train["max_steps"] != 50 or runner != "internal"
                 or train["prompt_batch_size"] != 17 or candidates != 4

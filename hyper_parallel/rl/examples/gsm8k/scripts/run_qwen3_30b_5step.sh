@@ -12,6 +12,6 @@ set -euo pipefail
 scripts=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo=$(cd -- "$scripts/../../../../.." && pwd)
 exec python "$repo/hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_cluster.py" \
-    --baseline-5step --steps 5 --select-nodes 4 \
+    --baseline-5step --steps 2 --select-nodes 4 \
     --global-prompt-batch-size 128 --micro-batch-size 2 --response-mini-batch-size 128 \
     --max-prompt 1024 --max-new-tokens 1024 "$@"

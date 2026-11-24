@@ -145,8 +145,8 @@ class BaselineCoverage:
         self.rank = dist.get_rank()
         self.steps = trainer.state.max_steps
         self.records = []
-        if len(trainer.train_dataloader.dataset) != 6400 or self.steps not in (5, 50):
-            raise ValueError("Unified baseline requires 6400 questions and 5 or 50 steps")
+        if len(trainer.train_dataloader.dataset) != 6400 or self.steps not in (2, 5, 50):
+            raise ValueError("Unified baseline requires 6400 questions and 2, 5 or 50 steps")
         original = trainer._generate_training_rollout
 
         def generate(batch, timings):

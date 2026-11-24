@@ -15,7 +15,7 @@ vLLM 的 HTTP/IPC 权重发布插件仍用于接收训练权重，不替换原�
 两步测试（在候选列表第一台宿主机、仓库根目录执行）：
 
 ```bash
-python3 hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_cluster.py --hosts 80.5.21.101,80.5.21.102,80.5.21.106,80.5.21.107,80.5.21.108 --master-addr 172.27.3.101 --interface data0.172 --select-nodes 4 --native-baseline --steps 2 --micro-batch-size 2 --max-prompt 1024 --max-new-tokens 1024
+python3 hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_cluster.py --hosts 80.5.21.101,80.5.21.102,80.5.21.103,80.5.21.104,80.5.21.106,80.5.21.107,80.5.21.108 --master-addr 172.27.3.101 --interface data0.172 --select-nodes 4 --native-baseline --steps 2 --micro-batch-size 2 --max-prompt 1024 --max-new-tokens 1024
 ```
 
 末尾加 `--dry-run` 可只显示计划；正式训练把 `--steps 2` 改为 `--steps 50`。
@@ -28,7 +28,8 @@ python3 hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_cluster.py 
 `old_log_prob_source=actor`，`collect_log_probs=false`；仍计算训练锚点和 Reference 概率，
 但不收集独立采样概率，也不要求训练/推理概率一致。
 训练 TP4/CP2/DP8/EP4，关闭 SP；推理每节点 native DP8/TP2，启用原生专家并行（EP16），关闭 EPLB。
-推理 token budget 1024、序列上限 4、KV cache 2 GiB，prompt/回答上限均为 1024。
+推理 token budget 8192、序列上限 64，`gpu_memory_utilization=0.6`，移除固定 KV cache 字节数，
+由 vLLM 自动估算缓存容量。prompt/回答上限均为 1024。
 
 按当前原生共置支持边界启用 CPU offload，Reference 也继承此策略。
 该内存策略、专家并行范围与 unified 对照不同，不能将时间差全部归因于是否启用一致性。
@@ -37,10 +38,12 @@ python3 hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_cluster.py 
 
 原生完成报告为 `node0/run/native-training.json`，不生成严格一致性通过结论。
 时间仍记录在 `node0/run/steps.jsonl`、`steps.csv` 和根目录 `summary.json`，可用原耗时统计方式。
-训练前后评估固定 500 题；50 步时每 10 步评估，每 5 步及最终保存 checkpoint。
-两步测试会在第 2 步保存最终 checkpoint。本入口默认不生成一致性图。
+训练前后评估固定 500 题；50 步时每 10 步评估。不保存训练 checkpoint、优化器状态或最终 HF 权重。
+保留日志、指标和评估结果，并自动生成 reward、loss、耗时、总览和原始曲线的 PNG/SVG。
+原生模式不生成一致性图，也不会把未检查的概率差异标成零。
+两种模式都必须通过图片存在及非空检查才能报告整体成功，图片位于 `node0/run/plots/`，宽高比均为 6:4。
 
-## Qwen3-30B-A3B：6400/500 训推一致，5 步试跑或 50 步训练
+## Qwen3-30B-A3B：6400/500 训推一致，默认 2 步，支持 5/50 步
 
 在 rank-0 宿主机、仓库根目录执行。`--hosts` 第一项必须是当前主机；
 其余候选主机中选择空闲节点，总计四节点、每节点 16 个 rank：
@@ -58,22 +61,26 @@ bash hyper_parallel/rl/examples/gsm8k/scripts/run_qwen3_30b_5step.sh \
 [独立配方](../gsm8k/configs/qwen3_30b_a3b_gsm8k_unified_5step.yaml)复用 MoE 的
 TP4/CP2/DP8/EP4、每节点 rollout TP2/DP8/EP8，完整模型、不做 CPU offload。
 每步全局 128 题，每题 8 个回答，micro-batch **2**，每 DP rank 的 response mini-batch 128。
-prompt/回答上限均为 1024，`max_model_len=2048`，`max_num_batched_tokens=1024`；
-保留当前 MoE 的 `max_num_seqs=4`、2 GiB KV cache、图执行、前缀缓存和 chunked prefill。
+prompt/回答上限均为 1024，`max_model_len=2048`，`max_num_batched_tokens=8192`；
+`max_num_seqs=64`，`gpu_memory_utilization=0.6`，移除固定 KV cache 字节数。
+两种模式均保留前缀缓存、chunked prefill，显式启用 mode 3、FULL_AND_PIECEWISE，
+捕图尺寸为 `[1, 2, 4, 8, 16, 32, 64]`。
 
 输入必须是完整官方 split 的 RL 格式 Parquet（7473/1319 行，含 `prompt`、`extra_info`）。
 [抽样脚本](../gsm8k/scripts/prepare_baseline_data.py)对 train/test 分别重置 `Random(42)`，
 无放回抽取 6400/500 行，保留抽取顺序，训练不 shuffle。
 独立结果目录的 `baseline/data/manifest.json` 保存源文件和输出哈希、抽取索引。
-5 步仅使用抽样训练集的前 640 题；训练前和第 5 步在同一 500 题上贪心评估，
-第 5 步 checkpoint 位于 `baseline/checkpoints/step_5`。需要为模型、优化器和 runtime state 预留磁盘空间。
+默认 2 步使用抽样训练集的前 256 题；训练前和第 2 步在同一 500 题上贪心评估。
+添加 `--steps 5` 可沿用 5 步测试，使用前 640 题。
+两个新增模式均设置 `save_steps=0`、`save_final=false`，所有测试和 50 步运行都不保存训练权重或优化器状态。
+仅保留配置、日志、指标、数据清单及评估结果；不删除以前运行已保存的模型，也不覆盖原始模型。
 完整训练在同一命令末尾添加 `--steps 50`；旧脚本名和 `--baseline-5step` 参数名保留兼容。
 50 步每步 128 题，恰好覆盖全部 6400 题；训练前及第 10/20/30/40/50 步评估同一 500 题。
-每 5 步保存 checkpoint，最终另导出 `baseline/checkpoints/step_50/hf/`，不会覆盖原模型。
+50 步完成后不保存 checkpoint、不导出 HF 权重；本模式仍自动绘图。
 覆盖检查使用实际 request-owner 的样本索引，每步核验 128 道预期题目；
 `node0/run/coverage.json` 保存每步索引，结束时检查无重复、无遗漏，50 步覆盖恰好 6400 题。
-50 步默认超时 86400 秒，预检磁盘空间按十份 checkpoint 加最终模型导出计入模型下限，
-优化器和 runtime state 仍需额外空间。默认 5 步运行、逐步严格概率检查和自动绘图保持不变。
+50 步默认超时 86400 秒，不再为两个新增模式预检 checkpoint 磁盘容量，仍需为日志和抽样数据预留空间。
+默认 2 步运行，逐步严格概率检查和自动绘图保持不变。原 `--formal-gsm8k` 的保存和导出策略保持不变。
 
 配置生成器保留 `consistency.mode=batch_invariant`、Level 3、V4 和 MoE 模块替换。
 `collect_log_probs=true` 保留独立 sampling 概率，`old_log_prob_source=actor` 重算训练锚点；
