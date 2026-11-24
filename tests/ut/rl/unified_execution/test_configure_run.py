@@ -30,6 +30,34 @@ CONFIGURE = runpy.run_path(str(ROOT / "scripts/configure_run.py"))["configure"]
 class ConfigureRunTests(unittest.TestCase):
     """Keep task selection and token/transport budgets independent of topology."""
 
+    def test_baseline_memory_override_preserves_training_and_cache_mode(self) -> None:
+        """Both profiles accept explicit memory budgets without changing default 0.6."""
+        common = {"RUN_MODEL_PATH": "/models/Qwen3-30B-A3B", "TRAIN_TP": "4", "TRAIN_CP": "2",
+                  "TRAIN_EP": "4", "ROLLOUT_TP": "2", "ROLLOUT_PCP": "1", "ROLLOUT_EP": "16",
+                  "ROLLOUT_LOCAL_WORLD_SIZE": "16", "GLOBAL_PROMPT_BATCH_SIZE": "128",
+                  "MICRO_BATCH_SIZE": "2", "RESPONSE_MINI_BATCH_SIZE": "128", "CANDIDATES": "8",
+                  "STEPS": "2", "MAX_PROMPT": "1024", "MAX_NEW_TOKENS": "1024", "MAX_MODEL_LEN": "2048"}
+        for flag, filename in (("BASELINE_5STEP", "qwen3_30b_a3b_gsm8k_unified_5step.yaml"),
+                               ("NATIVE_BASELINE", "qwen3_30b_a3b_gsm8k_native.yaml")):
+            recipe = yaml.safe_load((ROOT.parent / "gsm8k/configs" / filename).read_text(encoding="utf-8"))
+            with patch.dict(os.environ, {**common, flag: "true"}, clear=True):
+                default = CONFIGURE(yaml.safe_load(yaml.safe_dump(recipe)), 64)
+            for value in ("0.4", "0.35"):
+                with self.subTest(flag=flag, value=value), patch.dict(
+                    os.environ, {**common, flag: "true", "GPU_MEMORY_UTILIZATION": value}, clear=True,
+                ):
+                    actual = CONFIGURE(yaml.safe_load(yaml.safe_dump(recipe)), 64)
+                    inference = actual["rollout"]["vllm"]
+                    self.assertEqual(inference["gpu_memory_utilization"], float(value))
+                    self.assertNotIn("kv_cache_memory_bytes", inference)
+                    inference["gpu_memory_utilization"] = 0.6
+                    self.assertEqual(actual, default)
+            for value in ("0", "-0.1", "1.1", "nan", "inf"):
+                with self.subTest(flag=flag, invalid=value), patch.dict(
+                    os.environ, {**common, flag: "true", "GPU_MEMORY_UTILIZATION": value}, clear=True,
+                ), self.assertRaisesRegex(ValueError, "GPU_MEMORY_UTILIZATION"):
+                    CONFIGURE(yaml.safe_load(yaml.safe_dump(recipe)), 64)
+
     def test_native_baseline_removes_unified_execution(self) -> None:
         """Native runs use ordinary MoE training, no strict probability gate and fixed ordered data."""
         environment = {"RUN_MODEL_PATH": "/models/Qwen3-30B-A3B", "TRAIN_TP": "4", "TRAIN_CP": "2",

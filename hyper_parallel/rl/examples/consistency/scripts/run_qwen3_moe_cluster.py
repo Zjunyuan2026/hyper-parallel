@@ -212,6 +212,7 @@ def docker_command(args: argparse.Namespace, node_rank: int, address: str,
     if getattr(args, "baseline_5step", False) or getattr(args, "native_baseline", False):
         environment.pop("KV_CACHE_MEMORY_BYTES", None)
         environment["MAX_NUM_SEQS"] = "64"
+        environment["GPU_MEMORY_UTILIZATION"] = str(getattr(args, "gpu_memory_utilization", 0.6))
     for key, value in environment.items():
         command.extend(["-e", f"{key}={value}"])
     options = [] if getattr(args, "native_baseline", False) else ["--track-updates"]
@@ -315,6 +316,7 @@ def run(args: argparse.Namespace) -> Path:
             "formal_gsm8k": args.formal_gsm8k, "dataset_counts": manifest["counts"] if manifest else None,
             "baseline_5step": getattr(args, "baseline_5step", False),
             "native_baseline": getattr(args, "native_baseline", False),
+            "gpu_memory_utilization": getattr(args, "gpu_memory_utilization", None),
             "strict_consistency": not getattr(args, "native_baseline", False),
             "shared_free_gb_at_start": shutil.disk_usage(directory).free / 1024**3,
             "scope": ("Native vLLM baseline on 6400/500 samples; strict consistency disabled"
@@ -431,10 +433,20 @@ def main() -> None:
     parser.add_argument("--plot", action="store_true", help="Export rank-zero reward/loss/consistency figures")
     parser.add_argument("--max-new-tokens", type=int, default=1024)
     parser.add_argument("--max-prompt", type=int, default=512)
+    parser.add_argument("--gpu-memory-utilization", type=float,
+                        help="6400/500 profiles only: vLLM memory fraction; "
+                             "default 0.6, lower to reserve Trainer headroom")
     parser.add_argument("--cpu-offload", action="store_true")
     parser.add_argument("--timeout", type=int)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if args.gpu_memory_utilization is not None:
+        if not (args.baseline_5step or args.native_baseline):
+            parser.error("--gpu-memory-utilization is supported only by the 6400/500 baseline modes")
+        if not 0 < args.gpu_memory_utilization <= 1:
+            parser.error("--gpu-memory-utilization must be in (0, 1]")
+    elif args.baseline_5step or args.native_baseline:
+        args.gpu_memory_utilization = 0.6
     if args.native_baseline:
         if args.formal_gsm8k or args.baseline_5step:
             parser.error("--native-baseline cannot be combined with unified baseline or formal modes")
@@ -506,7 +518,8 @@ def main() -> None:
                                                      else args.max_prompt),
                           "native_baseline": args.native_baseline,
                           "max_num_seqs": 64 if args.baseline_5step or args.native_baseline else 4,
-                          "gpu_memory_utilization": 0.6 if args.baseline_5step or args.native_baseline else 0.35,
+                          "gpu_memory_utilization": (args.gpu_memory_utilization
+                                                     if args.baseline_5step or args.native_baseline else 0.35),
                           "kv_cache_auto": args.baseline_5step or args.native_baseline,
                           "strict_consistency": not args.native_baseline,
                           "timeout": args.timeout}, indent=2))

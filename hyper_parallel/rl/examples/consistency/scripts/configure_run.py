@@ -211,7 +211,10 @@ def configure(config: dict, world: int) -> dict:
                                    save_final=False, verify_reload=False, load_path=None)
     if boolean("BASELINE_5STEP", False) or boolean("NATIVE_BASELINE", False):
         inference.pop("kv_cache_memory_bytes", None)
-        inference.update(gpu_memory_utilization=0.6, max_num_seqs=64, max_num_batched_tokens=8192,
+        memory_utilization = float(os.environ.get("GPU_MEMORY_UTILIZATION", 0.6))
+        if not 0 < memory_utilization <= 1:
+            raise ValueError("GPU_MEMORY_UTILIZATION must be in (0, 1]")
+        inference.update(gpu_memory_utilization=memory_utilization, max_num_seqs=64, max_num_batched_tokens=8192,
                          enforce_eager=False, compilation_config={
                              "mode": 3, "cudagraph_mode": "FULL_AND_PIECEWISE",
                              "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32, 64],

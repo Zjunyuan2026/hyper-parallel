@@ -49,6 +49,40 @@ def arguments(directory: Path) -> argparse.Namespace:
 class ClusterLauncherTests(unittest.TestCase):
     """Validate placement, completeness, and bounded failure cleanup without NPU use."""
 
+    def test_memory_override_reaches_docker_and_dry_run(self) -> None:
+        """The handoff OOM workaround must not be overwritten by the baseline profile."""
+        for native in (False, True):
+            with self.subTest(native=native):
+                mode = "--native-baseline" if native else "--baseline-5step"
+                command = [str(SCRIPT), "--hosts", "192.0.2.1,192.0.2.2,192.0.2.3,192.0.2.4",
+                           "--master-addr", "198.51.100.1", mode, "--micro-batch-size", "2",
+                           "--gpu-memory-utilization", "0.4", "--dry-run"]
+                stream = io.StringIO()
+                with patch.object(sys, "argv", command), contextlib.redirect_stdout(stream):
+                    CONTROLLER.main()
+                self.assertEqual(json.loads(stream.getvalue())["gpu_memory_utilization"], 0.4)
+                args = arguments(Path("/shared/run"))
+                args.native_baseline = native
+                args.baseline_5step = not native
+                args.hosts = ["192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.4"]
+                args.global_prompt_batch_size = 128
+                args.micro_batch_size = 2
+                args.gpu_memory_utilization = 0.4
+                with patch.object(os, "getuid", return_value=0, create=True), \
+                     patch.object(os, "getgid", return_value=0, create=True):
+                    docker = CONTROLLER.docker_command(args, 0, "198.51.100.1", "image", "owned", Path("/shared/run"))
+                env = dict(value.split("=", 1) for index, value in enumerate(docker)
+                           if index and docker[index - 1] == "-e")
+                self.assertEqual(env["GPU_MEMORY_UTILIZATION"], "0.4")
+                self.assertNotIn("KV_CACHE_MEMORY_BYTES", env)
+                for invalid in ("0", "-0.1", "1.1", "nan", "inf"):
+                    rejected = [*command]
+                    rejected[rejected.index("--gpu-memory-utilization") + 1] = invalid
+                    with patch.object(sys, "argv", rejected), contextlib.redirect_stderr(io.StringIO()), \
+                         self.assertRaises(SystemExit) as error:
+                        CONTROLLER.main()
+                    self.assertEqual(error.exception.code, 2)
+
     def test_native_baseline_selects_non_strict_runner(self) -> None:
         """Native pilots retain the idle-node selector without claiming numerical parity."""
         command = [str(SCRIPT), "--hosts", "192.0.2.1,192.0.2.2,192.0.2.3,192.0.2.4",

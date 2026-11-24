@@ -38,6 +38,11 @@ python3 hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_cluster.py 
 ```
 
 末尾加 `--dry-run` 可只显示计划；正式训练把 `--steps 2` 改为 `--steps 50`。
+若权重更新成功后在 `wake_up(tags=['kv_cache'])` 报 CaMem `207001 (OOM)`，
+可在两种 6400/500 入口后都加 `--gpu-memory-utilization 0.4`，显式降低自动 KV cache 预算后重测。
+默认仍为 0.6；参数会传入容器并写入生成配置、`plan.json` 和 dry-run 输出。
+该预算不能保证训练更新后的显存一定足够，0.4 仍需两步实测；对照实验应保持两组相同的预算。
+此参数不改 CPU offload、CP2、FP32 主参数、训练 batch、8192 token budget 或 64 序列上限。
 原始数据、模型、镜像和共享目录参数沿用集群入口默认值，也可通过 CLI 覆盖。
 数据按 4B 协议从完整 7473/1319 行分别以 `Random(42)` 无放回抽取 6400/500 行，保持顺序。
 每步 128 题、每题 8 回答、micro-batch 2、每 DP rank response mini-batch 128；
