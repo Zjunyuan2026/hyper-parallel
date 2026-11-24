@@ -25,13 +25,13 @@ __all__ = [
 
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Mapping, Optional
+from typing import TYPE_CHECKING, Any
 
 from hyper_parallel.components.checkpoint.conversion_ops import ConcatenateWithSections
-
 
 # Annotation-only references must not initialize roles while weight_sync is importing.
 if TYPE_CHECKING:
@@ -66,7 +66,7 @@ def _canonical_weight_rows(name: str, config: Any) -> tuple[_WeightRows, ...]:
 
 
 def _mlp_conversion_rows(module_name: str, module: Any,
-                         logical_shapes: Optional[Mapping[str, Any]] = None) -> dict[str, tuple[_WeightRows, ...]]:
+                         logical_shapes: Mapping[str, Any] | None = None) -> dict[str, tuple[_WeightRows, ...]]:
     """Read the actual HP SwiGLU conversion descriptors without retaining tensors."""
     result = {}
     transforms = getattr(module, "_rl_logical_weight_transforms", None)
@@ -247,9 +247,9 @@ def _direct_tensor_description(
     parameter: Any,
     local_shape: tuple[int, ...],
     placement: str,
-    shard_dim: Optional[int],
+    shard_dim: int | None,
     destination_starts: tuple[int, ...],
-    destination_permutation: Optional[tuple[int, ...]] = None,
+    destination_permutation: tuple[int, ...] | None = None,
     accepted_source_dtypes: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Describe one logical Actor tensor region inside a physical parameter."""
@@ -414,7 +414,8 @@ def _native_qwen3_tensors(
     vocab_size = int(hf_config.vocab_size)
     modules = dict(model.named_modules()) if getattr(hf_config, "model_type", "") == "qwen3_moe" else {}
     for name, parameter in sorted(model.named_parameters(), key=lambda item: item[0]):
-        if name.endswith((".experts.w13_weight", ".experts.w2_weight")):
+        if name.endswith((".experts.w13_weight", ".experts.w2_weight",
+                          ".experts.routed_experts.w13_weight", ".experts.routed_experts.w2_weight")):
             module_name = name.rsplit(".", 1)[0]
             tensors.extend(_native_expert_descriptions(name, parameter, modules[module_name], hf_config))
             continue
@@ -478,7 +479,8 @@ def _native_qwen3_tensors(
 
 def _owned_experts(layer: Any, experts: int) -> list[tuple[int, int]]:
     """Validate the global-to-local map and return each physical expert owner."""
-    ep_size, tp_size = int(layer.ep_size), int(layer.tp_size)
+    parallel = getattr(layer, "moe_config", layer)
+    ep_size, tp_size = int(parallel.ep_size), int(parallel.tp_size)
     if ep_size > 1:
         expert_map = layer.expert_map
         if expert_map is None or int(expert_map.numel()) != experts:
@@ -499,9 +501,10 @@ def _native_expert_descriptions(name: str, parameter: Any, layer: Any, config: A
     experts = int(config.num_experts)
     hidden = int(config.hidden_size)
     intermediate = int(config.moe_intermediate_size)
-    ep_size = int(layer.ep_size)
-    tp_size = int(layer.tp_size)
-    tp_rank = int(layer.tp_rank)
+    parallel = getattr(layer, "moe_config", layer)
+    ep_size = int(parallel.ep_size)
+    tp_size = int(parallel.tp_size)
+    tp_rank = int(parallel.tp_rank)
     if ep_size <= 0 or tp_size <= 0 or intermediate % tp_size or not 0 <= tp_rank < tp_size:
         raise ValueError("Native expert TP coordinates do not divide the intermediate dimension")
     local_intermediate = intermediate // tp_size
@@ -513,7 +516,8 @@ def _native_expert_descriptions(name: str, parameter: Any, layer: Any, config: A
         raise ValueError(
             f"Native Ascend expert runtime {name!r} has shape {tuple(parameter.shape)}, expected {expected}"
         )
-    prefix = name.rsplit(".", 1)[0]
+    # RoutedExperts owns runtime storage; checkpoint names retain the parent experts prefix.
+    prefix = name.rsplit(".", 1)[0].removesuffix(".routed_experts")
     descriptions = []
     shard_dim = 2 if is_gate_up else 1
     placement = "replicate" if tp_size == 1 else "shard"

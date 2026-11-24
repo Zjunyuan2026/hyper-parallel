@@ -17,6 +17,8 @@
 import ast
 import json
 import os
+import re
+import sys
 import tempfile
 import time
 import unittest
@@ -46,6 +48,88 @@ def load_function(path: str, name: str, bindings: dict):
 
 class NativeBaselineTests(unittest.TestCase):
     """Verify native admission and reporting without weakening unified probability gates."""
+
+    def test_native_expert_reload_accepts_flat_and_routed_storage(self) -> None:
+        """Publish canonical projections across buckets while checking local expert coverage."""
+        adapter = "hyper_parallel/rl/rl/weight_sync/model_adapter.py"
+        bindings = {}
+        for name in ("_direct_tensor_description", "_owned_experts", "_native_expert_descriptions"):
+            load_function(adapter, name, bindings)
+        describe = load_function(adapter, "_native_qwen3_tensors", bindings)
+        config = SimpleNamespace(model_type="qwen3_moe", vocab_size=8, num_experts=2,
+                                 hidden_size=3, moe_intermediate_size=4)
+        reload_module = SimpleNamespace(initialize_layerwise_reload=Mock(), finalize_layerwise_reload=Mock())
+        for nested in (False, True):
+            for ep in (1, 2):
+                with self.subTest(nested=nested, ep=ep):
+                    prefix = "model.layers.0.mlp.experts"
+                    storage = prefix + (".routed_experts" if nested else "")
+                    parallel = SimpleNamespace(ep_size=ep, tp_size=1, tp_rank=0)
+                    expert_map = torch.tensor([-1, 0]) if ep == 2 else None
+                    layer = (SimpleNamespace(moe_config=parallel, expert_map=expert_map) if nested else
+                             SimpleNamespace(ep_size=ep, tp_size=1, tp_rank=0, expert_map=expert_map))
+                    count = 2 // ep
+                    parameters = {storage + ".w13_weight": torch.zeros(count, 3, 8),
+                                  storage + ".w2_weight": torch.zeros(count, 4, 3)}
+                    model = SimpleNamespace(named_modules=lambda: [(storage, layer)],
+                                            named_parameters=lambda: list(parameters.items()))
+                    descriptions = describe(model, config, tp_rank=0, tp_size=2)
+                    owned = range(2) if ep == 1 else (1,)
+                    expected_names = {f"{prefix}.{expert}.{proj}_proj.weight" for expert in owned
+                                      for proj in ("gate", "up", "down")}
+                    self.assertEqual({row["name"] for row in descriptions}, expected_names)
+                    self.assertEqual({row["destination_name"] for row in descriptions}, set(parameters))
+                    # The loader owns mapping canonical checkpoint names into native runtime storage.
+                    def load_weights(weights):
+                        name, value = weights[0]
+                        match = re.fullmatch(re.escape(prefix) + r"\.(\d+)\.(gate|up|down)_proj\.weight", name)
+                        self.assertIsNotNone(match)
+                        expert, projection = int(match[1]), match[2]
+                        local = expert if ep == 1 else int(expert_map[expert])
+                        self.assertGreaterEqual(local, 0)
+                        if projection == "down":
+                            parameters[storage + ".w2_weight"][local].copy_(value.T)
+                        else:
+                            offset = 0 if projection == "gate" else 4
+                            parameters[storage + ".w13_weight"][local, :, offset:offset + 4].copy_(value.T)
+                        return {name}
+
+                    model.load_weights = load_weights
+                    worker = SimpleNamespace(device="cpu", model_config=SimpleNamespace(hf_config=config),
+                                             model_runner=SimpleNamespace(get_model=lambda: model))
+                    runtime = {"torch": torch, "re": re,
+                               "_native_weight_layout": lambda _worker: {"tensors": descriptions}}
+                    path = "hyper_parallel/rl/rl/weight_sync/vllm_worker.py"
+                    receive = load_function(path, "_load_moe_checkpoint_weights", runtime)
+                    finish = load_function(path, "_finalize_moe_checkpoint_reload", runtime)
+                    source = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+                    all_weights = [(f"{prefix}.{expert}.{proj}_proj.weight",
+                                    (source + expert * 20 + offset).T if proj == "down"
+                                    else source + expert * 20 + offset)
+                                   for expert in range(2) for proj, offset in (("gate", 0), ("up", 1), ("down", 2))]
+                    before = reload_module.finalize_layerwise_reload.call_count
+                    with patch.dict(sys.modules, {"vllm.model_executor.model_loader.reload": reload_module}):
+                        receive(worker, model, all_weights[:-1])
+                        with self.assertRaisesRegex(RuntimeError, "incomplete"):
+                            finish(worker)
+                        self.assertEqual(reload_module.finalize_layerwise_reload.call_count, before)
+                        receive(worker, model, all_weights[-1:])
+                        self.assertEqual(worker._rl_received_weights, expected_names)
+                        with patch.object(torch, "npu", SimpleNamespace(current_stream=lambda: Mock()), create=True):
+                            finish(worker)
+                        self.assertEqual(reload_module.finalize_layerwise_reload.call_count, before + 1)
+                        with self.assertRaisesRegex(ValueError, "Duplicate"):
+                            receive(worker, model, all_weights[-1:])
+                        with self.assertRaisesRegex(ValueError, "Unexpected"):
+                            receive(worker, model, [(f"{prefix}.2.gate_proj.weight", source)])
+                    for expert in owned:
+                        local = expert if ep == 1 else 0
+                        torch.testing.assert_close(parameters[storage + ".w13_weight"][local, :, :4],
+                                                   (source + expert * 20).T)
+                        torch.testing.assert_close(parameters[storage + ".w13_weight"][local, :, 4:],
+                                                   (source + expert * 20 + 1).T)
+                        torch.testing.assert_close(parameters[storage + ".w2_weight"][local],
+                                                   source + expert * 20 + 2)
 
     def test_native_cp_masks_boundary_targets_and_gradients(self) -> None:
         """Real CPU tensors verify both shards against the global next-token computation."""
