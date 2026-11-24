@@ -31,7 +31,7 @@ class ConfigureRunTests(unittest.TestCase):
     """Keep task selection and token/transport budgets independent of topology."""
 
     def test_baseline_memory_override_preserves_training_and_cache_mode(self) -> None:
-        """Both profiles accept explicit memory budgets without changing default 0.6."""
+        """Both profiles accept explicit memory budgets without changing default 0.4."""
         common = {"RUN_MODEL_PATH": "/models/Qwen3-30B-A3B", "TRAIN_TP": "4", "TRAIN_CP": "2",
                   "TRAIN_EP": "4", "ROLLOUT_TP": "2", "ROLLOUT_PCP": "1", "ROLLOUT_EP": "16",
                   "ROLLOUT_LOCAL_WORLD_SIZE": "16", "GLOBAL_PROMPT_BATCH_SIZE": "128",
@@ -42,7 +42,7 @@ class ConfigureRunTests(unittest.TestCase):
             recipe = yaml.safe_load((ROOT.parent / "gsm8k/configs" / filename).read_text(encoding="utf-8"))
             with patch.dict(os.environ, {**common, flag: "true"}, clear=True):
                 default = CONFIGURE(yaml.safe_load(yaml.safe_dump(recipe)), 64)
-            for value in ("0.4", "0.35"):
+            for value in ("0.5", "0.35"):
                 with self.subTest(flag=flag, value=value), patch.dict(
                     os.environ, {**common, flag: "true", "GPU_MEMORY_UTILIZATION": value}, clear=True,
                 ):
@@ -50,7 +50,7 @@ class ConfigureRunTests(unittest.TestCase):
                     inference = actual["rollout"]["vllm"]
                     self.assertEqual(inference["gpu_memory_utilization"], float(value))
                     self.assertNotIn("kv_cache_memory_bytes", inference)
-                    inference["gpu_memory_utilization"] = 0.6
+                    inference["gpu_memory_utilization"] = 0.4
                     self.assertEqual(actual, default)
             for value in ("0", "-0.1", "1.1", "nan", "inf"):
                 with self.subTest(flag=flag, invalid=value), patch.dict(
@@ -87,7 +87,7 @@ class ConfigureRunTests(unittest.TestCase):
         self.assertNotIn("unified_execution", str(config["train"]["plan_overrides"]))
         self.assertEqual(config["rollout"]["vllm"]["max_num_batched_tokens"], 8192)
         self.assertEqual(config["rollout"]["vllm"]["max_num_seqs"], 64)
-        self.assertEqual(config["rollout"]["vllm"]["gpu_memory_utilization"], 0.6)
+        self.assertEqual(config["rollout"]["vllm"]["gpu_memory_utilization"], 0.4)
         self.assertNotIn("kv_cache_memory_bytes", config["rollout"]["vllm"])
         self.assertEqual(config["rollout"]["vllm"]["compilation_config"]["cudagraph_capture_sizes"][-1], 64)
         with patch.dict(os.environ, {**environment, "STEPS": "50"}, clear=True):
@@ -114,7 +114,7 @@ class ConfigureRunTests(unittest.TestCase):
         self.assertEqual(config["train"]["prompt_batch_size"] * 8, 128)
         self.assertEqual(config["rollout"]["vllm"]["max_num_batched_tokens"], 8192)
         self.assertEqual(config["rollout"]["vllm"]["max_num_seqs"], 64)
-        self.assertEqual(config["rollout"]["vllm"]["gpu_memory_utilization"], 0.6)
+        self.assertEqual(config["rollout"]["vllm"]["gpu_memory_utilization"], 0.4)
         self.assertNotIn("kv_cache_memory_bytes", config["rollout"]["vllm"])
         self.assertEqual(config["rollout"]["vllm"]["compilation_config"]["cudagraph_capture_sizes"][-1], 64)
         self.assertTrue(config["rollout"]["collect_log_probs"])

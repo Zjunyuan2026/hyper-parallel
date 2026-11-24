@@ -56,24 +56,24 @@ class ClusterLauncherTests(unittest.TestCase):
                 mode = "--native-baseline" if native else "--baseline-5step"
                 command = [str(SCRIPT), "--hosts", "192.0.2.1,192.0.2.2,192.0.2.3,192.0.2.4",
                            "--master-addr", "198.51.100.1", mode, "--micro-batch-size", "2",
-                           "--gpu-memory-utilization", "0.4", "--dry-run"]
+                           "--gpu-memory-utilization", "0.35", "--dry-run"]
                 stream = io.StringIO()
                 with patch.object(sys, "argv", command), contextlib.redirect_stdout(stream):
                     CONTROLLER.main()
-                self.assertEqual(json.loads(stream.getvalue())["gpu_memory_utilization"], 0.4)
+                self.assertEqual(json.loads(stream.getvalue())["gpu_memory_utilization"], 0.35)
                 args = arguments(Path("/shared/run"))
                 args.native_baseline = native
                 args.baseline_5step = not native
                 args.hosts = ["192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.4"]
                 args.global_prompt_batch_size = 128
                 args.micro_batch_size = 2
-                args.gpu_memory_utilization = 0.4
+                args.gpu_memory_utilization = 0.35
                 with patch.object(os, "getuid", return_value=0, create=True), \
                      patch.object(os, "getgid", return_value=0, create=True):
                     docker = CONTROLLER.docker_command(args, 0, "198.51.100.1", "image", "owned", Path("/shared/run"))
                 env = dict(value.split("=", 1) for index, value in enumerate(docker)
                            if index and docker[index - 1] == "-e")
-                self.assertEqual(env["GPU_MEMORY_UTILIZATION"], "0.4")
+                self.assertEqual(env["GPU_MEMORY_UTILIZATION"], "0.35")
                 self.assertNotIn("KV_CACHE_MEMORY_BYTES", env)
                 for invalid in ("0", "-0.1", "1.1", "nan", "inf"):
                     rejected = [*command]
@@ -94,6 +94,7 @@ class ClusterLauncherTests(unittest.TestCase):
         result = json.loads(stream.getvalue())
         self.assertEqual(result["steps"], 2)
         self.assertFalse(result["strict_consistency"])
+        self.assertEqual(result["gpu_memory_utilization"], 0.4)
         self.assertTrue(result["plot"])
         self.assertFalse(result["cpu_offload"])
         self.assertEqual(result["batch"]["global_prompt_batch_size"], 128)
@@ -108,6 +109,7 @@ class ClusterLauncherTests(unittest.TestCase):
             docker = CONTROLLER.docker_command(args, 0, "198.51.100.1", "image", "owned", Path("/shared/run"))
         env = dict(value.split("=", 1) for index, value in enumerate(docker) if index and docker[index - 1] == "-e")
         self.assertEqual(env["NATIVE_BASELINE"], "true")
+        self.assertEqual(env["GPU_MEMORY_UTILIZATION"], "0.4")
         self.assertEqual(env["CPU_OFFLOAD"], "false")
         self.assertEqual(env["TRAIN_SP"], "false")
         self.assertNotIn("--track-updates", docker)
@@ -126,7 +128,7 @@ class ClusterLauncherTests(unittest.TestCase):
         self.assertEqual(result["batch"]["global_response_batch_size"], 1024)
         self.assertEqual(result["max_num_batched_tokens"], 8192)
         self.assertEqual(result["max_num_seqs"], 64)
-        self.assertEqual(result["gpu_memory_utilization"], 0.6)
+        self.assertEqual(result["gpu_memory_utilization"], 0.4)
         self.assertTrue(result["kv_cache_auto"])
         self.assertEqual(result["batch"]["micro_batch_size"], 2)
         probe.assert_not_called()
@@ -150,6 +152,7 @@ class ClusterLauncherTests(unittest.TestCase):
             docker = CONTROLLER.docker_command(args, 0, "198.51.100.1", "image", "owned", Path("/shared/run"))
         env = dict(value.split("=", 1) for index, value in enumerate(docker) if index and docker[index - 1] == "-e")
         self.assertEqual(env["BASELINE_5STEP"], "true")
+        self.assertEqual(env["GPU_MEMORY_UTILIZATION"], "0.4")
         self.assertEqual(env["ROLLOUT_EP"], "16")
         self.assertEqual(env["PREFILL_TOKENS"], "8192")
         self.assertEqual(env["MAX_NUM_SEQS"], "64")

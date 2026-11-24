@@ -38,9 +38,9 @@ python3 hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_cluster.py 
 ```
 
 末尾加 `--dry-run` 可只显示计划；正式训练把 `--steps 2` 改为 `--steps 50`。
-若权重更新成功后在 `wake_up(tags=['kv_cache'])` 报 CaMem `207001 (OOM)`，
-可在两种 6400/500 入口后都加 `--gpu-memory-utilization 0.4`，显式降低自动 KV cache 预算后重测。
-默认仍为 0.6；参数会传入容器并写入生成配置、`plan.json` 和 dry-run 输出。
+两种 6400/500 入口均降低了自动 KV cache 默认预算，为训练更新后的常驻状态预留显存。
+末尾也可显式加 `--gpu-memory-utilization 0.4`；若仍在恢复 KV cache 时 OOM，需继续排查峰值占用。
+两种模式默认均为 0.4；参数会传入容器并写入生成配置、`plan.json` 和 dry-run 输出。
 该预算不能保证训练更新后的显存一定足够，0.4 仍需两步实测；对照实验应保持两组相同的预算。
 此参数不改 CPU offload、CP2、FP32 主参数、训练 batch、8192 token budget 或 64 序列上限。
 原始数据、模型、镜像和共享目录参数沿用集群入口默认值，也可通过 CLI 覆盖。
@@ -55,7 +55,7 @@ python3 hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_cluster.py 
 CP2 仅用于训练端：Actor 和 Reference 使用普通 HyperParallel CP Attention、全局位置及因果 mask，
 先全局移动 next-token 目标再按 CP 切分，保留跨 rank 边界的预测目标；推理侧保持 PCP1。
 该路径不安装 unified Attention，也不启用训推一致检查。
-推理 token budget 8192、序列上限 64，`gpu_memory_utilization=0.6`，移除固定 KV cache 字节数，
+推理 token budget 8192、序列上限 64，`gpu_memory_utilization=0.4`，移除固定 KV cache 字节数，
 由 vLLM 自动估算缓存容量。prompt/回答上限均为 1024。
 
 Actor 和 Reference 均关闭 CPU offload，保持与 unified 对照一致；实际内存用量需实机确认。
@@ -88,7 +88,7 @@ bash hyper_parallel/rl/examples/gsm8k/scripts/run_qwen3_30b_5step.sh \
 TP4/CP2/DP8/EP4、每节点 rollout TP2/DP8/EP8，完整模型、不做 CPU offload。
 每步全局 128 题，每题 8 个回答，micro-batch **2**，每 DP rank 的 response mini-batch 128。
 prompt/回答上限均为 1024，`max_model_len=2048`，`max_num_batched_tokens=8192`；
-`max_num_seqs=64`，`gpu_memory_utilization=0.6`，移除固定 KV cache 字节数。
+`max_num_seqs=64`，`gpu_memory_utilization=0.4`，移除固定 KV cache 字节数。
 两种模式均保留前缀缓存、chunked prefill，显式启用 mode 3、FULL_AND_PIECEWISE，
 捕图尺寸为 `[1, 2, 4, 8, 16, 32, 64]`。
 

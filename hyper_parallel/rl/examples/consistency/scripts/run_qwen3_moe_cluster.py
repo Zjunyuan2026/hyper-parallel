@@ -212,7 +212,7 @@ def docker_command(args: argparse.Namespace, node_rank: int, address: str,
     if getattr(args, "baseline_5step", False) or getattr(args, "native_baseline", False):
         environment.pop("KV_CACHE_MEMORY_BYTES", None)
         environment["MAX_NUM_SEQS"] = "64"
-        environment["GPU_MEMORY_UTILIZATION"] = str(getattr(args, "gpu_memory_utilization", 0.6))
+        environment["GPU_MEMORY_UTILIZATION"] = str(getattr(args, "gpu_memory_utilization", 0.4))
     for key, value in environment.items():
         command.extend(["-e", f"{key}={value}"])
     options = [] if getattr(args, "native_baseline", False) else ["--track-updates"]
@@ -435,7 +435,7 @@ def main() -> None:
     parser.add_argument("--max-prompt", type=int, default=512)
     parser.add_argument("--gpu-memory-utilization", type=float,
                         help="6400/500 profiles only: vLLM memory fraction; "
-                             "default 0.6, lower to reserve Trainer headroom")
+                             "default 0.4, lower to reserve Trainer headroom")
     parser.add_argument("--cpu-offload", action="store_true")
     parser.add_argument("--timeout", type=int)
     parser.add_argument("--dry-run", action="store_true")
@@ -446,7 +446,7 @@ def main() -> None:
         if not 0 < args.gpu_memory_utilization <= 1:
             parser.error("--gpu-memory-utilization must be in (0, 1]")
     elif args.baseline_5step or args.native_baseline:
-        args.gpu_memory_utilization = 0.6
+        args.gpu_memory_utilization = 0.4
     if args.native_baseline:
         if args.formal_gsm8k or args.baseline_5step:
             parser.error("--native-baseline cannot be combined with unified baseline or formal modes")

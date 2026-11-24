@@ -1,4 +1,4 @@
-# Qwen3-30B-A3B, 6400/500 data; default 2-step test; auto KV cache at 0.6.
+# Qwen3-30B-A3B, 6400/500 data; default 2-step test; auto KV cache at 0.4.
 model:
   registry_name: qwen3_30b_a3b
   name: qwen3_moe
@@ -46,7 +46,7 @@ rollout:
     batch_invariant: false
     enable_prefix_caching: true
     enable_chunked_prefill: true
-    gpu_memory_utilization: 0.6
+    gpu_memory_utilization: 0.4
     max_model_len: 2048
     block_size: 128
     max_num_seqs: 64

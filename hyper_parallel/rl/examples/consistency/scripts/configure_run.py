@@ -211,7 +211,7 @@ def configure(config: dict, world: int) -> dict:
                                    save_final=False, verify_reload=False, load_path=None)
     if boolean("BASELINE_5STEP", False) or boolean("NATIVE_BASELINE", False):
         inference.pop("kv_cache_memory_bytes", None)
-        memory_utilization = float(os.environ.get("GPU_MEMORY_UTILIZATION", 0.6))
+        memory_utilization = float(os.environ.get("GPU_MEMORY_UTILIZATION", 0.4))
         if not 0 < memory_utilization <= 1:
             raise ValueError("GPU_MEMORY_UTILIZATION must be in (0, 1]")
         inference.update(gpu_memory_utilization=memory_utilization, max_num_seqs=64, max_num_batched_tokens=8192,
