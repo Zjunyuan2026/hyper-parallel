@@ -9,14 +9,15 @@ python3 hyper_parallel/rl/examples/consistency/scripts/plot_comparison.py --cons
 输入为包含 `summary.json` 和 `node0/run/` 的集群结果根目录，要求两组均成功完成 50 步。
 输出四张 6:4 图片，每张均包含 PNG/SVG：`reward-comparison`、`test-accuracy-comparison`、
 `logp-max-comparison`、`time-comparison`，以及记录输入目录、耗时和缺失项的 `comparison-summary.json`。
-奖励保留原始均值、默认 MA5 平滑和原始均值 ± 每步回答奖励标准差的阴影；
-标准差不是多次实验间的置信区间，`--smooth-window` 可调整平滑窗口。
+奖励在同一坐标轴叠加两组均值和 std：各自保留原始取点与默认 MA5 平滑曲线。
+颜色区分两组，实线为均值、虚线为 std；不拆分子图、不画标准差阴影，`--smooth-window` 可调整平滑窗口。
 测试图保留训练前第 0 步，按 10、20…50 标刻度，标注最终 500 题准确率及答对数。
 logp 图使用有效回答 token 的最大绝对训练/推理差值，缺失数据明确标注，不补零。
 此前原生配方关闭了采样 logp 采集，这些历史运行无法恢复未记录的逐步 logp 差值。
 时间图按维度分组显示两组柱状图，单位为分钟，包含首步、不按排除首步后的均值外推。
-Run total 为启动至收集完成的墙钟时间，含启动、评估、绘图及清理；Training steps 为实际逐步耗时之和。
-其余柱为训练步骤内的生成、旧策略概率、Reference、Actor 更新和权重同步耗时之和；图中各柱不能相加。
+时间仅显示 Run total、Rollout、Actor update、Weight sync 四项。
+Run total 为启动至收集完成的墙钟时间，含启动、评估、绘图及清理；
+其余柱为全部训练步骤内的生成、Actor 更新和权重同步耗时之和；图中各柱不能相加。
 
 训练绘图脚本导出的所有 PNG/SVG（含总览图、原始曲线图）统一使用宽:高 **6:4**。
 单项图为 6×4 英寸，普通总览图为 12×8、formal 总览图为 18×12 英寸。

@@ -67,8 +67,14 @@ class ComparisonPlotTests(unittest.TestCase):
                 self.assertAlmostEqual(pixels.shape[1] / pixels.shape[0], 1.5)
             self.assertEqual(report["missing_logp"], [{"label": "NO-Consistency", "steps": list(range(1, 51))}])
             self.assertEqual(report["runs"]["Consistency"]["seconds"]["Run total"], 1200)
-            self.assertEqual(report["runs"]["Consistency"]["seconds"]["Training steps"], 600)
+            self.assertEqual(set(report["runs"]["Consistency"]["seconds"]),
+                             {"Run total", "Rollout", "Actor update", "Weight sync"})
             self.assertEqual(report["runs"]["Consistency"]["seconds"]["Actor update"], 250)
+            reward_svg = (output / "reward-comparison.svg").read_text(encoding="utf-8")
+            for label in ("Consistency", "NO-Consistency"):
+                for metric in ("mean", "std"):
+                    for mode in ("raw", "MA5"):
+                        self.assertIn(f"{label} {metric} {mode}", reward_svg)
             svg = (output / "test-accuracy-comparison.svg").read_text(encoding="utf-8")
             self.assertIn("60.00%", svg)
             self.assertIn("300/500", svg)

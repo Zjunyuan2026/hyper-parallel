@@ -28,9 +28,8 @@ from plot_training import moving_average, number, read_evaluations, read_rows
 SERIES = (("Consistency", "#2563eb"), ("NO-Consistency", "#ea580c"))
 DISPLAY_ANNOTATION = ("Training: TP4 DP8 EP4 CP2 SP=True\n"
                       "Rollout: TP2 DP8 EP16 PCP1 SP=False")
-TIMES = (("Run\ntotal", None), ("Training\nsteps", "timing_s/step"),
-         ("Rollout", "timing_s/gen"), ("Old\nlogp", "timing_s/old_log_prob"),
-         ("Reference", "timing_s/ref"), ("Actor\nupdate", "timing_s/update_actor"),
+TIMES = (("Run\ntotal", None), ("Rollout", "timing_s/gen"),
+         ("Actor\nupdate", "timing_s/update_actor"),
          ("Weight\nsync", "timing_s/weight_sync"))
 
 
@@ -90,15 +89,17 @@ def render(consistency: Path, native: Path, output: Path, window: int = 5, steps
     figure, axis = new_plot("Training Reward", "Reward")
     for (label, color), run in zip(SERIES, runs):
         x = [row["step"] for row in run["rows"]]
-        mean = np.array([number(row, "reward/mean") for row in run["rows"]])
-        std = np.array([number(row, "reward/std") for row in run["rows"]])
-        axis.fill_between(x, mean - std, mean + std, color=color, alpha=0.1, label=f"{label} mean +/- std")
-        axis.plot(x, mean, color=color, alpha=0.35, linewidth=0.9, label=f"{label} raw")
-        axis.plot(x, moving_average(mean.tolist(), window), color=color, linewidth=1.8,
-                  label=f"{label} MA{window}")
+        for key, metric, style, marker in (("reward/mean", "mean", "-", "o"),
+                                           ("reward/std", "std", "--", "s")):
+            values = [number(row, key) for row in run["rows"]]
+            axis.plot(x, values, color=color, alpha=0.3, linewidth=0.7, linestyle=style,
+                      marker=marker, markersize=2, label=f"{label} {metric} raw")
+            axis.plot(x, moving_average(values, window), color=color, linewidth=1.6, linestyle=style,
+                      label=f"{label} {metric} MA{window}")
     axis.set_xlabel("Training step")
     axis.set_xlim(1, steps)
-    axis.legend(fontsize=7, ncol=2)
+    axis.set_ylim(-0.05, 1.05)
+    axis.legend(fontsize=6, ncol=2)
     save(figure, output, "reward-comparison")
 
     figure, axis = new_plot("Test Accuracy", "Accuracy (500 questions)")
