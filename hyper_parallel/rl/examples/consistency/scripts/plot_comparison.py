@@ -68,17 +68,20 @@ def save(figure: Figure, output: Path, name: str) -> None:
     figure.clear()
 
 
-def render(consistency: Path, native: Path, output: Path, window: int = 5, steps: int = 50) -> dict:
+def render(consistency: Path | None, native: Path, output: Path, window: int = 5, steps: int = 50) -> dict:
     """Overlay metrics without fabricating missing native sampling probabilities."""
-    if consistency.resolve() == native.resolve():
+    if consistency is not None and consistency.resolve() == native.resolve():
         raise ValueError("Select two different run directories")
     if window < 1 or steps < 1:
         raise ValueError("Window and expected steps must be positive")
-    runs = [load_run(path, steps) for path in (consistency, native)]
+    paths = (consistency, native) if consistency is not None else (native,)
+    runs = [load_run(path, steps) for path in paths]
+    series = SERIES if consistency is not None else SERIES[1:]
+    suffix = "-comparison" if consistency is not None else ""
     output.mkdir(parents=True, exist_ok=True)
     report = {"runs": {label: {"root": run["root"], "seconds": dict(zip(
         (label.replace("\n", " ") for label, _ in TIMES), run["seconds"]))}
-        for (label, _), run in zip(SERIES, runs)}, "smoothing_window": window,
+        for (label, _), run in zip(series, runs)}, "smoothing_window": window,
         "display_annotation": DISPLAY_ANNOTATION,
         "display_annotation_source": "User-specified display text; not inferred from recorded run configurations",
         "reward_std_scope": "Per-step response reward population std; not uncertainty across repeated runs",
@@ -87,7 +90,7 @@ def render(consistency: Path, native: Path, output: Path, window: int = 5, steps
                       "the displayed bars are not additive.", "missing_logp": []}
 
     figure, axis = new_plot("Training Reward", "Reward")
-    for (label, color), run in zip(SERIES, runs):
+    for (label, color), run in zip(series, runs):
         x = [row["step"] for row in run["rows"]]
         for key, metric, style, marker in (("reward/mean", "mean", "-", "o"),
                                            ("reward/std", "std", "--", "s")):
@@ -100,11 +103,12 @@ def render(consistency: Path, native: Path, output: Path, window: int = 5, steps
     axis.set_xlim(1, steps)
     axis.set_ylim(-0.05, 1.05)
     axis.legend(fontsize=6, ncol=2)
-    save(figure, output, "reward-comparison")
+    save(figure, output, "reward" + suffix)
 
     figure, axis = new_plot("Test Accuracy", "Accuracy (500 questions)")
-    for index, ((label, color), run) in enumerate(zip(SERIES, runs)):
-        evaluations = [row for row in run["evaluations"] if row["step"] % 10 == 0 and 0 <= row["step"] <= steps]
+    for index, ((label, color), run) in enumerate(zip(series, runs)):
+        evaluations = [row for row in run["evaluations"]
+                       if (row["step"] % 10 == 0 or row["step"] == steps) and 0 <= row["step"] <= steps]
         for row in evaluations:
             accuracy, total, correct = (number(row, key) for key in
                                         ("validation/accuracy", "validation/total", "validation/correct"))
@@ -124,11 +128,11 @@ def render(consistency: Path, native: Path, output: Path, window: int = 5, steps
     axis.yaxis.set_major_formatter(PercentFormatter(1))
     axis.set_ylim(0, 1)
     axis.legend(fontsize=8)
-    save(figure, output, "test-accuracy-comparison")
+    save(figure, output, "test-accuracy" + suffix)
 
     figure, axis = new_plot("Maximum Train–Rollout Log-Probability Difference",
                             "Max |logp(train) - logp(rollout)|")
-    for index, ((label, color), run) in enumerate(zip(SERIES, runs)):
+    for index, ((label, color), run) in enumerate(zip(series, runs)):
         values = [number(row, "training/rollout_log_probs_diff_max")
                   if number(row, "training/rollout_probs_diff_valid") == 1
                   and number(row, "training/log_probs_valid_tokens") > 0 else math.nan for row in run["rows"]]
@@ -143,13 +147,13 @@ def render(consistency: Path, native: Path, output: Path, window: int = 5, steps
     axis.set_xlim(1, steps)
     if axis.lines:
         axis.legend(loc="lower right", fontsize=8)
-    save(figure, output, "logp-max-comparison")
+    save(figure, output, "logp-max" + suffix)
 
     figure, axis = new_plot("Runtime Breakdown", "Minutes")
     x = np.arange(len(TIMES))
-    for index, ((label, color), run) in enumerate(zip(SERIES, runs)):
+    for index, ((label, color), run) in enumerate(zip(series, runs)):
         values = [v / 60 if v is not None else math.nan for v in run["seconds"]]
-        positions = x + (index - 0.5) * 0.36
+        positions = x + (index - (len(series) - 1) / 2) * 0.36
         bars = axis.bar(positions, values, width=0.36, color=color, label=label)
         for position, value in zip(positions, values):
             if not math.isfinite(value):
@@ -159,7 +163,7 @@ def render(consistency: Path, native: Path, output: Path, window: int = 5, steps
     axis.legend(fontsize=8)
     axis.set_xlabel("Time category (totals and components; do not sum bars)", fontsize=8)
     axis.margins(y=0.18)
-    save(figure, output, "time-comparison")
+    save(figure, output, "time" + suffix)
     (output / "comparison-summary.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return report
 
@@ -167,12 +171,15 @@ def render(consistency: Path, native: Path, output: Path, window: int = 5, steps
 def main() -> None:
     """Accept cluster result roots; no training, model loading or device access."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--consistency", type=Path, required=True)
+    parser.add_argument("--consistency", type=Path)
     parser.add_argument("--native", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--smooth-window", type=int, default=5)
     parser.add_argument("--expected-steps", type=int, default=50)
+    parser.add_argument("--single-output", type=Path, help="Also export four native-only figures here")
     args = parser.parse_args()
+    if args.single_output is not None:
+        render(None, args.native, args.single_output, args.smooth_window, args.expected_steps)
     result = render(args.consistency, args.native, args.output, args.smooth_window, args.expected_steps)
     print(json.dumps({"output": str(args.output.resolve()), "missing_logp": result["missing_logp"]}, indent=2))
 

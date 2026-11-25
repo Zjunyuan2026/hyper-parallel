@@ -49,6 +49,32 @@ def arguments(directory: Path) -> argparse.Namespace:
 class ClusterLauncherTests(unittest.TestCase):
     """Validate placement, completeness, and bounded failure cleanup without NPU use."""
 
+    def test_native_exports_use_cpu_image_and_verify_all_eight_figures(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = arguments(root)
+            args.compare_with = root / "old-consistency"
+            args.steps = 50
+
+            def execute(_host, local, command):
+                self.assertTrue(local)
+                self.assertIn("--network=none", command)
+                self.assertNotIn("--privileged", command)
+                self.assertIn("/consistency-result", command)
+                self.assertIn("--single-output", command)
+                for folder, suffix in (("native-plots", ""), ("comparison-plots", "-comparison")):
+                    output = root / "node0/run" / folder
+                    output.mkdir(parents=True, exist_ok=True)
+                    for name in ("reward", "test-accuracy", "logp-max", "time"):
+                        for extension in ("png", "svg"):
+                            (output / f"{name}{suffix}.{extension}").write_bytes(b"verified-by-render-tests")
+
+            with patch.object(CONTROLLER, "execute", side_effect=execute), \
+                 patch.object(os, "getuid", return_value=0, create=True), \
+                 patch.object(os, "getgid", return_value=0, create=True):
+                CONTROLLER.export_native_figures(args, root, root / "source", "image-id")
+            self.assertEqual(len(list((root / "node0/run").rglob("*.png"))), 8)
+
     def test_memory_override_reaches_docker_and_dry_run(self) -> None:
         """The handoff OOM workaround must not be overwritten by the baseline profile."""
         for native in (False, True):

@@ -16,6 +16,7 @@
 
 import ast
 import json
+import math
 import os
 import re
 import sys
@@ -259,14 +260,23 @@ class NativeBaselineTests(unittest.TestCase):
 
         def train():
             trainer.state.global_step = 2
-            trainer._tracker.rows = [{"training/rollout_log_probs_diff_max": 1.0}] * 2
+            trainer._tracker.rows = [{"step": step, "training/rollout_log_probs_diff_max": 1.0,
+                                     "training/rollout_log_probs_diff_mean": 0.1,
+                                     "training/actor_log_probs_mean": -0.5,
+                                     "training/rollout_log_probs_mean": -0.6,
+                                     "training/rollout_probs_diff_valid": 1,
+                                     "training/log_probs_valid_tokens": 100} for step in (1, 2)]
 
         trainer.train = train
+        validate = load_function("hyper_parallel/rl/examples/gsm8k/scripts/run_qwen3_30b_native.py",
+                                 "validate_logp_diagnostics", {"math": math})
         run = load_function("hyper_parallel/rl/examples/gsm8k/scripts/run_qwen3_30b_native.py", "run", {
             "json": json, "time": time, "os": os, "PhaseRecorder": Recorder,
             "MetricsObserver": Observer, "build_trainer": lambda _config: trainer,
+            "validate_logp_diagnostics": validate,
         })
-        config = {"rollout": {"vllm": {"model_implementation": "native"}}, "train": {"max_steps": 2}}
+        config = {"rollout": {"vllm": {"model_implementation": "native"}, "collect_log_probs": True},
+                  "train": {"max_steps": 2, "old_log_prob_source": "actor"}}
         with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {"RANK": "0"}):
             report = Path(temporary) / "native-training.json"
             run(config, report)
@@ -274,6 +284,13 @@ class NativeBaselineTests(unittest.TestCase):
             self.assertTrue(result["passed"])
             self.assertFalse(result["strict_consistency"])
             self.assertEqual(result["completed_steps"], 2)
+            self.assertTrue(result["logp_diagnostics_complete"])
+            self.assertEqual(result["logp_diff_max_over_steps"], 1.0)
+            for key in ("training/rollout_log_probs_diff_max", "training/rollout_probs_diff_valid"):
+                missing = trainer._tracker.rows[0].copy()
+                missing.pop(key)
+                with self.assertRaisesRegex(RuntimeError, "native logp"):
+                    validate([missing])
             with self.assertRaisesRegex(ValueError, "no consistency"):
                 run({**config, "consistency": {}}, report)
             trainer.train = lambda: None

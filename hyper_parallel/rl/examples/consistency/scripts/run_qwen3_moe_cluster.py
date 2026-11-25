@@ -269,6 +269,14 @@ def prepare_formal_data(args: argparse.Namespace, directory: Path, image_id: str
 def run(args: argparse.Namespace) -> Path:
     """Preflight, stage, launch, collect evidence, and clean up only owned containers."""
     controller_started = time.monotonic()
+    comparison = getattr(args, "compare_with", None)
+    if comparison is not None:
+        evidence = json.loads((comparison / "summary.json").read_text(encoding="utf-8"))
+        rows = [json.loads(line) for line in (comparison / "node0/run/steps.jsonl").read_text(
+            encoding="utf-8").splitlines() if line.strip()]
+        if (evidence.get("passed") is not True or evidence.get("native_baseline") is True
+                or [row.get("step") for row in rows] != list(range(1, 51))):
+            raise ValueError("--compare-with requires an existing successful 50-step Consistency run")
     image_id, addresses = preflight(args)
     batch = resolve_batch(args, len(args.hosts))
     args.shared_root.mkdir(parents=True, exist_ok=True)
@@ -316,6 +324,7 @@ def run(args: argparse.Namespace) -> Path:
             "formal_gsm8k": args.formal_gsm8k, "dataset_counts": manifest["counts"] if manifest else None,
             "baseline_5step": getattr(args, "baseline_5step", False),
             "native_baseline": getattr(args, "native_baseline", False),
+            "compare_with": str(comparison.resolve()) if comparison is not None else None,
             "gpu_memory_utilization": getattr(args, "gpu_memory_utilization", None),
             "strict_consistency": not getattr(args, "native_baseline", False),
             "shared_free_gb_at_start": shutil.disk_usage(directory).free / 1024**3,
@@ -397,10 +406,52 @@ def run(args: argparse.Namespace) -> Path:
         timing_keys = ("warm_step_samples", "mean_seconds", "warm_generated_tokens", "rollout_summary",
                        "reported_peak_allocated_gb", "memory_scope", "timing_error")
         print("CLUSTER_TIMING", json.dumps({key: result[key] for key in timing_keys if key in result}), flush=True)
-        print("CLUSTER_RESULT", json.dumps({"passed": result["passed"], "directory": str(directory)}), flush=True)
     if not result["passed"]:
+        print("CLUSTER_RESULT", json.dumps({"passed": False, "directory": str(directory)}), flush=True)
         raise RuntimeError(f"Cluster training failed; inspect {directory}/node*.log and node*/run")
+    if getattr(args, "native_baseline", False):
+        try:
+            export_native_figures(args, directory, source, image_id)
+            result["native_figures_verified"] = True
+            result["comparison_figures_verified"] = getattr(args, "compare_with", None) is not None
+        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+            result.update(passed=False, post_training_plot_error=str(error))
+            raise
+        finally:
+            (directory / "summary.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+            print("CLUSTER_RESULT", json.dumps({"passed": result["passed"], "directory": str(directory)}), flush=True)
+    else:
+        print("CLUSTER_RESULT", json.dumps({"passed": True, "directory": str(directory)}), flush=True)
     return directory
+
+
+def export_native_figures(args: argparse.Namespace, directory: Path, source: Path, image_id: str) -> None:
+    """Use the existing runtime image on CPU to export native and optional paired figures."""
+    output = directory / "node0/run"
+    command = ["docker", "run", "--rm", "--network=none", "--user", f"{os.getuid()}:{os.getgid()}",
+               "-e", "MPLCONFIGDIR=/tmp/matplotlib", "--entrypoint", "python",
+               "-v", f"{source}:/workspace:ro", "-v", f"{directory}:/native-result:ro",
+               "-v", f"{output}:/plots:rw"]
+    comparison = getattr(args, "compare_with", None)
+    if comparison is not None:
+        command.extend(["-v", f"{comparison.resolve()}:/consistency-result:ro"])
+    command.extend([image_id, f"/workspace/{SCRIPTS}/plot_comparison.py", "--native", "/native-result",
+                    "--expected-steps", str(args.steps), "--output",
+                    "/plots/comparison-plots" if comparison is not None else "/plots/native-plots"])
+    if comparison is not None:
+        command.extend(["--consistency", "/consistency-result", "--single-output", "/plots/native-plots"])
+    execute(args.hosts[0], True, command)
+    for subdirectory, suffix in (("native-plots", ""), ("comparison-plots", "-comparison")):
+        if subdirectory == "comparison-plots" and comparison is None:
+            continue
+        for name in ("reward", "test-accuracy", "logp-max", "time"):
+            for extension in ("png", "svg"):
+                path = output / subdirectory / f"{name}{suffix}.{extension}"
+                if not path.is_file() or path.stat().st_size == 0:
+                    raise RuntimeError(f"Missing native experiment figure: {path}")
+    print("NATIVE_FIGURES", str(output / "native-plots"), flush=True)
+    if comparison is not None:
+        print("COMPARISON_FIGURES", str(output / "comparison-plots"), flush=True)
 
 
 def main() -> None:
@@ -422,6 +473,8 @@ def main() -> None:
                         help="50 steps over 6726 training questions, 747 validation and 1319 final test")
     parser.add_argument("--native-baseline", action="store_true",
                         help="Native vLLM MoE without strict consistency; default 2 steps, up to 50")
+    parser.add_argument("--compare-with", type=Path,
+                        help="Existing successful Consistency cluster root; native 50-step runs only")
     parser.add_argument("--baseline-5step", action="store_true",
                         help="Unified 6400/500 baseline; default 2-step pilot, --steps 50 for a complete epoch")
     parser.add_argument("--global-prompt-batch-size", type=int, help="Global questions per step across training DP")
@@ -440,6 +493,8 @@ def main() -> None:
     parser.add_argument("--timeout", type=int)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if args.compare_with is not None and (not args.native_baseline or args.steps != 50):
+        parser.error("--compare-with requires --native-baseline --steps 50")
     if args.gpu_memory_utilization is not None:
         if not (args.baseline_5step or args.native_baseline):
             parser.error("--gpu-memory-utilization is supported only by the 6400/500 baseline modes")
@@ -517,6 +572,7 @@ def main() -> None:
                           "max_num_batched_tokens": (8192 if args.baseline_5step or args.native_baseline
                                                      else args.max_prompt),
                           "native_baseline": args.native_baseline,
+                          "compare_with": str(args.compare_with) if args.compare_with is not None else None,
                           "max_num_seqs": 64 if args.baseline_5step or args.native_baseline else 4,
                           "gpu_memory_utilization": (args.gpu_memory_utilization
                                                      if args.baseline_5step or args.native_baseline else 0.35),

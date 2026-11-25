@@ -199,7 +199,8 @@ def configure(config: dict, world: int) -> dict:
         config["algorithm"]["kl_coef"] = 0.001
         config["data"].update(train_path="/baseline-run/data/train.parquet",
                               test_path="/baseline-run/data/test.parquet", max_train_samples=6400, shuffle=False)
-        config["rollout"].update(seed=None, collect_log_probs=False)
+        config["rollout"].update(seed=None, collect_log_probs=True)
+        config["logging"]["log_steps"] = 1
         for field in ("expert_parallel_size", "unified_execution", "sequence_parallel", "compilation_config"):
             inference.pop(field, None)
         inference.update(model_implementation="native", enable_expert_parallel=True, enable_eplb=False,

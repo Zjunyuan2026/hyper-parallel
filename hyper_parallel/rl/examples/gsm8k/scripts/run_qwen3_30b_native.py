@@ -17,6 +17,7 @@
 import argparse
 import json
 import logging
+import math
 import os
 import time
 from pathlib import Path
@@ -26,10 +27,27 @@ from rl.config.loader import load_config
 from rl.trainer.build import build_trainer
 
 
+def validate_logp_diagnostics(rows: list[dict]) -> dict:
+    """Require independently measured logp evidence, allowing arbitrary finite differences."""
+    maxima = []
+    for row in rows:
+        keys = ("training/rollout_log_probs_diff_max", "training/rollout_log_probs_diff_mean",
+                "training/actor_log_probs_mean", "training/rollout_log_probs_mean")
+        if (row.get("training/rollout_probs_diff_valid") != 1
+                or row.get("training/log_probs_valid_tokens", 0) <= 0
+                or any(key not in row or not math.isfinite(float(row[key])) for key in keys)
+                or row[keys[0]] < 0 or row[keys[1]] < 0):
+            raise RuntimeError(f"Missing or invalid native logp measurements at step {row.get('step')}")
+        maxima.append(float(row[keys[0]]))
+    return {"logp_diagnostics_complete": bool(rows), "logp_diff_max_over_steps": max(maxima, default=None)}
+
+
 def run(config: dict, report: Path) -> None:
     """Record normal training metrics without requiring Actor/rollout probability equality."""
     if "consistency" in config or config["rollout"]["vllm"]["model_implementation"] != "native":
         raise ValueError("Native baseline requires native vLLM and no consistency section")
+    if not config["rollout"].get("collect_log_probs") or config["train"].get("old_log_prob_source") != "actor":
+        raise ValueError("Native diagnostic baseline requires rollout logp collection and the Actor anchor")
     report.parent.mkdir(parents=True, exist_ok=True)
     phases = PhaseRecorder(report.parent)
     trainer = phases.call("build_trainer", lambda: build_trainer(config))
@@ -48,10 +66,12 @@ def run(config: dict, report: Path) -> None:
             raise RuntimeError("Native training stopped before completing requested steps")
         # Only global rank zero writes MetricsObserver rows and the shared report.
         if observer.rows:
+            diagnostics = validate_logp_diagnostics(observer.rows)
             result = {"passed": True, "completed_steps": trainer.state.global_step,
+                      **diagnostics,
                       "strict_consistency": False, "model_implementation": "native",
                       "training_seconds_including_evaluation_and_checkpoint": time.monotonic() - started,
-                      "scope": "Native GRPO completion only; no train/rollout numerical parity assertion"}
+                      "scope": "Native GRPO with independent logp diagnostics; no numerical equality assertion"}
             report.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
 
     finish()

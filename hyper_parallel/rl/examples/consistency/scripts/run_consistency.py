@@ -242,6 +242,8 @@ class MetricsObserver:
             writer.writerows(self.rows)
         logging.info("STEP_RESULT %s", json.dumps(row, default=str))
         important = ("reward/mean", "reward/std", "train/gradient_norm", "train/total_loss",
+                     "training/rollout_probs_diff_valid", "training/actor_log_probs_mean",
+                     "training/rollout_log_probs_mean", "training/rollout_log_probs_diff_std",
                      "perf/time_per_step", "training/log_probs_valid_tokens",
                      "training/rollout_log_probs_diff_max", "training/rollout_log_probs_diff_mean")
         logging.info("STEP_SUMMARY %s", json.dumps({"step": step, **{key: row.get(key) for key in important}}))

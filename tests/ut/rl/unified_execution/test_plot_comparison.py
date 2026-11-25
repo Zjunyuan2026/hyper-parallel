@@ -53,6 +53,26 @@ def fixture(root: Path, native: bool) -> None:
 class ComparisonPlotTests(unittest.TestCase):
     """Keep absent probabilities distinct from real zero and use full-run time sums."""
 
+    def test_native_single_and_comparison_preserve_nonzero_logp(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fixture(root / "consistency", False)
+            fixture(root / "native", True)
+            path = root / "native/node0/run/steps.jsonl"
+            rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+            for row in rows:
+                row.update({"training/rollout_probs_diff_valid": 1,
+                            "training/log_probs_valid_tokens": 100, "training/rollout_log_probs_diff_max": 0.125})
+            path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+            for paired in (False, True):
+                output = root / ("paired" if paired else "single")
+                report = RENDER(root / "consistency" if paired else None, root / "native", output)
+                self.assertEqual(report["missing_logp"], [])
+                self.assertEqual(len(list(output.glob("*.png"))), 4)
+                self.assertEqual(len(report["runs"]), 2 if paired else 1)
+                svg = (output / ("logp-max-comparison.svg" if paired else "logp-max.svg")).read_text(encoding="utf-8")
+                self.assertNotIn("missing logp measurements", svg)
+
     def test_four_panels_and_missing_native_logp(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

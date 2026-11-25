@@ -76,7 +76,7 @@ class ConfigureRunTests(unittest.TestCase):
         self.assertNotIn("expert_parallel_size", config["rollout"]["vllm"])
         self.assertNotIn("unified_execution", config["rollout"]["vllm"])
         self.assertEqual(config["rollout"]["vllm"]["model_implementation"], "native")
-        self.assertFalse(config["rollout"]["collect_log_probs"])
+        self.assertTrue(config["rollout"]["collect_log_probs"])
         self.assertFalse(config["train"]["accelerator"]["cpu_offload"])
         self.assertFalse(config["train"]["accelerator"]["sequence_parallel"])
         self.assertEqual(config["train"]["micro_batch_size"], 2)

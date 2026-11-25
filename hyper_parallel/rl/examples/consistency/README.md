@@ -68,8 +68,15 @@ python3 hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_cluster.py 
 2 步使用前 256 题，50 步恰好覆盖全部 6400 题。
 
 学习率 `1e-6`、KL `0.001`、weight decay `0.01`、FP32 主参数及其余算法/优化器超参数对齐 4B。
-`old_log_prob_source=actor`，`collect_log_probs=false`；仍计算训练锚点和 Reference 概率，
-但不收集独立采样概率，也不要求训练/推理概率一致。
+`old_log_prob_source=actor`，`collect_log_probs=true`；训练锚点仍由更新前 Actor 重算，
+独立保留采样端 logp，仅用于观测同一有效回答 token 上的训推差异，不要求差值为零。
+每步 `STEP_SUMMARY` 输出最大/平均/标准差、两端 logp 均值、有效标记及有效 token 数，
+并保存到 `steps.jsonl/csv`；完成报告要求每步观测有效，但允许任意有限非零差值。
+原生训练结束后自动用运行镜像在 CPU 导出四张单组图至 `node0/run/native-plots/`，宿主机无需 matplotlib。
+50 步原生入口可追加 `--compare-with /path/to/existing-consistency-cluster-result`，
+复用已有成功的 Consistency 结果，另导出四张对比图至本次 `node0/run/comparison-plots/`，不重跑一致性训练。
+两组图均沿用同轴 mean/std 原始取点与 MA5，以及 Run total、Rollout、Actor update、Weight sync 四项时间。
+新图各包含 PNG/SVG；原有 `plots/` 诊断图仍保留。自动对比读取已有记录，不能补回历史缺失的采样 logp。
 训练 TP4/CP2/DP8/EP4，关闭 SP；推理每节点 native DP8/TP2，启用原生专家并行（EP16），关闭 EPLB。
 CP2 仅用于训练端：Actor 和 Reference 使用普通 HyperParallel CP Attention、全局位置及因果 mask，
 先全局移动 next-token 目标再按 CP 切分，保留跨 rank 边界的预测目标；推理侧保持 PCP1。
