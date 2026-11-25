@@ -26,6 +26,8 @@ from matplotlib.ticker import PercentFormatter
 from plot_training import moving_average, number, read_evaluations, read_rows
 
 SERIES = (("Consistency", "#2563eb"), ("NO-Consistency", "#ea580c"))
+DISPLAY_ANNOTATION = ("Training: TP4 DP8 EP4 CP2 SP=True\n"
+                      "Rollout: TP2 DP8 EP16 PCP1 SP=False")
 TIMES = (("Run\ntotal", None), ("Training\nsteps", "timing_s/step"),
          ("Rollout", "timing_s/gen"), ("Old\nlogp", "timing_s/old_log_prob"),
          ("Reference", "timing_s/ref"), ("Actor\nupdate", "timing_s/update_actor"),
@@ -54,7 +56,7 @@ def new_plot(title: str, ylabel: str) -> tuple:
     figure = Figure(figsize=(6, 4), layout="constrained")
     FigureCanvasAgg(figure)
     axis = figure.subplots()
-    axis.set_title(title)
+    figure.suptitle(f"Qwen3-30B-A3B on GSM8K:\n{title}\n{DISPLAY_ANNOTATION}", fontsize=9)
     axis.set_ylabel(ylabel)
     axis.grid(axis="y", alpha=0.2)
     return figure, axis
@@ -78,12 +80,14 @@ def render(consistency: Path, native: Path, output: Path, window: int = 5, steps
     report = {"runs": {label: {"root": run["root"], "seconds": dict(zip(
         (label.replace("\n", " ") for label, _ in TIMES), run["seconds"]))}
         for (label, _), run in zip(SERIES, runs)}, "smoothing_window": window,
+        "display_annotation": DISPLAY_ANNOTATION,
+        "display_annotation_source": "User-specified display text; not inferred from recorded run configurations",
         "reward_std_scope": "Per-step response reward population std; not uncertainty across repeated runs",
         "time_scope": "All recorded steps including first. Run total is launch-to-collection wall time; "
                       "includes startup/evaluation/plotting/cleanup. Component bars cover training steps only; "
                       "the displayed bars are not additive.", "missing_logp": []}
 
-    figure, axis = new_plot("Training reward", "Reward")
+    figure, axis = new_plot("Training Reward", "Reward")
     for (label, color), run in zip(SERIES, runs):
         x = [row["step"] for row in run["rows"]]
         mean = np.array([number(row, "reward/mean") for row in run["rows"]])
@@ -97,7 +101,7 @@ def render(consistency: Path, native: Path, output: Path, window: int = 5, steps
     axis.legend(fontsize=7, ncol=2)
     save(figure, output, "reward-comparison")
 
-    figure, axis = new_plot("GSM8K test accuracy (500 questions)", "Accuracy")
+    figure, axis = new_plot("Test Accuracy", "Accuracy (500 questions)")
     for index, ((label, color), run) in enumerate(zip(SERIES, runs)):
         evaluations = [row for row in run["evaluations"] if row["step"] % 10 == 0 and 0 <= row["step"] <= steps]
         for row in evaluations:
@@ -121,7 +125,8 @@ def render(consistency: Path, native: Path, output: Path, window: int = 5, steps
     axis.legend(fontsize=8)
     save(figure, output, "test-accuracy-comparison")
 
-    figure, axis = new_plot("Train / rollout logp difference", "Max |logp(train) - logp(rollout)|")
+    figure, axis = new_plot("Maximum Train–Rollout Log-Probability Difference",
+                            "Max |logp(train) - logp(rollout)|")
     for index, ((label, color), run) in enumerate(zip(SERIES, runs)):
         values = [number(row, "training/rollout_log_probs_diff_max")
                   if number(row, "training/rollout_probs_diff_valid") == 1
@@ -139,7 +144,7 @@ def render(consistency: Path, native: Path, output: Path, window: int = 5, steps
         axis.legend(loc="lower right", fontsize=8)
     save(figure, output, "logp-max-comparison")
 
-    figure, axis = new_plot("Time comparison", "Minutes")
+    figure, axis = new_plot("Runtime Breakdown", "Minutes")
     x = np.arange(len(TIMES))
     for index, ((label, color), run) in enumerate(zip(SERIES, runs)):
         values = [v / 60 if v is not None else math.nan for v in run["seconds"]]
