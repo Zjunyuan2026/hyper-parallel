@@ -295,13 +295,15 @@ def run(args: argparse.Namespace) -> Path:
             execute(host, index == 0, ["test", "-s", str(path)])
         require_idle(execute(host, index == 0, ["npu-smi", "info"]).stdout, host)
         (directory / f"node{index}/run").mkdir(parents=True)
-    if args.formal_gsm8k:
+    if args.formal_gsm8k or getattr(args, "baseline_5step", False) or getattr(args, "native_baseline", False):
         weight_bytes = sum(path.stat().st_size for path in args.model_root.glob("*.safetensors"))
         free_bytes = shutil.disk_usage(directory).free
-        model_copies = 6
+        model_copies = 6 if args.formal_gsm8k else 1
         print("CHECKPOINT_STORAGE", json.dumps({"shared_free_gb": free_bytes / 1024**3,
               "model_only_lower_bound_gb": weight_bytes * model_copies / 1024**3,
-              "note": "Model/export lower bound only; optimizer/rank state needs additional space"}), flush=True)
+              "note": ("Model/export lower bound only; optimizer/rank state needs additional space"
+                       if args.formal_gsm8k else "Final HF weights lower bound; reserve additional space for logs")}),
+              flush=True)
         if weight_bytes == 0 or free_bytes < weight_bytes * model_copies:
             raise RuntimeError("Insufficient minimum checkpoint space or missing safetensors model weights")
     prepares_data = (args.formal_gsm8k or getattr(args, "baseline_5step", False)
@@ -387,6 +389,10 @@ def run(args: argparse.Namespace) -> Path:
             if getattr(args, "baseline_5step", False) or getattr(args, "native_baseline", False):
                 result["final_test_verified"] = evidence.get("final_test_verified") is True
                 result["passed"] = result["passed"] and result["final_test_verified"]
+                export = directory / "baseline/checkpoints" / f"step_{args.steps}" / "hf"
+                result["final_model_path"] = str(export)
+                result["final_model_verified"] = verify_final_model(export)
+                result["passed"] = result["passed"] and result["final_model_verified"]
     finally:
         for index, host, name in launched:
             for command in (["docker", "logs", name], ["docker", "rm", "-f", name]):
@@ -423,6 +429,24 @@ def run(args: argparse.Namespace) -> Path:
     else:
         print("CLUSTER_RESULT", json.dumps({"passed": True, "directory": str(directory)}), flush=True)
     return directory
+
+
+def verify_final_model(directory: Path) -> bool:
+    """Require nonempty HF config, tokenizer config and every indexed weight shard."""
+    if not all((directory / name).is_file() and (directory / name).stat().st_size > 0
+               for name in ("config.json", "tokenizer_config.json")):
+        return False
+    indices = list(directory.glob("*.index.json"))
+    if indices:
+        names = {str(name) for index in indices for name in json.loads(
+            index.read_text(encoding="utf-8")).get("weight_map", {}).values()}
+        if not names:
+            return False
+        weights = [directory / name for name in names]
+    else:
+        weights = [*directory.glob("*.safetensors"), *directory.glob("pytorch_model*.bin")]
+    return bool(weights) and all(path.parent.resolve() == directory.resolve()
+                                 and path.is_file() and path.stat().st_size > 0 for path in weights)
 
 
 def export_native_figures(args: argparse.Namespace, directory: Path, source: Path, image_id: str) -> None:

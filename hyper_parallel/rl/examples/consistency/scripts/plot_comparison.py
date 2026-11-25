@@ -86,7 +86,8 @@ def render(consistency: Path | None, native: Path, output: Path, window: int = 5
         "display_annotation_source": "User-specified display text; not inferred from recorded run configurations",
         "reward_std_scope": "Per-step response reward population std; not uncertainty across repeated runs",
         "time_scope": "All recorded steps including first. Run total is launch-to-collection wall time; "
-                      "includes startup/evaluation/plotting/cleanup. Component bars cover training steps only; "
+                      "includes startup/evaluation/final model export/plotting/cleanup. "
+                      "Component bars cover training steps only; "
                       "the displayed bars are not additive.", "missing_logp": []}
 
     figure, axis = new_plot("Training Reward", "Reward")

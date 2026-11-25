@@ -49,6 +49,21 @@ def arguments(directory: Path) -> argparse.Namespace:
 class ClusterLauncherTests(unittest.TestCase):
     """Validate placement, completeness, and bounded failure cleanup without NPU use."""
 
+    def test_final_model_requires_all_indexed_weight_shards(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("config.json", "tokenizer_config.json"):
+                (root / name).write_text("{}", encoding="utf-8")
+            self.assertFalse(CONTROLLER.verify_final_model(root))
+            (root / "model-1.safetensors").write_bytes(b"weights")
+            self.assertTrue(CONTROLLER.verify_final_model(root))
+            index = root / "model.safetensors.index.json"
+            index.write_text(json.dumps({"weight_map": {"a": "model-1.safetensors",
+                                                        "b": "model-2.safetensors"}}), encoding="utf-8")
+            self.assertFalse(CONTROLLER.verify_final_model(root))
+            (root / "model-2.safetensors").write_bytes(b"weights")
+            self.assertTrue(CONTROLLER.verify_final_model(root))
+
     def test_native_exports_use_cpu_image_and_verify_all_eight_figures(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

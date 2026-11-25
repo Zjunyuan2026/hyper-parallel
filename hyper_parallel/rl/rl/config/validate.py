@@ -717,6 +717,8 @@ def _validate_checkpoint(checkpoint: Mapping[str, Any]) -> None:
     save_final = bool(checkpoint.get("save_final", True))
     verify_reload = bool(checkpoint.get("verify_reload", False))
     save_steps = int(checkpoint.get("save_steps", 0))
+    if checkpoint.get("save_final_model_only", False) and (not save_final or verify_reload or save_steps != 0):
+        raise ValueError("checkpoint.save_final_model_only requires save_final=true, save_steps=0, verify_reload=false")
     if verify_reload and not save_final:
         raise ValueError("checkpoint.verify_reload requires checkpoint.save_final=true")
     if save_steps < 0:

@@ -174,7 +174,8 @@ class RLCheckpointManager:
     def will_save(self, step: int) -> bool:
         """Return whether periodic or final policy state is due."""
         periodic = self.save_steps > 0 and step % self.save_steps == 0
-        final = bool(self.config.get("save_final", True)) and step == self.resources.state.max_steps
+        final = (bool(self.config.get("save_final", True)) and step == self.resources.state.max_steps
+                 and not self.config.get("save_final_model_only", False))
         return periodic or final
 
     def _validate_optimizer_manifest(self, manifest: Mapping[str, Any]) -> None:
@@ -329,10 +330,13 @@ class RLCheckpointManager:
         self._save(state)
 
     def finalize(self, state: Any) -> None:
-        """Save resumable state, verify it if requested, and export final HF weights."""
+        """Export final HF weights, optionally retaining resumable training state."""
         if not bool(self.config.get("save_final", True)):
             return
         step = int(state.global_step)
+        if self.config.get("save_final_model_only", False):
+            self._export_hf(self.directory(step))
+            return
         if self._last_saved_step != step:
             self._save(state)
         if bool(self.config.get("verify_reload", False)):

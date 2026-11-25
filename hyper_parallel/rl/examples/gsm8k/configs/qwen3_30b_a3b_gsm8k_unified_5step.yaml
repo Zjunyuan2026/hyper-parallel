@@ -263,7 +263,8 @@ train:
     load_path: null
     output_dir: /baseline-run/checkpoints
     save_steps: 0
-    save_final: false
+    save_final: true
+    save_final_model_only: true
     verify_reload: false
   old_log_prob_source: actor
   gradient_sync_each_micro_batch: true

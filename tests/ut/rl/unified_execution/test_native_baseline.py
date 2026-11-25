@@ -50,6 +50,34 @@ def load_function(path: str, name: str, bindings: dict):
 class NativeBaselineTests(unittest.TestCase):
     """Verify native admission and reporting without weakening unified probability gates."""
 
+    def test_final_model_only_exports_hf_without_optimizer_checkpoint(self) -> None:
+        manager_type = load_function("hyper_parallel/rl/rl/trainer/checkpoint.py", "RLCheckpointManager", {})
+        validate = load_function("hyper_parallel/rl/rl/config/validate.py", "_validate_checkpoint",
+                                 {"_path_value": lambda config, key: config[key]})
+        manager = object.__new__(manager_type)
+        manager.config = {"save_final": True, "save_final_model_only": True, "save_steps": 0,
+                          "verify_reload": False, "output_dir": "/run/checkpoints"}
+        manager.output_dir = Path("/run/checkpoints")
+        manager.resources = SimpleNamespace(state=SimpleNamespace(max_steps=50))
+        manager._last_saved_step = None
+        manager._save = Mock()
+        manager._verify_reload = Mock()
+        manager._export_hf = Mock()
+        validate(manager.config)
+        for step in (1, 10, 49, 50):
+            self.assertFalse(manager.will_save(step))
+        manager.finalize(SimpleNamespace(global_step=50))
+        manager._save.assert_not_called()
+        manager._verify_reload.assert_not_called()
+        manager._export_hf.assert_called_once_with(manager.output_dir / "step_50")
+        manager.config["save_final_model_only"] = False
+        self.assertTrue(manager.will_save(50))
+        manager.finalize(SimpleNamespace(global_step=50))
+        manager._save.assert_called_once()
+        for overrides in ({"save_final": False}, {"save_steps": 10}, {"verify_reload": True}):
+            with self.assertRaisesRegex(ValueError, "save_final_model_only"):
+                validate({**manager.config, "save_final_model_only": True, **overrides})
+
     def test_native_expert_reload_accepts_flat_and_routed_storage(self) -> None:
         """Publish canonical projections across buckets while checking local expert coverage."""
         adapter = "hyper_parallel/rl/rl/weight_sync/model_adapter.py"

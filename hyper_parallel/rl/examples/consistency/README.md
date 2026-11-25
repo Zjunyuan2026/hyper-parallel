@@ -16,7 +16,7 @@ logp 图使用有效回答 token 的最大绝对训练/推理差值，缺失数�
 此前原生配方关闭了采样 logp 采集，这些历史运行无法恢复未记录的逐步 logp 差值。
 时间图按维度分组显示两组柱状图，单位为分钟，包含首步、不按排除首步后的均值外推。
 时间仅显示 Run total、Rollout、Actor update、Weight sync 四项。
-Run total 为启动至收集完成的墙钟时间，含启动、评估、绘图及清理；
+Run total 为启动至收集完成的墙钟时间，含启动、评估、最终模型导出、绘图及清理；
 其余柱为全部训练步骤内的生成、Actor 更新和权重同步耗时之和；图中各柱不能相加。
 
 训练绘图脚本导出的所有 PNG/SVG（含总览图、原始曲线图）统一使用宽:高 **6:4**。
@@ -40,7 +40,7 @@ python3 hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_cluster.py 
 ```
 
 两组均每步 128 题、每题 8 回答，50 步使用 6400 题；每 10 步及训练前评估固定 500 题。
-不保存训练模型或 checkpoint，指标和 6:4 PNG/SVG 保存在各自独立结果目录。
+两种模式均保留最后一步 HF 模型及 tokenizer，指标和 6:4 PNG/SVG 保存在各自独立结果目录。
 
 ## Qwen3-30B-A3B：原生 vLLM 对照训练（不启用训推一致）
 
@@ -90,7 +90,7 @@ Actor 和 Reference 均关闭 CPU offload，保持与 unified 对照一致；实
 
 原生完成报告为 `node0/run/native-training.json`，不生成严格一致性通过结论。
 时间仍记录在 `node0/run/steps.jsonl`、`steps.csv` 和根目录 `summary.json`，可用原耗时统计方式。
-训练前后评估固定 500 题；50 步时每 10 步评估。不保存训练 checkpoint、优化器状态或最终 HF 权重。
+训练前后评估固定 500 题；50 步时每 10 步评估。最后导出 HF 权重及 tokenizer，不保存优化器或中间 checkpoint。
 保留日志、指标和评估结果，并自动生成 reward、loss、耗时、总览和原始曲线的 PNG/SVG。
 原生模式不生成一致性图，也不会把未检查的概率差异标成零。
 两种模式都必须通过图片存在及非空检查才能报告整体成功，图片位于 `node0/run/plots/`，宽高比均为 6:4。
@@ -124,14 +124,16 @@ prompt/回答上限均为 1024，`max_model_len=2048`，`max_num_batched_tokens=
 独立结果目录的 `baseline/data/manifest.json` 保存源文件和输出哈希、抽取索引。
 默认 2 步使用抽样训练集的前 256 题；训练前和第 2 步在同一 500 题上贪心评估。
 添加 `--steps 5` 可沿用 5 步测试，使用前 640 题。
-两个新增模式均设置 `save_steps=0`、`save_final=false`，所有测试和 50 步运行都不保存训练权重或优化器状态。
-仅保留配置、日志、指标、数据清单及评估结果；不删除以前运行已保存的模型，也不覆盖原始模型。
+两个新增模式均设置 `save_steps=0`、`save_final=true`、`save_final_model_only=true`，
+仅在最后一步导出 HF 权重及 tokenizer，不保存优化器、随机数状态或中间 checkpoint。
+模型路径为本次结果目录的 `baseline/checkpoints/step_50/hf/`（两步测试为 `step_2/hf/`）。
+原始模型以只读方式挂载，不会覆盖；此 HF 导出用于推理，不能作为完整 RL 断点恢复。
 完整训练在同一命令末尾添加 `--steps 50`；旧脚本名和 `--baseline-5step` 参数名保留兼容。
 50 步每步 128 题，恰好覆盖全部 6400 题；训练前及第 10/20/30/40/50 步评估同一 500 题。
-50 步完成后不保存 checkpoint、不导出 HF 权重；本模式仍自动绘图。
+最终 500 题评估完成后，关闭推理进程以释放显存，再导出 HF 模型，最后自动绘图；请等待全部完成。
 覆盖检查使用实际 request-owner 的样本索引，每步核验 128 道预期题目；
 `node0/run/coverage.json` 保存每步索引，结束时检查无重复、无遗漏，50 步覆盖恰好 6400 题。
-50 步默认超时 86400 秒，不再为两个新增模式预检 checkpoint 磁盘容量，仍需为日志和抽样数据预留空间。
+50 步默认超时 86400 秒；启动前按一份初始模型权重大小检查最终 HF 导出的最低磁盘空间，另需为日志预留空间。
 默认 2 步运行，逐步严格概率检查和自动绘图保持不变。原 `--formal-gsm8k` 的保存和导出策略保持不变。
 
 配置生成器保留 `consistency.mode=batch_invariant`、Level 3、V4 和 MoE 模块替换。

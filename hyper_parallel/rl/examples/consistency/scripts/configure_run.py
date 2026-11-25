@@ -181,7 +181,7 @@ def configure(config: dict, world: int) -> dict:
                                     do_sample=False, before_train=True,
                                     every_n_steps=5 if train["max_steps"] == 5 else 10, at_end=True)
         train["checkpoint"].update(output_dir="/baseline-run/checkpoints", save_steps=0,
-                                   save_final=False, verify_reload=False, load_path=None)
+                                   save_final=True, save_final_model_only=True, verify_reload=False, load_path=None)
     if boolean("NATIVE_BASELINE", False):
         if (boolean("BASELINE_5STEP", False) or boolean("FORMAL_GSM8K", False)
                 or world != 64 or train_tp != 4 or train_cp != 2 or dp_size != 8
@@ -209,7 +209,7 @@ def configure(config: dict, world: int) -> dict:
                                     max_new_tokens=config["rollout"]["max_new_tokens"], temperature=0.0,
                                     do_sample=False, before_train=True, every_n_steps=10, at_end=True)
         train["checkpoint"].update(output_dir="/baseline-run/checkpoints", save_steps=0,
-                                   save_final=False, verify_reload=False, load_path=None)
+                                   save_final=True, save_final_model_only=True, verify_reload=False, load_path=None)
     if boolean("BASELINE_5STEP", False) or boolean("NATIVE_BASELINE", False):
         inference.pop("kv_cache_memory_bytes", None)
         memory_utilization = float(os.environ.get("GPU_MEMORY_UTILIZATION", 0.4))
