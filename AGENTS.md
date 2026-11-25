@@ -13,7 +13,7 @@ Primary target hardware: **Ascend NPU and Nvidia GPU**. Primary framework: **PyT
 - For RL-owned code, tests, docs, or agent rules, start with [`.agent/rules/hyper-rl.md`](.agent/rules/hyper-rl.md). It is the sole RL entry.
 - RL rules do not apply to other HyperParallel modules. Handle a required main-project change separately under that module's rules.
 - Use the [RL architecture](docs/rl-architecture.md), [feature navigation](docs/rl-navigation.md), and [module map](.agent/rules/rl/module-map.md) to locate boundaries, implementation/test traces, and ownership.
-- RL unit tests live in `tests/ut/rl/`, system tests in `hyper_parallel/rl/tests/st/`, and shared recipes in `tests/common/rl_st_cases.py`. RL ST is run explicitly and is temporarily outside the main-project PR gate. Follow the repository testing rules as well.
+- RL unit tests live in `tests/ut/rl/`, system tests and their recipes in `hyper_parallel/rl/tests/st/`. RL ST is run explicitly and is temporarily outside the main-project PR gate. Follow the repository testing rules as well.
 
 ---
 

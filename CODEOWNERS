@@ -63,7 +63,7 @@
 # Hyper-RL tests.
 /tests/ut/rl/ @liuchongming74 @kisnwangg
 /hyper_parallel/rl/tests/ @yangzhenzhang02 @kisnwangg
-/tests/common/rl_st_cases.py @liuchongming74 @kisnwangg
+/hyper_parallel/rl/tests/st/st_cases.py @liuchongming74 @kisnwangg
 
 # Hyper-RL documentation and development rules.
 /docs/rl-*.md @yangzhenzhang02 @gemini524 @kisnwangg
