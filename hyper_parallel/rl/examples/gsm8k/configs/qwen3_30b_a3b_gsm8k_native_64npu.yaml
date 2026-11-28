@@ -153,7 +153,7 @@ train:
     save_steps: 0
     save_final: true
     verify_reload: false
-    save_final_model_only: true
+    save_final_model_only: false
   old_log_prob_source: actor
   gradient_sync_each_micro_batch: true
   plan_overrides:

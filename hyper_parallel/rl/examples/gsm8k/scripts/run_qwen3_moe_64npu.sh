@@ -142,7 +142,6 @@ overrides=(
     "--model.weights_path=$model" "--model.tokenizer_path=$model"
     "--data.train_path=$data/train.parquet" "--data.test_path=$data/test.parquet"
     "--train.max_steps=$steps" "--train.checkpoint.save_final=$save_final"
-    "--train.checkpoint.save_final_model_only=$save_final"
     "--train.checkpoint.output_dir=$results_root/$run_id/checkpoints"
 )
 printf 'override=%s\n' "${overrides[@]}" >> "$result/run-info.txt"

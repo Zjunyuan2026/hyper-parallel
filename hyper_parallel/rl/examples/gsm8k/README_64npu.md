@@ -59,8 +59,8 @@ controller-run consistency experiment of equal step count, if one exists.
 choose a specific completed consistency run. Four comparison figures are written
 to the native result's `node0/run/comparison-plots/`; without a reference it
 still produces four native figures. One-to-three-step checks do not save model
-weights; runs of four or more steps export the final HF model to
-`checkpoints/step_<N>/hf/`.
+weights; runs of four or more steps save the final resumable checkpoint at
+`checkpoints/step_<N>/` and export the HF model to `checkpoints/step_<N>/hf/`.
 
 Compared with the earlier A3 branch, training changes from TP4/DP8/EP4/CP2
 to TP4/DP8/EP8/CP2. Full recomputation and rollout-time offload replace the
@@ -84,7 +84,7 @@ uses the PR's grouped-attention factory instead of the older binding path.
 | Maximum sequences per rollout replica | 128 | 32 |
 | Maximum batched tokens | 2048 | 2048 |
 | Evaluation batch per training DP rank | 64 | 64 |
-| Final save | Resumable checkpoint and HF export | HF export only |
+| Final save | Resumable checkpoint and HF export | Resumable checkpoint and HF export |
 
 Both modes use training TP4/CP2 with logical DP8; rollout remains TP2/DP8 per node.
 Both modes keep the PR's learning rate `1e-6`, KL coefficient `0.001`, weight
@@ -233,10 +233,17 @@ For `RUN=$GSM8K_RESULTS/$GSM8K_RUN_ID`:
 | Paired figures, when reference supplied | `$RUN/node0/run/comparison-plots/` |
 | Final 50-step model and tokenizer | `$RUN/checkpoints/step_50/hf/` |
 
-One-to-three-step checks do not save weights. Longer runs export the final model without optimizer
-or scheduler state; this HF directory supports inference, not exact training resume.
-The source model directory is not overwritten. Preserve a full checkpoint instead
-if exact resume is needed by setting `save_final_model_only=false` in the recipe.
+One-to-three-step checks do not save weights. Longer runs save a full checkpoint
+only at the final step (`save_steps=0`, `save_final=true`, `save_final_model_only=false`).
+The final step directory contains distributed model shards, rank-local optimizer,
+scheduler, RNG and dataloader state, progress metadata and a completion manifest.
+Its `hf/` subdirectory contains the inference-ready model and tokenizer. The original
+model directory is not overwritten. Checkpoint saving uses the PR implementation:
+model shards use collective distributed IO, runtime state is written independently
+by each rank, and HF export retains the full CPU state only on the writing rank.
+Resume requires the complete step directory with a compatible topology, not only
+the `hf/` subdirectory. HF-only export remains an optional configuration by setting
+`save_final_model_only=true`; it does not retain optimizer or scheduler state.
 
 The paired output contains four 6:4 figures in PNG and SVG: training reward (raw
 and smoothed mean/std on one axis), 500-question test accuracy with final percentage,
