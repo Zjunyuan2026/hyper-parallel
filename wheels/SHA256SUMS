@@ -1,0 +1,3 @@
+5ef04a872b1be2c812bb0c36c17ba4776a4b5f9b9eabb24eab0a56a139a497c9  wheels/flash_attn_npu-0.5.0+hpbi1-cp312-cp312-linux_aarch64.whl
+97eacca0b73e45cb867dbf8c5d5d4dc32219544300e0c8992c7334dc2ef33cec  wheels/runtime/accelerate-1.15.0-py3-none-any.whl
+106ab6077ff72c54d21577f9af5970e34bac7582cb14209f7b2b511e322a4eae  wheels/runtime/peft-0.21.2-py3-none-any.whl
