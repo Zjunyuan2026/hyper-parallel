@@ -8,6 +8,60 @@ The fork's earlier cluster entry and old unified operator bindings are replaced
 by the PR implementation; use the new entry below rather than the old
 `run_qwen3_moe_cluster.py` command.
 
+## Launch from one host terminal
+
+Run from the repository root on a host with Python 3.10+, Docker access,
+noninteractive SSH access to the candidates, and `/mnt/share/zjy1` mounted.
+The host launcher imports only the Python standard library; Torch and plotting
+packages are used inside the runtime containers.
+
+```bash
+git pull origin A3_hyper_rl
+bash hyper_parallel/rl/examples/gsm8k/scripts/run_qwen3_moe_cluster.sh consistency 2
+bash hyper_parallel/rl/examples/gsm8k/scripts/run_qwen3_moe_cluster.sh native 2
+bash hyper_parallel/rl/examples/gsm8k/scripts/run_qwen3_moe_cluster.sh consistency 50
+bash hyper_parallel/rl/examples/gsm8k/scripts/run_qwen3_moe_cluster.sh native 50
+```
+
+Run the commands sequentially. The default with no arguments is consistency,
+50 steps. The last number accepts any positive integer, for example `native 20`;
+`native --steps 20` also works. A 50-step run covers the 6400-question training
+split once. Longer runs reuse training samples after the data iterator cycles.
+
+The launcher checks `80.5.21.101,102,103,104,106,107,108` (each with the
+`80.5.21.` prefix), skips busy or unavailable nodes, and selects four eligible
+hosts. It checks image content and runtime dependencies, loads missing images
+from matching Docker archives under `/mnt/share/zjy1/images`, verifies shared
+storage, and prepares the 6400/500 sample on CPU if it is absent. It rechecks
+device occupancy before starting four temporary containers. The master address
+comes from the first selected node's `data0.172` interface; the controller does
+not need to be rank zero. Source is frozen with file hashes and installed into
+each container's own writable checkout.
+
+The default image tag is `hyper-rl:consistency-v0.30.0-cann9.2.1-a3-runtime-arm64`.
+If its tag or archive layout differs, set `GSM8K_IMAGE` or `GSM8K_IMAGE_ARCHIVE`
+once, or append `--image TAG --image-archive /mnt/share/zjy1/PATH.tar`.
+`GSM8K_HOSTS`, `GSM8K_INTERFACE`, `GSM8K_SSH_USER`, `GSM8K_MODEL`, `GSM8K_DATA`,
+`GSM8K_SOURCE_DATA`, `GSM8K_RESULTS` and `GSM8K_CACHE_ROOT` are optional overrides.
+Use `--dry-run` to print the resolved plan without contacting hosts or
+`--select-only` to check nodes and images without training.
+
+Each launch prints `RESULT_DIRECTORY` and creates a fresh
+`/mnt/share/zjy1/rl-cluster-runs/qwen3-cluster-<mode>-<id>` directory. Training,
+final export and plotting finish before container exit is accepted. Logs are
+retained as `node*.log` and `node*/run/train.log`. Ctrl+C, timeout and failures
+attempt cleanup only for this invocation's named containers; network failures
+are reported if remote cleanup cannot be completed.
+
+Native mode automatically compares with the most recent successfully completed
+controller-run consistency experiment of equal step count, if one exists.
+`COMPARE_WITH` prints the selected reference. Append `--compare-with PATH` to
+choose a specific completed consistency run. Four comparison figures are written
+to the native result's `node0/run/comparison-plots/`; without a reference it
+still produces four native figures. One-to-three-step checks do not save model
+weights; runs of four or more steps export the final HF model to
+`checkpoints/step_<N>/hf/`.
+
 Compared with the earlier A3 branch, training changes from TP4/DP8/EP4/CP2
 to TP4/DP8/EP8/CP2. Full recomputation and rollout-time offload replace the
 earlier disabled settings. The batched-token limit changes from 8192 to 2048,
@@ -104,7 +158,8 @@ python -m pip install --no-deps -e . -e hyper_parallel/rl
 python -m pip install matplotlib pandas pyarrow pyyaml
 ```
 
-Select four idle nodes before launching. This entry runs inside an already
+The following direct worker instructions are an alternative to the host launcher.
+Select four idle nodes before launching. The worker entry runs inside an already
 prepared environment on every selected node; it does not discover hosts, create
 Docker containers or clean up host containers. Each environment needs 16 visible
 NPUs and working inter-node HCCL connectivity. Use one shared results filesystem
@@ -178,7 +233,7 @@ For `RUN=$GSM8K_RESULTS/$GSM8K_RUN_ID`:
 | Paired figures, when reference supplied | `$RUN/node0/run/comparison-plots/` |
 | Final 50-step model and tokenizer | `$RUN/checkpoints/step_50/hf/` |
 
-Short checks do not save weights. Full runs export the final model without optimizer
+One-to-three-step checks do not save weights. Longer runs export the final model without optimizer
 or scheduler state; this HF directory supports inference, not exact training resume.
 The source model directory is not overwritten. Preserve a full checkpoint instead
 if exact resume is needed by setting `save_final_model_only=false` in the recipe.

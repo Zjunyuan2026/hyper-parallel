@@ -23,8 +23,8 @@ if (( $# )) && [[ $1 != --* ]]; then
     steps=$1
     shift
 fi
-if [[ ! $mode =~ ^(native|unified)$ || ! $steps =~ ^(2|3|50)$ ]]; then
-    echo "Usage: $0 {native|unified} [2|3|50] [--section.field=value ...]" >&2
+if [[ ! $mode =~ ^(native|unified)$ || ! $steps =~ ^[1-9][0-9]*$ ]]; then
+    echo "Usage: $0 {native|unified} [positive-step-count] [--section.field=value ...]" >&2
     exit 2
 fi
 
@@ -101,7 +101,7 @@ finish() {
 trap finish EXIT
 {
     date --iso-8601=seconds
-    git rev-parse HEAD
+    if [[ -n ${GSM8K_SOURCE_REVISION:-} ]]; then printf '%s\n' "$GSM8K_SOURCE_REVISION"; else git rev-parse HEAD; fi
     printf 'mode=%s steps=%s devices=%s model=%s data=%s\n' "$mode" "$steps" "$ASCEND_RT_VISIBLE_DEVICES" "$model" "$data"
     for name in GSM8K_SHARE_ROOT GSM8K_IMAGES GSM8K_CACHE_ROOT XDG_CACHE_HOME HF_HOME HF_HUB_CACHE \
         HF_DATASETS_CACHE PIP_CACHE_DIR TORCH_HOME TORCHINDUCTOR_CACHE_DIR TRITON_CACHE_DIR \
@@ -135,7 +135,7 @@ if count != 16:
 PY
 } > "$result/run-info.txt"
 save_final=false
-if [[ "$steps" == 50 ]]; then save_final=true; fi
+if (( steps > 3 )); then save_final=true; fi
 # Paths and checkpoint cadence follow the run directory and selected step count.
 overrides=(
     "$@"
