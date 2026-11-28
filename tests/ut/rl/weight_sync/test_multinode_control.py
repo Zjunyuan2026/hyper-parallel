@@ -73,17 +73,19 @@ class MultiNodeTests(unittest.TestCase):
             original = yaml.safe_load((configs / f"qwen3_30b_a3b_gsm8k_{mode}_16npu.yaml").read_text())
             actual = yaml.safe_load((configs / f"qwen3_30b_a3b_gsm8k_{mode}_64npu.yaml").read_text())
             train = actual["train"]
-            self.assertEqual(train["accelerator"]["dp_shard"] * train["accelerator"]["tp"], 64)
-            self.assertEqual(train["prompt_batch_size"] * 32, 128)
-            self.assertEqual(train["response_mini_batch_size"], 32)
-            self.assertEqual(train["max_steps"] * train["prompt_batch_size"] * 32, 6400)
+            self.assertEqual(train["accelerator"]["dp_shard"] * train["accelerator"]["tp"]
+                             * train["accelerator"]["cp"], 64)
+            self.assertEqual(train["prompt_batch_size"] * 8, 128)
+            self.assertEqual(train["response_mini_batch_size"], 128)
+            self.assertEqual(train["max_steps"] * train["prompt_batch_size"] * 8, 6400)
             self.assertEqual(train["optimizer"], original["train"]["optimizer"])
             self.assertEqual(actual["algorithm"], original["algorithm"])
             self.assertEqual(train["plan_overrides"], original["train"]["plan_overrides"])
             self.assertTrue(actual["rollout"]["collect_log_probs"])
             self.assertTrue(train["checkpoint"]["save_final_model_only"])
             self.assertEqual(actual["rollout"]["vllm"]["max_num_seqs"], 32)
-            self.assertEqual(actual["evaluation"]["batch_size"] * 32, 512)
+            self.assertEqual(actual["rollout"]["vllm"]["gpu_memory_utilization"], 0.8)
+            self.assertEqual(actual["evaluation"]["batch_size"] * 8, 512)
             self.assertEqual(actual["rollout"]["vllm"]["compilation_config"]["cudagraph_mode"], "FULL_DECODE_ONLY")
 
     def test_node_leader_failure_reaches_global_error_synchronization(self):

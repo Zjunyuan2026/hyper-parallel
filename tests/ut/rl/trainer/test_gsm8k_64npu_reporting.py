@@ -86,7 +86,7 @@ class ReportingTests(unittest.TestCase):
             self.assertEqual(report["missing_logp"], [])
             self.assertEqual(report["runs"]["NO-Consistency"]["seconds"]["Rollout"], 500)
             self.assertEqual(report["run_total_scope"]["Consistency"], "test lifecycle")
-            self.assertIn("TP2 DP32 EP8 CP1", report["display_annotation"])
+            self.assertIn("TP4 DP8 EP8 CP2", report["display_annotation"])
             self.assertEqual(len(list(output.glob("*.png"))), 4)
             self.assertEqual(len(list(output.glob("*.svg"))), 4)
             for path in output.glob("*.png"):

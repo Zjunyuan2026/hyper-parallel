@@ -9,7 +9,7 @@ by the PR implementation; use the new entry below rather than the old
 `run_qwen3_moe_cluster.py` command.
 
 Compared with the earlier A3 branch, training changes from TP4/DP8/EP4/CP2
-to TP2/DP32/EP8/CP1. Full recomputation and rollout-time offload replace the
+to TP4/DP8/EP8/CP2. Full recomputation and rollout-time offload replace the
 earlier disabled settings. The batched-token limit changes from 8192 to 2048,
 and maximum sequences from 64 to 32. Learning rate, KL and weight decay retain
 their existing `1e-6`, `0.001` and `0.01` values. The consistency attention now
@@ -19,19 +19,20 @@ uses the PR's grouped-attention factory instead of the older binding path.
 
 | Setting | PR: one node, 16 NPUs | Four nodes, 64 NPUs |
 | --- | --- | --- |
-| Training TP / DP / EP / EDP / CP / SP | 2 / 8 / 8 / 2 / 1 / false | 2 / 32 / 8 / 8 / 1 / false |
-| Questions per training DP rank | 16 | 4 |
+| Training TP / DP / EP / EDP / CP / SP | 2 / 8 / 8 / 2 / 1 / false | 4 / 8 / 8 / 8 / 2 / false |
+| Questions per training DP rank | 16 | 16 |
 | Global questions per step | 128 | 128 |
 | Responses per question | 8 | 8 |
-| Response mini-batch per DP rank | 128 | 32 |
+| Response mini-batch per DP rank | 128 | 128 |
 | Training micro-batch | 2 | 2 |
 | Rollout TP / DP / EP / PCP | 2 / 8 / 16 / 1 | Same, independently on each node |
-| vLLM memory utilization | 0.8 | 0.4 |
+| vLLM memory utilization | 0.8 | 0.8 |
 | Maximum sequences per rollout replica | 128 | 32 |
 | Maximum batched tokens | 2048 | 2048 |
-| Evaluation batch per training DP rank | 64 | 16 |
+| Evaluation batch per training DP rank | 64 | 64 |
 | Final save | Resumable checkpoint and HF export | HF export only |
 
+Both modes use training TP4/CP2 with logical DP8; rollout remains TP2/DP8 per node.
 Both modes keep the PR's learning rate `1e-6`, KL coefficient `0.001`, weight
 decay `0.01`, FP32 optimizer master parameters, full activation recomputation,
 and `old_log_prob_source: actor`. Rollout log probabilities are collected for
