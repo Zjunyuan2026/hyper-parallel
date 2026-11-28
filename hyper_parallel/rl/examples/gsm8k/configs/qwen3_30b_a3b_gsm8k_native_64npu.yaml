@@ -2,12 +2,12 @@
 model:
   registry_name: qwen3_30b_a3b
   name: qwen3_moe
-  weights_path: /models/Qwen3-30B-A3B
-  tokenizer_path: /models/Qwen3-30B-A3B
+  weights_path: /mnt/share/zjy1/models/Qwen3-30B-A3B
+  tokenizer_path: /mnt/share/zjy1/models/Qwen3-30B-A3B
   config_overrides: null
 data:
-  train_path: /data/gsm8k/train.parquet
-  test_path: /data/gsm8k/test.parquet
+  train_path: /mnt/share/zjy1/datasets/gsm8k-6400-500/train.parquet
+  test_path: /mnt/share/zjy1/datasets/gsm8k-6400-500/test.parquet
   prompt_column: prompt
   answer_column: extra_info
   prompt_instruction: Let's think step by step and output the final answer after "####".
@@ -149,7 +149,7 @@ train:
     no_decay_params: []
   checkpoint:
     load_path: null
-    output_dir: /results/checkpoints
+    output_dir: /mnt/share/zjy1/rl-cluster-runs/checkpoints
     save_steps: 0
     save_final: true
     verify_reload: false
@@ -189,4 +189,4 @@ logging:
   wandb:
     mode: disabled
     entity: null
-    directory: /results/wandb
+    directory: /mnt/share/zjy1/cache/wandb

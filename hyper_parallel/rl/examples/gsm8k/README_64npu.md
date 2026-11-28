@@ -61,6 +61,44 @@ Reinstall both editable packages after updating
 the checkout. An older image from a previous run does not by itself prove runtime
 compatibility.
 
+The shared directory is `/mnt/share/zjy1`. Mount it at the same absolute path
+inside every training container, for example by replacing the old mount argument
+with `-v /mnt/share/zjy1:/mnt/share/zjy1` when creating the container. An existing
+container's old bind mount is not changed by `git pull`.
+
+Source the path setup before installing dependencies so pip also uses the shared
+cache. The training launcher sources it automatically:
+
+```bash
+export GSM8K_SHARE_ROOT=/mnt/share/zjy1
+source hyper_parallel/rl/examples/gsm8k/scripts/configure_qwen3_shared_paths.sh
+```
+
+| Content | Default location |
+| --- | --- |
+| Original model | `$GSM8K_SHARE_ROOT/models/Qwen3-30B-A3B` |
+| Prepared 6400/500 dataset | `$GSM8K_SHARE_ROOT/datasets/gsm8k-6400-500` |
+| Results, final weights and plots | `$GSM8K_SHARE_ROOT/rl-cluster-runs` |
+| Docker image archives | `$GSM8K_SHARE_ROOT/images` |
+| Hugging Face and pip caches | `$GSM8K_SHARE_ROOT/cache/{huggingface,pip}` |
+| Torch, Triton, vLLM and CANN caches | `$GSM8K_SHARE_ROOT/cache/<node>/` |
+
+`GSM8K_MODEL`, `GSM8K_DATA`, `GSM8K_RESULTS`, `GSM8K_IMAGES` and `GSM8K_CACHE_ROOT`
+can override these locations. Existing `/mnt/share/zjy/...` values in these variables,
+including `GSM8K_COMPARE_WITH`, are rebased to the new shared root. No data or cache
+files are copied, moved or deleted. Reuse existing prepared 6400/500 files by setting
+`GSM8K_DATA` to their actual new location; do not sample an already sampled split again.
+Node-specific compiler caches avoid sharing machine-specific compilation artifacts;
+set `GSM8K_CACHE_NODE` to a stable node name when container hostnames are temporary.
+The CANN cache uses the documented
+[`ASCEND_CACHE_PATH`](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/maintenref/envvar/envref_07_0006.html).
+
+To import an archived image, run `docker load -i /mnt/share/zjy1/images/ACTUAL_ARCHIVE.tar`
+on each host, using the actual archive filename. An image already loaded under the
+same tag does not need reimporting just because its archive directory was renamed.
+Image layers remain in Docker-managed storage; this setup does not change Docker's
+daemon data directory or load an image from inside the training process.
+
 ```bash
 python -m pip install --no-deps -e . -e hyper_parallel/rl
 python -m pip install matplotlib pandas pyarrow pyyaml
@@ -78,7 +116,7 @@ the earlier fork's fixed 6400/500 random sample with an index/hash manifest, run
 once on CPU against the full, unsampled source:
 
 ```bash
-python hyper_parallel/rl/examples/gsm8k/scripts/prepare_baseline_data.py --source /data/gsm8k-official --destination /data/gsm8k-6400-500
+python hyper_parallel/rl/examples/gsm8k/scripts/prepare_baseline_data.py --source /mnt/share/zjy1/datasets/gsm8k/prepared --destination /mnt/share/zjy1/datasets/gsm8k-6400-500
 ```
 
 The script samples without replacement, restarting seed 42 separately for the
@@ -94,9 +132,8 @@ to identical values on all four nodes; set `NODE_RANK` individually to 0, 1, 2, 
 Use a fresh `GSM8K_RUN_ID` for every experiment, including when changing its length.
 
 ```bash
-export GSM8K_MODEL=/models/Qwen3-30B-A3B
-export GSM8K_DATA=/data/gsm8k-6400-500
-export GSM8K_RESULTS=/mnt/share/zjy/rl-cluster-runs
+export GSM8K_SHARE_ROOT=/mnt/share/zjy1
+source hyper_parallel/rl/examples/gsm8k/scripts/configure_qwen3_shared_paths.sh
 export MASTER_ADDR=172.27.3.101
 export MASTER_PORT=29751
 export GLOO_SOCKET_IFNAME=data0.172 HCCL_SOCKET_IFNAME=data0.172
@@ -117,7 +154,7 @@ bash hyper_parallel/rl/examples/gsm8k/scripts/run_qwen3_moe_64npu.sh unified 50
 
 ```bash
 export GSM8K_RUN_ID=qwen3-native-50step
-export GSM8K_COMPARE_WITH=/mnt/share/zjy/rl-cluster-runs/qwen3-unified-50step
+export GSM8K_COMPARE_WITH=/mnt/share/zjy1/rl-cluster-runs/qwen3-unified-50step
 bash hyper_parallel/rl/examples/gsm8k/scripts/run_qwen3_moe_64npu.sh native 50
 ```
 
@@ -162,5 +199,5 @@ the plotting report retains each run's recorded scope.
 To regenerate a comparison without training:
 
 ```bash
-python hyper_parallel/rl/examples/consistency/scripts/plot_comparison.py --consistency /mnt/share/zjy/rl-cluster-runs/qwen3-unified-50step --native /mnt/share/zjy/rl-cluster-runs/qwen3-native-50step --output /mnt/share/zjy/rl-cluster-runs/qwen3-native-50step/node0/run/comparison-plots
+python hyper_parallel/rl/examples/consistency/scripts/plot_comparison.py --consistency /mnt/share/zjy1/rl-cluster-runs/qwen3-unified-50step --native /mnt/share/zjy1/rl-cluster-runs/qwen3-native-50step --output /mnt/share/zjy1/rl-cluster-runs/qwen3-native-50step/node0/run/comparison-plots
 ```

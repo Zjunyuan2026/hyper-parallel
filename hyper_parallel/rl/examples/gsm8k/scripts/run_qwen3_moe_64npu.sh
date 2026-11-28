@@ -30,14 +30,15 @@ fi
 
 scripts=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo=$(cd -- "$scripts/../../../../.." && pwd)
+source "$scripts/configure_qwen3_shared_paths.sh"
 config="$scripts/../configs/qwen3_30b_a3b_gsm8k_${mode}_64npu.yaml"
-model=$(realpath -- "${GSM8K_MODEL:-/models/Qwen3-30B-A3B}")
-data=$(realpath -- "${GSM8K_DATA:-/data/gsm8k}")
+model=$(realpath -- "$GSM8K_MODEL")
+data=$(realpath -- "$GSM8K_DATA")
 node_rank=${NODE_RANK:?Set NODE_RANK to 0, 1, 2 or 3}
 master_addr=${MASTER_ADDR:?Set MASTER_ADDR to the rank-zero data address}
 run_id=${GSM8K_RUN_ID:?Use the same unique GSM8K_RUN_ID on all four nodes}
 [[ $node_rank =~ ^[0-3]$ && $run_id =~ ^[a-zA-Z0-9_-]+$ ]] || exit 2
-results_root=$(realpath -m -- "${GSM8K_RESULTS:-$PWD/results}")
+results_root=$(realpath -m -- "$GSM8K_RESULTS")
 result="$results_root/$run_id/node$node_rank/run"
 for file in "$model/config.json" "$data/train.parquet" "$data/test.parquet"; do
     [[ -r "$file" ]] || { echo "Missing input: $file" >&2; exit 1; }
@@ -62,7 +63,7 @@ echo "Run directory: $result"
 cd "$repo"
 
 export PYTHONPATH="$repo/hyper_parallel/rl:$repo:${PYTHONPATH:-}"
-export PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=false VLLM_WORKER_MULTIPROC_METHOD=spawn
+export PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 TOKENIZERS_PARALLELISM=false VLLM_WORKER_MULTIPROC_METHOD=spawn
 export VLLM_HOST_IP=127.0.0.1 GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-data0.172} VLLM_SERVER_DEV_MODE=1
 export VLLM_ASCEND_ENABLE_NZ=0 VLLM_BATCH_INVARIANT=0
 export HCCL_SOCKET_IFNAME=${HCCL_SOCKET_IFNAME:-data0.172}
@@ -102,6 +103,11 @@ trap finish EXIT
     date --iso-8601=seconds
     git rev-parse HEAD
     printf 'mode=%s steps=%s devices=%s model=%s data=%s\n' "$mode" "$steps" "$ASCEND_RT_VISIBLE_DEVICES" "$model" "$data"
+    for name in GSM8K_SHARE_ROOT GSM8K_IMAGES GSM8K_CACHE_ROOT XDG_CACHE_HOME HF_HOME HF_HUB_CACHE \
+        HF_DATASETS_CACHE PIP_CACHE_DIR TORCH_HOME TORCHINDUCTOR_CACHE_DIR TRITON_CACHE_DIR \
+        VLLM_CACHE_ROOT ASCEND_CACHE_PATH WANDB_CACHE_DIR; do
+        printf '%s=%s\n' "$name" "${!name}"
+    done
     sha256sum "$config" "$model/config.json" "$data/train.parquet" "$data/test.parquet"
     df -h "$result"
     python - "$model/config.json" <<'PY'
