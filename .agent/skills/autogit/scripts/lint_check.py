@@ -927,11 +927,12 @@ def run_test_coverage_check(
 # ============================================================================
 
 def _classify_files(files: List[str]) -> dict:
-    """Group files by type for dispatching to checkers.
+    """Group existing files by type, excluding deletions from the staged diff.
 
     Args:
         files: List of all file paths to classify.
     """
+    files = [path for path in files if os.path.isfile(path)]
     cpp_exts = (".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hxx")
     return {
         "py": [f for f in files if f.endswith(".py")],

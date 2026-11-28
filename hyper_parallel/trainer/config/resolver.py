@@ -447,7 +447,7 @@ def replace_override_path(config: object, parts: list[str], value: object, *, pa
             location, f"value of type {type(config).__name__} has no configurable fields"
         )
 
-    config_fields = {field.name: field for field in fields(config)}
+    config_fields = {field.name: field for field in fields(config) if field.init}
     name = parts[0]
     if name not in config_fields:
         target = getattr(config, "target", None)
@@ -513,7 +513,7 @@ def _resolve_dataclass(node: object, config_type: type, *, path: str) -> object:
     if not isinstance(node, Mapping):
         raise ConfigResolutionError(path, "configuration section must be a YAML mapping")
 
-    config_fields = {field.name: field for field in fields(config_type)}
+    config_fields = {field.name: field for field in fields(config_type) if field.init}
     unknown = sorted(set(node) - set(config_fields))
     if unknown:
         raise ConfigResolutionError(path, f"unknown configuration fields: {unknown}")
@@ -669,6 +669,13 @@ def _resolve_replacement_target(node: object, *, path: str) -> Target[Any]:
         if selected.low_precision_dtype_scheme is not None:
             return selected
         selected_signature = inspect.signature(selected.callable)
+        if get_module_family(requested).default_variant is not None:
+            # The build pipeline supplies these resources after topology selection.
+            # Do not turn their Python defaults into user family arguments.
+            selected_signature = selected_signature.replace(parameters=[
+                parameter for name, parameter in selected_signature.parameters.items()
+                if name not in {"module", "module_fqn", "context", "mesh"}
+            ])
         for parameter in selected_signature.parameters.values():
             if parameter.kind is inspect.Parameter.POSITIONAL_ONLY and parameter.default is inspect.Parameter.empty:
                 raise TypeError(f"replacement parameter {parameter.name!r} must be callable by keyword")
@@ -677,6 +684,11 @@ def _resolve_replacement_target(node: object, *, path: str) -> Target[Any]:
             selected._kwargs, selected_signature,
             _target_hints(selected.callable, path=path), path=path,
         )
+        if get_module_family(requested).default_variant is not None:
+            # Deferred family factories receive these resources from model preparation.
+            # Constructor defaults must not become serialized user request arguments.
+            normalized = {name: value for name, value in normalized.items()
+                          if name not in {"module", "module_fqn", "context", "mesh"}}
         return selected.replace(**normalized)
     except (ValueError, TypeError, ImportError, AttributeError) as exc:
         raise ConfigResolutionError(path, str(exc)) from exc

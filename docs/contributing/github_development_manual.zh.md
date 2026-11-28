@@ -2,13 +2,13 @@
 
 [English](github_development_manual.md) | **简体中文**
 
-版本：1.0 · 更新日期：2026-09-18 · 适用仓库：[mindspore-ai/hyper-parallel](https://github.com/mindspore-ai/hyper-parallel)
+版本：1.1 · 更新日期：2026-11-12 · 适用仓库：[mindspore-ai/hyper-parallel](https://github.com/mindspore-ai/hyper-parallel)
 
 本文面向从 GitCode 迁移到 GitHub 的开发者、评审人、仓库管理员和 CI 维护者，提供实际操作、验收方法及故障处理入口。命令以 Bash / Zsh 为例；Windows 可使用 Git Bash，硬件测试仍须在项目支持的环境执行。
 
 **如何区分规则与建议：**
 
-- **现行配置**：2026-09-18 核实的仓库设置，配置变更后应同步更新本文。
+- **当前 CI 指引**：CI 工作流与重测指引于 2026-11-12 更新。当前合入要求以[贡献指南](../../CONTRIBUTING.zh.md#ci评审与合入)、[详细合入策略](github_auto_merge.zh.md)和目标分支实时规则为准。其他标注 2026-09-18 的配置审计属于历史快照，不代表重新核实了今天的权限与设置。
 - **操作规范**：按现行规则完成开发和协作的方法。
 - **建议落地**：尚未完成的平台改造，不能视作已经启用的能力。
 - **历史案例**：某次 PR 或规则执行的快照，不代表该 PR 今天仍处于同一状态。
@@ -75,7 +75,7 @@ GitHub 提交按本文操作；框架、硬件、代码风格和测试实现以�
 | CI | 当前 SHA 对应的必需检查有终态和可访问日志 | CI 维护者 |
 | 合入 | PR 标记 Merged，目标分支包含预期结果 | 合并人 |
 
-**迁移现状：**截至本版本，必需检查列表仍为空、默认模板和部分 CODEOWNERS 条目仍待修复。PR 页面没有红色 Checks 不代表测试通过；过渡期合并人仍需人工核对完整证据，并推动第 3、5 章的改造。
+**合入要求：**Jenkins 回报测试结果，GitHub Actions 检查 CI 标签有效期和评审批准。按[合入清单与排障步骤](../../CONTRIBUTING.zh.md#ci评审与合入)处理，缺少结果不代表通过。迁移期关于模板与 CODEOWNERS 的发现需要重新核实后再采取行动。
 
 ## 1. GitHub 与 GitCode 的差异及迁移约定
 
@@ -101,7 +101,7 @@ GitHub 提交按本文操作；框架、硬件、代码风格和测试实现以�
 
 ### 1.3 GitHub、GitCode、Jenkins、同步机器人的职责
 
-**已观察到的迁移链路：**GitHub PR 与 GitCode 合并请求有 Paired 对应关系，外部 Jenkins 执行测试，机器人将结果回写 GitHub。当前没有注册的 GitHub Actions 工作流；这不妨碍继续使用 Jenkins。
+**当前职责分工：**GitHub PR 可以有配对的 GitCode 合并请求。外部 Jenkins 执行测试，机器人向 GitHub 回报结果；GitHub Actions 执行 CI 标签有效期与评审批准门禁，不替代 Jenkins 硬件流水线。参见[工作流源码](../../.github/workflows)和[合入策略](github_auto_merge.zh.md)。
 
 ~~~mermaid
 flowchart LR
@@ -161,16 +161,10 @@ GitHub 的 `#123` 指向当前 GitHub 仓库中的编号，不能直接当成 Gi
 ~~~bash
 git --version
 gh --version
-conda env list
+python --version
 ~~~
 
-已有 py312 环境时直接使用。尚未创建时，根据团队环境规范创建 Python 3.12 环境：
-
-~~~bash
-conda create -n py312 python=3.12
-~~~
-
-后续 Python 命令使用 `conda run -n py312`，避免误用系统 Python。硬件驱动、CANN、CUDA 和框架组合按目标分支的[安装指南](../installation.zh.md)安装。
+使用项目支持的 Python 版本，并在执行下列命令前激活所选开发环境。硬件驱动、CANN、CUDA 和框架组合见目标分支的[安装指南](../installation.zh.md)。
 
 ### 2.2 SSH / HTTPS 认证与多账号配置
 
@@ -264,12 +258,12 @@ git remote -v
 
 ### 2.7 项目环境、可编辑安装和本地测试
 
-按[项目安装说明](../installation.zh.md)为 py312 安装匹配的框架及硬件依赖，然后在本工作树根目录执行：
+按[项目安装说明](../installation.zh.md)在开发环境中安装匹配的框架及硬件依赖，然后在本工作树根目录执行：
 
 ~~~bash
-conda run -n py312 python -m pip install -e .
-conda run -n py312 python -m pip show hyper_parallel
-conda run -n py312 python -c "import hyper_parallel; print(hyper_parallel.__file__)"
+python -m pip install -e .
+python -m pip show hyper_parallel
+python -c "import hyper_parallel; print(hyper_parallel.__file__)"
 ~~~
 
 导入路径必须指向当前工作树。切换 worktree 或发现旧路径后，重新进行可编辑安装；只设置 PYTHONPATH 不能替代这项验收。
@@ -277,7 +271,7 @@ conda run -n py312 python -c "import hyper_parallel; print(hyper_parallel.__file
 单元测试示例：
 
 ~~~bash
-conda run -n py312 python -m pytest -vs tests/ut
+python -m pytest -vs tests/ut
 ~~~
 
 先运行受影响模块，再按提交门禁执行所需测试集合。没有 NPU/GPU 时，应如实记录已完成的逻辑测试和待 CI 验证内容。对于通过 torchrun_case 等启动子进程的 ST，按用例入口运行 pytest，由项目启动器管理进程；不要给整套启动器再套一层 torchrun。遵循[测试规则](../../.agent/rules/testing.md)，不把 GitHub 手册写成另一套测试实现规范。
@@ -374,13 +368,13 @@ gh api 'repos/mindspore-ai/hyper-parallel/codeowners/errors?ref=r1.0.0'
 
 ### 3.5 Rulesets：审批、签名、讨论与必需检查
 
-现行 master / 发布分支规则包括：至少一个批准、Code Owner 审批、最近一次可评审推送由其他人批准、解决讨论、失效审批处理、提交签名、防删除和防强推；受保护分支只允许 Merge。
+2026-09-18 的审计记录包括：至少一个批准、Code Owner 审批、最近推送由其他人独立批准、解决讨论、失效审批处理、提交签名、防删除和防强推。应用这些设置前，应核对目标分支的当前规则。
 
-**当前缺口：**两个规则都存在“Require status checks”配置，但检查名称列表为空。因此该项尚未强制任何实际 CI 测试。
+**当前 CI 策略：**`label-check` 检查 CI 标签年龄，`all-reviewers-approved` 结合有效 CI 检查评审票数。实现与必需 Ruleset 绑定见[合入策略](github_auto_merge.zh.md)。9 月审计中必需检查列表为空的记录属于历史状态。
 
 管理员在 Settings → Rules → Rulesets 中检查目标分支范围、执行状态、具体检查名称和旁路用户。规则集可能叠加；旧 branch protection API 返回 404 不代表没有 Rulesets。参考[创建规则集](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/creating-rulesets-for-a-repository)。
 
-**建议落地：**按第 5 章先建立真实检查，再选入必需检查列表，并绑定预期来源。不要填入没有任何服务会回传的检查名，否则所有 PR 都可能一直等待。
+新增检查时，先验证它能向正确的提交回传结果，再设为必需项并绑定预期来源。不要填入没有服务会回传的检查名，否则所有 PR 都可能一直等待。
 
 ### 3.6 PR / Issue 模板与校验器
 
@@ -493,7 +487,7 @@ git commit -S -m "fix: describe the actual change"
 git diff --check
 git diff upstream/master...HEAD
 git log --oneline upstream/master..HEAD
-conda run -n py312 python -m pytest -vs tests/ut
+python -m pytest -vs tests/ut
 ~~~
 
 完整 UT 可能需要当前平台的依赖；无法在本机执行时，写清缺失条件和交由哪个 CI 环境验证。不能把“命令未运行”记录为“测试通过”。
@@ -599,13 +593,13 @@ gh pr view PR_NUMBER --repo mindspore-ai/hyper-parallel \
   --json headRefOid,statusCheckRollup,url
 ~~~
 
-没有 Checks 结果不等于检查通过。若服务依赖评论触发重测，只使用 CI 维护者公布的、已在 GitHub 路径验证过的指令；GitCode 的 `/retest` 等旧指令不能直接假定在 GitHub 同样有效。
+没有 Checks 结果不等于检查通过。Jenkins 重测在 GitHub PR Conversation 中单独评论 `/retest`，并核对机器人新构建链接与被测 SHA。操作及命令被拒绝、未启动构建时的处理见[重测与排障步骤](../../CONTRIBUTING.zh.md#门禁失败后的处理)。重新运行 Actions 门禁不会重跑 Jenkins，也不会为 CI 续期。
 
 重测应说明原因：代码已修复、基础设施恢复或明确的偶发失败。避免反复点击重跑而不阅读失败日志。
 
 ### 4.11 合入前检查、合入与清理
 
-合入者按附录 D 检查当前 PR，特别核对当前 head、有效审批、签名、未解决讨论、冲突和真实 CI 结果。当前 required checks 为空，因此还需要人工核验已约定的外部测试证据。
+合入者按[当前合入要求](../../CONTRIBUTING.zh.md#ci评审与合入)和附录 D 核对 head、有效审批、适用的签名要求、讨论、冲突及 CI 证据。必需检查必须针对当前提交通过，旧构建成功不能证明当前版本已具备合入条件。
 
 普通合入使用页面上的 Create a merge commit。CLI 可绑定已经检查的 head，防止确认后又有新提交：
 
@@ -657,9 +651,9 @@ git cherry-pick -x -S ORIGINAL_COMMIT_SHA
 
 ### 5.1 当前链路与目标链路
 
-**已核实的现状：**仓库尚无 GitHub Actions 工作流；部分检查经 GitCode/Jenkins 执行，机器人回写 GitHub 评论和标签，原生状态以 CLA 为主。部分 PR 没有原生检查记录，目标分支 required checks 列表为空。
+**当前实现：**Jenkins 执行项目流水线，由机器人回报结果。GitHub Actions 已包含 [Label Gate Check](../../.github/workflows/label-check.yml)、[Reviewer approval gate](../../.github/workflows/reviewer-approval-gate.yml)、[CI 标签过期清理](../../.github/workflows/expire-ci-pass-labels.yml)等工作流。交互方式、必需检查绑定和异步执行边界见[合入策略](github_auto_merge.zh.md)。
 
-这意味着“外部 CI 在运行”和“GitHub 在合并前强制要求 CI 成功”还没有完整衔接。建议建立以下闭环：
+下图表示外部 CI 的完整回报目标，并非已启用检查清单；实际流水线阶段以 Jenkins 报告为准，必需状态以实时分支规则为准：
 
 ~~~mermaid
 flowchart LR
@@ -928,7 +922,7 @@ git push --force-with-lease=refs/heads/YOUR_BRANCH:EXPECTED_REMOTE_SHA \
 - **责任人：**CI 维护者为主；作者补充 PR、SHA 和等待时间。
 - **成功标志：**能找到对应版本的任务，执行后获得明确终态，必需检查名称与规则匹配。
 
-当前没有 Actions 工作流，因此仅查看 Actions 页面为空不足以判断 Jenkins 没有执行。
+通过机器人的构建链接检查 Jenkins，通过对应门禁运行链接检查 Actions。缺少 Actions 结果不代表 Jenkins 没执行，重新运行 Actions 也不是 Jenkins 重测。
 
 ### 6.8 评论显示测试成功，但 Checks 为空
 
@@ -984,7 +978,7 @@ git push --force-with-lease=refs/heads/YOUR_BRANCH:EXPECTED_REMOTE_SHA \
 - [ ] 本仓 name、email 正确，邮箱已关联 GitHub。
 - [ ] 签名密钥登记为 Signing key，新提交能显示 Verified。
 - [ ] CLA 已按当前要求签署，账号和邮箱映射正确。
-- [ ] Python 使用 py312，editable install 指向当前工作目录。
+- [ ] 已激活开发环境，editable install 指向当前工作目录。
 - [ ] 能执行相关本地检查，理解需要交由硬件 CI 验证的范围。
 - [ ] 已阅读目标分支开发规则，知道模块 Owner 和支持入口。
 - [ ] 首次 PR 没有模板占位符，附有真实验证结果。
@@ -1049,7 +1043,7 @@ git push --force-with-lease=refs/heads/YOUR_BRANCH:EXPECTED_REMOTE_SHA \
 
 ### F. 分支、权限、评审与 CI 配置矩阵
 
-**2026-09-18 核实的分支规则：**
+**2026-09-18 分支规则历史快照：**保留本表作为迁移记录，包括当时为空的检查列表和绕过名单。请勿将其当作当前权限或合入策略；当前要求见[实时规则](https://github.com/mindspore-ai/hyper-parallel/rules)和[合入策略](github_auto_merge.zh.md)。
 
 | 项目 | master / 默认分支规则 | 发布分支规则 |
 |---|---|---|
@@ -1226,6 +1220,7 @@ Fixes #<真实 GitHub Issue 编号>
 
 | 版本 | 日期 | 变化 |
 |---|---|---|
+| 1.1 | 2026-11-12 | 更新 CI 工作流、合入门禁和已验证的 GitHub 重测指引，明确 9 月配置矩阵属于历史记录；未重新审计其他权限与设置。 |
 | 1.0 | 2026-09-18 | 基于迁移期 PR 与仓库配置审计，建立本地配置、权限与规则、PR 协作、CI/CD、排障和检查清单；区分现状与待实施建议 |
 
 后续修改必须同时检查正文、矩阵、示例和 FAQ 是否一致。修改团队权限、CODEOWNERS、规则集、必需检查、模板字段、CLA 或同步方式时，登记对应配置变更和验收 PR，更新“现行配置”的核实日期。

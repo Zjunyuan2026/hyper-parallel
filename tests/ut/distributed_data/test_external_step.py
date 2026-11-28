@@ -23,14 +23,15 @@ from unittest.mock import Mock, PropertyMock, patch
 
 import torch
 
-from hyper_parallel.distributed_data import (
+from hyper_parallel.data.distributed import (
     CausalAttentionCostModel,
     DistributedDatasetConfig,
     SampleMetadata,
     WorkloadCost,
     build_distributed_dataloader,
 )
-from hyper_parallel.distributed_data.transport import DataPlaneTransport
+from hyper_parallel.data.distributed.transport import DataPlaneTransport
+from tests.common.mark_utils import arg_mark
 
 
 class _Mesh:
@@ -93,6 +94,26 @@ def _pack(samples: list[dict], seq_len: int) -> dict:
 class TestExternalStepSource(unittest.TestCase):
     """Verify source iteration, metadata, and externally owned recovery."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_synchronous_steps_read_on_delivery(self) -> None:
+        """Feature: In-process external step preparation.
+        Description: Request prefetch, drain, deliver steps and restart the source.
+        Expectation: Only delivery advances the source, on the caller.
+        """
+        source = _Source()
+        with patch("hyper_parallel.data.distributed.packed_balancing.create_data_worker") as spawn, closing(
+                _build(source, use_data_process=False),
+        ) as loader:
+            loader.prefetch_plan()
+            loader.wait_for_prefetch()
+            self.assertEqual(source.position, 0)
+            first = next(loader)
+            self.assertEqual(source.position, 1)
+            self.assertEqual(len(list(loader)), 1)
+            loader.set_epoch(1)
+            self.assertEqual(first, next(loader))
+            spawn.assert_not_called()
+
     def test_device_prefetch_depth_requires_native_sampler(self) -> None:
         """Feature: External-step prefetch configuration.
         Description: Request device lookahead depths supported only by the native sampler path.
@@ -100,11 +121,12 @@ class TestExternalStepSource(unittest.TestCase):
         """
         for depth in (0, 2):
             with self.subTest(depth=depth), patch(
-                    "hyper_parallel.distributed_data.packed_balancing._create_locality_groups",
+                    "hyper_parallel.data.distributed.packed_balancing._create_locality_groups",
             ) as groups, self.assertRaisesRegex(ValueError, "device_prefetch_depth requires a native batch_sampler"):
                 _build(_Source(), device_prefetch_depth=depth)
             groups.assert_not_called()
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_non_planner_rank_consumes_source_without_plan_broadcast(self) -> None:
         """Feature: Independent planning for external steps.
         Description: Disable plan broadcast on a non-Planner rank with either collective schedule.
@@ -119,7 +141,7 @@ class TestExternalStepSource(unittest.TestCase):
                     DataPlaneTransport, "planner_rank", new_callable=PropertyMock, return_value=1,
             ), patch.object(
                     loader._transport, "broadcast_from_planner", side_effect=AssertionError("plan broadcast used"),
-            ), patch.object(loader._planner, "plan", wraps=loader._planner.plan) as plan:
+            ), patch.object(loader._source._planner, "plan", wraps=loader._source._planner.plan) as plan:
                 self.assertEqual(list(loader), [[({"id": 0, "tokens": 4},)], [({"id": 1, "tokens": 5},)]])
                 self.assertEqual(plan.call_count, 2)
 
@@ -131,7 +153,7 @@ class TestExternalStepSource(unittest.TestCase):
         source = _Source()
         loader = _build(source)
         try:
-            with self.assertNoLogs("hyper_parallel.distributed_data.balance_logging", level="INFO"):
+            with self.assertNoLogs("hyper_parallel.data.distributed.balance_logging", level="INFO"):
                 expected = list(loader)
             self.assertEqual(expected, [[({"id": 0, "tokens": 4},)], [({"id": 1, "tokens": 5},)]])
             loader.set_epoch(1)
@@ -139,28 +161,53 @@ class TestExternalStepSource(unittest.TestCase):
         finally:
             loader.close()
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_source_does_not_require_checkpoint_hooks(self) -> None:
-        """Feature: External source lifecycle validation.
-        Description: Consume plain iterable steps, then wrap a caller-restored source.
-        Expectation: HP consumes the supplied position without requiring checkpoint or epoch hooks.
+        """Feature: External step boundaries and caller-owned recovery.
+        Description: Consume single-bin steps with both window settings and resume from the second source yield.
+        Expectation: Both configurations produce the same steps and exact suffix.
         """
-        source = [[[{"id": 0, "tokens": 4}]], [[{"id": 1, "tokens": 5}]]]
-        loader = _build(source)
-        try:
-            self.assertEqual(list(loader), [[({"id": 0, "tokens": 4},)], [({"id": 1, "tokens": 5},)]])
-        finally:
-            loader.close()
-        # The caller reconstructs its source at the next step before wrapping it.
-        resumed = _build(source[1:])
-        try:
-            self.assertEqual(list(resumed), [[({"id": 1, "tokens": 5},)]])
-        finally:
-            resumed.close()
+        source = _Source().steps
+        expected = [[({"id": 0, "tokens": 4},)], [({"id": 1, "tokens": 5},)]]
+        for width in (1, 3):
+            with self.subTest(width=width):
+                with closing(_build(source, balance_window_size=width)) as loader:
+                    self.assertEqual(next(loader), expected[0])
+                    if width > 1:
+                        windows = loader.last_balance_stats["windows"]
+                        self.assertEqual([(w["first_micro_batch"], w["last_micro_batch"]) for w in windows], [(1, 1)])
+                    self.assertEqual(list(loader), expected[1:])
+                with closing(_build(source[1:], balance_window_size=width)) as resumed:
+                    self.assertEqual(list(resumed), expected[1:])
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
+    def test_windows_clip_at_step_end_and_collate_once(self) -> None:
+        """Feature: External window planning and step delivery.
+        Description: Plan five equal-cost bins with a partial tail or an oversized window.
+        Expectation: Each occurrence is costed once and rejected windows retain the exact source layout.
+        """
+        source = [[[index] for index in range(5)]]
+        for width, ranges in ((2, [(1, 2), (3, 4), (5, 5)]), (7, [(1, 5)])):
+            cost = Mock(spec=[], return_value=WorkloadCost(llm=1))
+            collate = Mock(side_effect=list)
+            with self.subTest(width=width), closing(build_distributed_dataloader(
+                    None, _Mesh(), DistributedDatasetConfig(seq_len=1, local_batch_size=5, balance_window_size=width),
+                    external_step_source=source, metadata_fn=lambda _: SampleMetadata(1), pack_fn=lambda items, _: items,
+                    collate_fn=collate, cost_model=cost, device="cpu",
+            )) as loader:
+                self.assertEqual(next(loader), source[0])
+                windows = loader.last_balance_stats["windows"]
+                self.assertEqual([(w["first_micro_batch"], w["last_micro_batch"]) for w in windows], ranges)
+                self.assertFalse(any(w["accepted"] for w in windows))
+                self.assertIsNone(next(loader, None))
+                collate.assert_called_once_with(source[0])
+                self.assertEqual(cost.call_count, 5)
 
 
 class TestExternalStepCallbacks(unittest.TestCase):
     """Verify raw-step callbacks, buffering and source lifecycle without process groups."""
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_device_handoff_preserves_complete_batch_and_host_view(self) -> None:
         """Feature: Complete external-step device handoff.
         Description: Collate two steps as lists or tuples and stage separate pinned copies.
@@ -174,7 +221,7 @@ class TestExternalStepCallbacks(unittest.TestCase):
                 accelerator.Event.return_value.query.return_value = False
                 host_batches = []
 
-                def collate(bins: list[Any], container=container, record_batch=host_batches.append) -> Any:
+                def collate(bins: list[Any], container: Any=container, record_batch: Any=host_batches.append) -> Any:
                     """Retain original collated views to distinguish them from pinned staging."""
                     batch = container(bins)
                     record_batch(batch)
@@ -192,9 +239,9 @@ class TestExternalStepCallbacks(unittest.TestCase):
                     )
 
                 with patch.object(torch, "cuda", accelerator), patch(
-                        "hyper_parallel.distributed_data.device_prefetch._pin_memory", side_effect=pin,
+                        "hyper_parallel.data.distributed.device_prefetch._pin_memory", side_effect=pin,
                 ), patch(
-                        "hyper_parallel.distributed_data.device_prefetch._move_to_device", side_effect=move,
+                        "hyper_parallel.data.distributed.device_prefetch._move_to_device", side_effect=move,
                 ), closing(build_distributed_dataloader(
                         None, _Mesh(), DistributedDatasetConfig(
                             seq_len=8, local_batch_size=2, communication_backend="gloo",
@@ -263,7 +310,7 @@ class TestExternalStepCallbacks(unittest.TestCase):
                 pack_fn=_pack, collate_fn=list,
                 cost_model=lambda metadata: WorkloadCost(llm=metadata.cost.llm * 10),
         )) as loader:
-            with self.assertLogs("hyper_parallel.distributed_data.balance_logging", level="INFO") as logs:
+            with self.assertLogs("hyper_parallel.data.distributed.balance_logging", level="INFO") as logs:
                 batch = next(loader)
             self.assertEqual(batch[0]["input_ids"].tolist(), [0, 1, 1, 2])
             stats = dict(loader.last_balance_stats)
@@ -289,7 +336,7 @@ class TestExternalStepCallbacks(unittest.TestCase):
                 metadata_fn=lambda sample: sample["metadata"], pack_fn=_pack, collate_fn=list,
                 cost_model=CausalAttentionCostModel(),
         )) as loader:
-            with self.assertLogs("hyper_parallel.distributed_data.balance_logging", level="INFO") as logs:
+            with self.assertLogs("hyper_parallel.data.distributed.balance_logging", level="INFO") as logs:
                 next(loader)
             stats = loader.last_balance_stats
             for layout in ("before", "after"):

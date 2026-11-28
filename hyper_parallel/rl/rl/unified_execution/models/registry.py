@@ -36,16 +36,15 @@ class ModelFamily:
     vllm_architecture: str
     execution_targets: dict[str, str]
     builder_target: str
-    attention_factory: str
+    gqa_factory: str
     row_projections: tuple[str, ...]
-    router_adapter: str | None = None
     attention_attribute: str = "self_attn"
     attention_output: str = "o_proj"
 
     @property
     def moe(self) -> bool:
         """A routed-expert model must declare its authoritative HP router."""
-        return self.router_adapter is not None
+        return "moe_block" in self.execution_targets
 
     def execution_types(self) -> dict[str, type]:
         """Load authoritative forward owners only in a model execution process."""
@@ -58,15 +57,6 @@ _FAMILIES = {options["model_type"]: ModelFamily(**options) for options in QWEN3_
 def model_families() -> tuple[ModelFamily, ...]:
     """Expose the same supported identities to plan checks and worker registration."""
     return tuple(_FAMILIES.values())
-
-
-def component_family(module: object, role: str) -> ModelFamily:
-    """Identify an existing HP/HF component without requiring an attached config."""
-    for family in model_families():
-        target = family.execution_targets.get(role)
-        if target is not None and isinstance(module, resolve_runtime_symbol(target)):
-            return family
-    raise ValueError(f"Unsupported unified execution component: {type(module).__name__} ({role})")
 
 
 def get_model_family(model_type: str) -> ModelFamily:

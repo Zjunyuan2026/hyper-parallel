@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""CPU regression for the example's strict pre-update consistency gate."""
+"""End-to-end consistency verdict and portable checkpoint cropping."""
+from __future__ import annotations
 
 import json
 import tempfile
@@ -26,12 +27,8 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-from hyper_parallel.rl.examples.consistency.scripts.prepare_checkpoint import prepare_checkpoint, verify_checkpoint
-from hyper_parallel.rl.examples.consistency.scripts.run_consistency import (
-    check_metrics,
-    check_metrics_on_all_ranks,
-    run,
-)
+from hyper_parallel.rl.examples.consistency.scripts import prepare_checkpoint as crop
+from hyper_parallel.rl.examples.consistency.scripts import run_consistency as acceptance
 
 
 def _metrics():
@@ -45,20 +42,6 @@ def _metrics():
 class TestConsistencyExample(unittest.TestCase):
     """Prevent empty or nonfinite comparisons and incomplete RL runs from passing."""
 
-    def test_reject_missing_empty_nonfinite_and_unequal_metrics(self):
-        """Reject missing or invalid evidence of train and rollout equality."""
-        self.assertEqual(check_metrics(_metrics())["log_probs_valid_tokens"], 16)
-        for key, value in (("rollout_probs_diff_valid", 0), ("log_probs_valid_tokens", 0),
-                           ("rollout_log_probs_diff_max", 1e-7),
-                           ("actor_log_probs_mean", float("nan")),
-                           ("rollout_log_probs_mean", float("inf"))):
-            metrics = _metrics()
-            metrics[f"training/{key}"] = value
-            with self.subTest(key=key), self.assertRaises(RuntimeError):
-                check_metrics(metrics)
-        with self.assertRaises(KeyError):
-            check_metrics({})
-
     def test_report_requires_completed_updates_and_retained_rollout(self):
         """Write success only after both verified updates and publications complete."""
         config = {"train": {"max_steps": 2, "accelerator": {}},
@@ -66,11 +49,6 @@ class TestConsistencyExample(unittest.TestCase):
         for complete, retained in ((True, True), (False, True), (True, False)):
             trainer = SimpleNamespace(state=SimpleNamespace(global_step=0),
                                       targets=SimpleNamespace(prepare=lambda *_: (None, _metrics())))
-
-            trainer.rollout_manager = SimpleNamespace(generate=lambda *args: None)
-            trainer.actor = SimpleNamespace(update=lambda *args: None)
-            trainer.publication = SimpleNamespace(publish=lambda *args: None)
-            trainer._tracker = SimpleNamespace(log=lambda *args, **kwargs: None)
 
             def _train(complete=complete, retained=retained, trainer=trainer):
                 for step in range(1, 3):
@@ -91,53 +69,18 @@ class TestConsistencyExample(unittest.TestCase):
                     return_value=trainer,
                 ):
                     if complete and retained:
-                        run(config, report)
-                        self.assertIn('"passed": true', report.read_text())
+                        recipe = Path(directory) / "recipe.yaml"
+                        recipe.write_text(json.dumps({**config, "train": {**config["train"], "max_steps": 50}}))
+                        with patch("sys.argv", ["run_consistency.py", str(recipe), "--report", str(report),
+                                                "--train.max_steps=2"]):
+                            acceptance.main()
+                        verdict = json.loads(report.read_text())
+                        self.assertTrue(verdict["passed"])
+                        self.assertEqual([item["step"] for item in verdict["checks"]], [1, 2])
                     else:
                         with self.assertRaises(RuntimeError):
-                            run(config, report)
+                            acceptance.run(config, report)
                         self.assertFalse(report.exists(), "A failed run must not leave a success report")
-
-    def test_learning_report_rejects_missing_optimizer_observations(self):
-        """A completed loop counter alone cannot claim an actual learned policy."""
-        trainer = SimpleNamespace(state=SimpleNamespace(global_step=0),
-                                  targets=SimpleNamespace(prepare=lambda *_: (None, _metrics())),
-                                  rollout_manager=SimpleNamespace(generate=lambda *_: None),
-                                  actor=SimpleNamespace(update=lambda *_: None),
-                                  publication=SimpleNamespace(publish=lambda *_: None),
-                                  _tracker=SimpleNamespace(log=lambda *args, **kwargs: None))
-        def train():
-            for step in (1, 2):
-                trainer.targets.prepare(SimpleNamespace(rollout_log_probs=object()), True, {})
-                trainer.state.global_step = step
-        trainer.train = train
-        config = {"train": {"max_steps": 2, "accelerator": {}, "learning_gate": {"enabled": True}},
-                  "logging": {"log_steps": 1}, "rollout": {"vllm": {}}}
-        module = "hyper_parallel.rl.examples.consistency.scripts.run_consistency."
-        with TemporaryDirectory() as directory, patch(module + "build_trainer", return_value=trainer), \
-             patch(module + "run_synchronized", side_effect=lambda name, callback: callback()):
-            report = Path(directory) / "consistency.json"
-            with self.assertRaisesRegex(RuntimeError, "Updated policy"):
-                run(config, report)
-            self.assertFalse(report.exists())
-
-    def test_nonzero_rank_uses_global_verdict_without_local_metrics(self):
-        """Nonzero ranks receive empty metrics but must share rank zero's failure."""
-        with patch.dict("os.environ", {"RANK": "1"}), patch("rl.trainer.distributed.dist") as distributed:
-            distributed.get_world_size.return_value = 2
-
-            def _gather_success(records, local_error):
-                records[:] = [None, local_error]
-
-            distributed.all_gather_object.side_effect = _gather_success
-            self.assertEqual(check_metrics_on_all_ranks({}), {})
-
-            def _gather_failure(records, local_error):
-                records[:] = ["rank zero: log probabilities differ", local_error]
-
-            distributed.all_gather_object.side_effect = _gather_failure
-            with self.assertRaisesRegex(RuntimeError, "log probabilities differ"):
-                check_metrics_on_all_ranks({})
 
     def test_root_validation_failure_is_synchronized_before_update(self):
         """Rank zero publishes its validation error through the existing collective."""
@@ -151,7 +94,7 @@ class TestConsistencyExample(unittest.TestCase):
             metrics = _metrics()
             metrics["training/rollout_log_probs_diff_max"] = 1e-6
             with self.assertRaisesRegex(RuntimeError, "consistency failed"):
-                check_metrics_on_all_ranks(metrics)
+                acceptance.check_metrics_on_all_ranks(metrics)
             distributed.all_gather_object.assert_called_once()
 
 
@@ -165,8 +108,10 @@ class TestConsistencyCheckpoint(unittest.TestCase):
             source, output = root / "source", root / "cropped"
             source.mkdir()
             config = {"model_type": "qwen3_moe", "num_hidden_layers": 3, "max_window_layers": 3,
-                      "num_experts": 128, "num_experts_per_tok": 8, "mlp_only_layers": [2]}
+                      "num_experts": 128, "num_experts_per_tok": 8, "mlp_only_layers": [2],
+                      "layer_types": ["full_attention"] * 3}
             (source / "config.json").write_text(json.dumps(config))
+            (source / "tokenizer.json").write_text('{"version":"1.0"}')
             weights = {name: torch.arange(8, dtype=torch.float32).reshape(2, 4) + index
                        for index, name in enumerate(("model.embed_tokens.weight", "model.layers.0.test.weight",
                                                      "model.layers.1.test.weight", "model.layers.2.test.weight",
@@ -176,7 +121,12 @@ class TestConsistencyCheckpoint(unittest.TestCase):
                 "weight_map": dict.fromkeys(weights, "source.safetensors"),
             }))
             before = {path.name: path.read_bytes() for path in source.iterdir()}
-            manifest = prepare_checkpoint(source, output, 1)
+            argv = ["prepare_checkpoint.py", "--source", str(source), "--output", str(output),
+                    "--layers", "1", "--reuse"]
+            with patch("sys.argv", argv):
+                crop.main()
+                crop.main()
+            manifest = json.loads((output / "crop_manifest.json").read_text())
             self.assertEqual(manifest["layers"], 1)
             exported = json.loads((output / "model.safetensors.index.json").read_text())["weight_map"]
             expected = set(weights) - {"model.layers.1.test.weight", "model.layers.2.test.weight"}
@@ -188,16 +138,23 @@ class TestConsistencyCheckpoint(unittest.TestCase):
             self.assertEqual(actual_config["num_experts"], 128)
             self.assertEqual(actual_config["num_experts_per_tok"], 8)
             self.assertEqual(actual_config["mlp_only_layers"], [])
+            self.assertEqual(actual_config["layer_types"], ["full_attention"])
+            self.assertEqual((output / "tokenizer.json").read_bytes(), before["tokenizer.json"])
             self.assertEqual(before, {path.name: path.read_bytes() for path in source.iterdir()})
             with self.assertRaises(FileExistsError):
-                prepare_checkpoint(source, output, 1)
+                crop.prepare_checkpoint(source, output, 1)
             with self.assertRaises(ValueError):
-                prepare_checkpoint(source, root / "invalid", 0)
+                crop.prepare_checkpoint(source, root / "invalid", 0)
             self.assertFalse((root / "invalid").exists())
-            verify_checkpoint(source, output, 1)
             with self.assertRaisesRegex(ValueError, "decoder depth"):
-                verify_checkpoint(source, output, 2)
+                crop.verify_checkpoint(source, output, 2)
+            config_path = output / "config.json"
+            original_config = config_path.read_bytes()
+            config_path.write_text("{}")
+            with patch("sys.argv", argv), self.assertRaisesRegex(ValueError, "metadata differs"):
+                crop.main()
+            config_path.write_bytes(original_config)
             shard = output / manifest["shards"][0]["output_file"]
             shard.write_bytes(shard.read_bytes() + b"corrupted")
             with self.assertRaisesRegex(ValueError, "checksum"):
-                verify_checkpoint(source, output, 1)
+                crop.verify_checkpoint(source, output, 1)

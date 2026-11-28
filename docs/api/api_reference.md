@@ -566,39 +566,7 @@ All DSA classes inherit `ParallelStyle` and support `apply(module, device_mesh)`
 
 ## EP Expert Parallelism
 
-### `ExpertParallel`
-
-Standard all-to-all EP.
-
-```python
-class ExpertParallel(BaseExpertParallel)
-```
-
-Each rank owns `num_experts / ep_degree` local experts and dispatches/combines tokens through differentiable all-to-all.
-
-**Mesh requirement:** A 1-D mesh, such as `mesh_dim_names=("ep",)`.
-
----
-
-### `TensorParallel` (within EP)
-
-TP-only weight sharding, used when EP degree = 1.
-
-```python
-class TensorParallel(BaseExpertParallel)
-```
-
----
-
-### `ExpertTensorParallel`
-
-Two-dimensional EP+TP.
-
-```python
-class ExpertTensorParallel(BaseExpertParallel)
-```
-
-**Mesh requirement:** A 2-D mesh, such as `mesh_dim_names=("ep", "tp")`.
+Select a routed-expert compute factory in the model recipe. Custom callers can import `EPContext` from `hyper_parallel.distributed.expert_parallel.ep_context` to dispatch already-selected slots on a one-dimensional expert mesh. Compute and weight the slots, then combine with the receipt from that dispatch. See the [EP guide](../guide/expert_parallel.md).
 
 ---
 
@@ -709,9 +677,16 @@ class Muon(torch.optim.Optimizer):
         ns_steps: int = 5,
         nesterov: bool = True,
         weight_decay: float = 0.1,
+        hsdp_replica_count: int | None = None,
         ...
     )
 ```
+
+`hsdp_replica_count` sets the target size of each Muon HSDP replicate subgroup
+when topology detection enables splitting. The default `None` lets Muon infer
+whether to split and choose the subgroup size. See
+[Muon HSDP replica deduplication](../guide/optimizer.md#muon-hsdp-replica-deduplication)
+for when an explicit value takes effect.
 
 ---
 

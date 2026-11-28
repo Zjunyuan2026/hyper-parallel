@@ -30,7 +30,7 @@ and must not be reported as an efficiency result; correctness runs keep it off.
 import logging
 from typing import Any, Callable, Optional
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
 from hyper_parallel.distributed.expert_parallel.recipes import build_ep_compute
 from hyper_parallel.distributed.recipe_spec import local_compute
@@ -73,9 +73,7 @@ def kimi_k26_ep_compute_fn(
             this on: without it the routed branch exposes the whole exchange
             (measured at GBS 256: +2.28 GB peak, +22% step time).
         capacity_factor: Bound each expert at ``factor x (T*K / E)`` slots per
-            sender (``None`` = off).  Read back per layer by
-            ``experts._resolve_capacity_factor``, so ``HP_EP_CAPACITY_FACTOR``
-            still overrides it.
+            sender (``None`` = off).
 
     Returns:
         A callable ``(module, hidden_states) -> Tensor`` running the block.

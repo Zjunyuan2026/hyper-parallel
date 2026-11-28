@@ -45,9 +45,6 @@ Use these rules as the default coding style and convention set for HyperParallel
 ### Import placement
 
 - **Default:** Put runtime `import` / `from … import` at **module top** (after the license header and any module docstring). Do **not** put imports inside functions, methods, or nested class bodies except the narrow exceptions under “Other exceptions” below. Applies to e.g. `core/`, `collectives/`, `tests/`.
-- **Multicore** (`hyper_parallel/core/multicore/**`): use direct module-level Torch imports.
-  The component root may export its business APIs; the HyperParallel root must not export them.
-  Native-library initialization may still be deferred until an operation needs the activated payload.
 - **DFunction** (`hyper_parallel/core/shard/dfunction.py`): import Torch at module scope
   and inherit directly from `torch.autograd.Function`.
 - **Pipeline** (`hyper_parallel/core/pipeline_parallel/**`): import Torch APIs
@@ -93,7 +90,7 @@ rank = config["rank"]
 - Prefer the logging framework over `print`, `sys.stdout.write`, or `sys.stderr.write` in production code.
 - Define instance attributes in `__init__` unless there is a deliberate and well-documented reason not to.
 - Avoid direct access to another class's protected members unless no stable public API exists and the coupling is explicitly justified.
-- The `platform/` abstraction and the MindSpore backend are gone: use native Torch APIs directly.
+- Use native Torch APIs directly; do not introduce a framework-dispatch abstraction.
 - Avoid GPU-CPU synchronization in hot paths. In training loops, avoid patterns such as `.item()`, `.numpy()`, and `print(tensor)`.
 - Prefer `os.path` or `pathlib` helpers over manual string concatenation for filesystem paths.
 - Do not mutate `sys.path` with patterns such as `insert(0, ...)` unless there is no alternative and the reason is documented.

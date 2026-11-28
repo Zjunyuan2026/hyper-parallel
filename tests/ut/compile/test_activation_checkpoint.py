@@ -59,6 +59,10 @@ from hyper_parallel.distributed.activation_checkpoint import (
     _apply_activation_checkpointing,
 )
 from hyper_parallel.models.adapter_spec import RecomputePolicy
+from hyper_parallel.trainer.config.parallelism import (
+    ActivationCheckpointConfig,
+    FullCheckpointConfig,
+)
 
 _DIST_PATH = "hyper_parallel.compile.passes.parallel.fsdp_pass.dist"
 _RESOLVE_PG_PATH = (
@@ -418,9 +422,8 @@ class TestTagging(unittest.TestCase):
         )
         self.assertEqual(
             producer.meta["recompute"],
-            CheckpointPolicy.MUST_RECOMPUTE,
-            "the producer itself may recompute; its duplicate replays the "
-            "pre-mutation value the in-place backward consumes",
+            CheckpointPolicy.MUST_SAVE,
+            "the producer owns mutated storage and backward may need its final value",
         )
 
     def test_alias_chain_readers_are_saved(self):
@@ -460,8 +463,8 @@ class TestTagging(unittest.TestCase):
             )
         self.assertEqual(
             producer.meta["recompute"],
-            CheckpointPolicy.MUST_RECOMPUTE,
-            "the base producer may still replay its pre-mutation value",
+            CheckpointPolicy.MUST_SAVE,
+            "the base producer must retain writes performed through sibling views",
         )
 
     def test_out_of_scope_mutation_saves_scoped_alias_readers(self):
@@ -580,6 +583,38 @@ class TestRemat(unittest.TestCase):
                 self.assertTrue(torch.allclose(loss, ref_loss, atol=1e-10))
                 for grad, ref_grad in zip(grads, ref_grads):
                     self.assertTrue(torch.allclose(grad, ref_grad, atol=1e-10))
+
+    def test_saved_buffer_written_through_view_matches_original(self) -> None:
+        """A saved precomputed gradient must retain writes through its view.
+
+        Description: Write into a gradient buffer through a view before backward.
+        Expectation: Full and selective recompute preserve the original result.
+        Feature: Static-graph activation checkpointing with aliased mutations.
+        """
+        for mode in ("full", "selective"):
+            with self.subTest(ac_mode=mode):
+                graph = torch.fx.Graph()
+                value = graph.placeholder("value")
+                buffer = graph.call_function(torch.ops.aten.zeros_like.default, args=(value,))
+                view = graph.call_function(torch.ops.aten.view.default, args=(buffer, [-1]))
+                source = graph.call_function(torch.ops.aten.view.default, args=(value, [-1]))
+                write = graph.call_function(torch.ops.aten.copy_.default, args=(view, source))
+                backward = graph.call_function(torch.ops.aten.mul.Tensor, args=(buffer, value))
+                backward.meta["autograd_backward"] = True
+                graph.output(backward)
+                for node in (buffer, view, source, write):
+                    node.meta["nn_module_stack"] = {"block": ("layers.0", nn.Module)}
+                    node.meta["val"] = torch.randn(2, 2)
+                module = torch.fx.GraphModule(nn.Module(), graph)
+                inputs = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+                expected = module(inputs)
+                scope = _CheckpointScope(
+                    region_fqns=frozenset({"layers.0"}), unit_fqns=frozenset({"layers.0"})
+                )
+                ActivationCheckpointPass().run(
+                    module, PassConfig(ac_mode=mode), ac_scope=scope
+                )
+                torch.testing.assert_close(module(inputs), expected, rtol=0, atol=0)
 
 
 class TestLayerSelection(unittest.TestCase):
@@ -1125,7 +1160,11 @@ class TestEagerWrappedModel(unittest.TestCase):
         """Graph AC warns when the model was already eagerly checkpointed."""
         torch.manual_seed(7)
         model = _Model()
-        wrapped = _apply_activation_checkpointing(model, "full", enable_compile=False)
+        config = ActivationCheckpointConfig(
+            mode="full",
+            full=FullCheckpointConfig(recompute_layer=[0, 1]),
+        )
+        wrapped = _apply_activation_checkpointing(model, config, enable_compile=False)
         joint = _trace(wrapped, torch.randn(4, 8), torch.randn(4, 8))
 
         with self.assertLogs(

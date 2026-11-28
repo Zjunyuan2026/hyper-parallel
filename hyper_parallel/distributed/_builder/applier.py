@@ -26,6 +26,7 @@ import logging
 
 import numpy as np
 
+from hyper_parallel.components.modules.module_family import get_family_build_info
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh, init_device_mesh
 from hyper_parallel.distributed._builder.forward_rewriter import (
     _bind_input_indices,
@@ -135,6 +136,8 @@ def _validate_cp_compute_injections(plan, cp_mesh):
     if cp_mesh is None or cp_mesh.size() <= 1:
         return
     for fqn, spec in plan.modules.items():
+        if fqn in plan.parallel_modules:
+            continue
         if not spec.is_boundary or not getattr(spec, "_needs_cp_attn", False):
             continue
         if spec.inner_wrapper is not None or spec.local_compute_fn is not None:
@@ -160,6 +163,8 @@ def _validate_ep_compute_injections(plan, model):
         EP_ARCHETYPE_SUGGESTIONS,
     )
     for fqn, spec in plan.modules.items():
+        if fqn in plan.parallel_modules:
+            continue
         if not spec.is_boundary or not getattr(spec, "_ep_size", 0):
             continue
         if spec.local_compute_fn is not None or spec.region_dispatch is False:
@@ -351,6 +356,16 @@ def _boundary_post_order_key(item):
     return -item[0].count(".")
 
 
+def _family_boundary_state(module, module_fqn, spec, plan):
+    """Identify class-owned execution and boundaries already applied or unnecessary."""
+    family = get_family_build_info(module)
+    owned = module_fqn in plan.parallel_modules or (family is not None and family.resolved.sharding is not None)
+    if family is not None and family.layout is not None and family.layout.applied:
+        return owned, True
+    unchanged = spec.in_src == spec.in_dst and (spec.out_dst is None or spec.out_src == spec.out_dst)
+    return owned, owned and unchanged
+
+
 def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
     """Phase C: wrap forward (production/validate/moe/cp/vocab_embed, five paths).
 
@@ -372,6 +387,9 @@ def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
         if not spec.is_boundary:
             continue
         module = _resolve_module(model, module_fqn)
+        owned, skip = _family_boundary_state(module, module_fqn, spec, plan)
+        if skip:
+            continue
         boundary = PrecompiledBoundary(
             spec,
             mesh,
@@ -406,12 +424,15 @@ def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
         # semantics.
         # (_preflight_compute_injection has already failed fast when a CP
         # attention boundary declares nothing)
-        _wrap_inner_attention(
-            module, cp_mesh, spec=spec, mesh=mesh,
-            mesh_dim_names=mesh_dim_names, tp_mesh=tp_mesh,
-            ep_mesh=expert_mesh, validate_mode=validate_mode,
-            module_fqn=module_fqn,
-        )
+        # Class-owned CP already lives in forward. Only its external TP ports
+        # belong to this boundary; injecting a legacy CP wrapper would run CP twice.
+        if not owned:
+            _wrap_inner_attention(
+                module, cp_mesh, spec=spec, mesh=mesh,
+                mesh_dim_names=mesh_dim_names, tp_mesh=tp_mesh,
+                ep_mesh=expert_mesh, validate_mode=validate_mode,
+                module_fqn=module_fqn,
+            )
 
         # Step 2: forward wrapping
         # local region path (D-03'): the gate is derived from the compute_fn
@@ -420,8 +441,8 @@ def _apply_phase_c(model, plan, mesh, validate_mode, expert_mesh=None):
         # local_compute_fn (callable or factory Target) and the
         # region_dispatch=False gate; the built-in EP auto-injection link
         # was REMOVED (05 §4.4.3)
-        compute_fn = _resolve_local_compute_fn(
-            module, spec, mesh, mesh_dim_names, expert_mesh)
+        compute_fn = (module.forward if owned else _resolve_local_compute_fn(
+            module, spec, mesh, mesh_dim_names, expert_mesh))
         if compute_fn is not None:
             if validate_mode:
                 # D-17: inside the local region the module sees local

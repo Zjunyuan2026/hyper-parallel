@@ -21,10 +21,16 @@ from typing import Any
 import pytest
 
 from hyper_parallel.codegen import build, cli
+from tests.common.mark_utils import arg_mark
 
 
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0", card_mark="onecard",
+          essential_mark="essential")
 def test_generate_uses_native_build_and_typed_overrides(monkeypatch):
-    """Generate consumes TrainerConfig but delegates only to build-only orchestration."""
+    """Feature: CLI native-build delegation.
+    Description: Generate with typed overrides and a mocked native build.
+    Expectation: The resolved config and overrides reach generation unchanged.
+    """
     captured = {}
     config = object()
     layout = SimpleNamespace(artifact_dir="generated")
@@ -60,8 +66,13 @@ def test_generate_uses_native_build_and_typed_overrides(monkeypatch):
     }
 
 
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0", card_mark="onecard",
+          essential_mark="essential")
 def test_generate_rejects_torchrun_environment(monkeypatch):
-    """Multiple CLI ranks fail before parsing config or touching devices."""
+    """Feature: Single-process CLI enforcement.
+    Description: Run generation with a multi-rank environment.
+    Expectation: Generation fails before parsing config or touching devices.
+    """
     monkeypatch.setenv("WORLD_SIZE", "8")
     monkeypatch.setattr(
         cli.config_parser,
@@ -75,23 +86,34 @@ def test_generate_rejects_torchrun_environment(monkeypatch):
 
 
 @pytest.mark.parametrize("removed_command", ["train", "check"])
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0", card_mark="onecard",
+          essential_mark="essential")
 def test_cli_rejects_removed_commands(removed_command):
-    """Only standalone artifact generation remains public."""
+    """Feature: CLI command surface.
+    Description: Invoke commands removed from the public CLI.
+    Expectation: Argument parsing rejects every removed command.
+    """
     with pytest.raises(SystemExit) as captured:
         cli.main([removed_command])
 
     assert captured.value.code == 2
 
 
-def test_verbose_cli_logs_traceback(monkeypatch):
-    """Verbose failures retain their traceback for remote generation diagnosis."""
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0", card_mark="onecard",
+          essential_mark="essential")
+def test_verbose_cli_logs_warning_with_traceback(monkeypatch):
+    """Feature: Verbose codegen failure logging.
+    Description: Raise a generation error while verbose logging is enabled.
+    Expectation: The CLI logs a warning with traceback details and returns failure.
+    """
     captured = {}
 
-    def _exception(message, error):
+    def _warning(message, error, *, exc_info):
         captured["message"] = message
         captured["error"] = error
+        captured["exc_info"] = exc_info
 
-    monkeypatch.setattr(cli.logger, "exception", _exception)
+    monkeypatch.setattr(cli.logger, "warning", _warning)
     monkeypatch.setattr(
         cli,
         "cmd_generate",
@@ -114,10 +136,53 @@ def test_verbose_cli_logs_traceback(monkeypatch):
         f"Expected original exception in verbose log, "
         f"got error={captured['error']!r}"
     )
+    assert captured["exc_info"] is True
 
 
-def test_native_build_orchestration_builds_only_model(monkeypatch):
-    """Build-only generation never constructs training-owned components."""
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0", card_mark="onecard",
+          essential_mark="essential")
+def test_cli_logs_failure_as_warning(monkeypatch):
+    """Feature: Codegen failure log level.
+    Description: Raise a generation error with default logging.
+    Expectation: The CLI logs a warning without traceback and returns failure.
+    """
+    captured = {}
+
+    def _warning(message, error, *, exc_info):
+        captured["message"] = message
+        captured["error"] = error
+        captured["exc_info"] = exc_info
+
+    monkeypatch.setattr(cli.logger, "warning", _warning)
+    monkeypatch.setattr(
+        cli,
+        "cmd_generate",
+        lambda _args: (_ for _ in ()).throw(RuntimeError("broken model build")),
+    )
+
+    result = cli.main([
+        "generate",
+        "--config",
+        "train.yaml",
+    ])
+
+    assert result == 1
+    assert captured["message"] == "codegen: %s"
+    assert str(captured["error"]) == "broken model build"
+    assert captured["exc_info"] is False
+
+
+@pytest.mark.parametrize(
+    "activation_checkpoint",
+    [None, SimpleNamespace(mode="off"), SimpleNamespace(mode="hybrid", full=object(), selective=object())],
+)
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0", card_mark="onecard",
+          essential_mark="essential")
+def test_native_build_orchestration_builds_only_model(monkeypatch, activation_checkpoint):
+    """Feature: Build-only codegen orchestration.
+    Description: Run generation with mocked model construction and planner setup.
+    Expectation: Only the model path is built and its artifact is returned.
+    """
     events = []
     layout = object()
 
@@ -129,22 +194,17 @@ def test_native_build_orchestration_builds_only_model(monkeypatch):
             return object()
 
     @contextmanager
-    def _model_overlay(_session, received_artifact_dir):
+    def _model_overlay(_session, received_artifact_dir, *, defer_publish):
         """Provide the artifact normally populated by the overlay."""
         assert received_artifact_dir == "bundle"
+        assert defer_publish is True
         yield SimpleNamespace(artifact_layout=layout)
 
     config = SimpleNamespace(
         training=SimpleNamespace(backend="gloo", seed=7, enable_full_determinism=False),
         model=ModelTarget(),
         peft=None,
-        activation_checkpoint=SimpleNamespace(
-            mode="none",
-            selection=None,
-            swap_inputs=False,
-            allow_cache_entry_mutation=False,
-        ),
-        activation_swap="none",
+        activation_checkpoint=activation_checkpoint,
         compile=None,
         model_init_dtype=None,
     )
@@ -160,16 +220,26 @@ def test_native_build_orchestration_builds_only_model(monkeypatch):
 
     assert result is layout
     assert [event[0] for event in events] == ["normalize", "model"]
+    model_kwargs = events[-1][1]
+    assert model_kwargs["activation_checkpoint"] is activation_checkpoint
+    assert "activation_checkpoint_selection" not in model_kwargs
+    assert "swap_inputs" not in model_kwargs
+    assert "allow_cache_entry_mutation" not in model_kwargs
+    assert "activation_swap" not in model_kwargs
 
 
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0", card_mark="onecard",
+          essential_mark="essential")
 def test_native_build_requires_published_artifact(monkeypatch):
-    """A completed model build cannot be reported as successful without a bundle."""
+    """Feature: Codegen publication contract.
+    Description: Complete model construction without publishing an artifact.
+    Expectation: Generation reports the missing bundle as a failure.
+    """
     config = SimpleNamespace(
         training=SimpleNamespace(backend="gloo", seed=7, enable_full_determinism=False),
         model=SimpleNamespace(build=lambda **_kwargs: object()),
         peft=None,
-        activation_checkpoint=SimpleNamespace(mode="none", selection=None),
-        activation_swap="none",
+        activation_checkpoint=None,
         compile=None,
         model_init_dtype=None,
     )
@@ -180,20 +250,25 @@ def test_native_build_requires_published_artifact(monkeypatch):
         build.generate_from_native_build(config)
 
 
+@arg_mark(plat_marks=["cpu_linux", "cpu_windows"], level_mark="level0", card_mark="onecard",
+          essential_mark="essential")
 def test_native_build_reports_isolated_publication_failure(monkeypatch):
-    """The standalone CLI surfaces the publication reason retained by its session."""
+    """Feature: Codegen publication diagnostics.
+    Description: Finish an isolated build with a retained publication failure.
+    Expectation: Generation surfaces the recorded stage and reason.
+    """
     config = SimpleNamespace(
         training=SimpleNamespace(backend="gloo", seed=7, enable_full_determinism=False),
         model=SimpleNamespace(build=lambda **_kwargs: object()),
         peft=None,
-        activation_checkpoint=SimpleNamespace(mode="none", selection=None),
-        activation_swap="none",
+        activation_checkpoint=None,
         compile=None,
         model_init_dtype=None,
     )
 
     @contextmanager
-    def _failed_overlay(_session, _artifact_dir):
+    def _failed_overlay(_session, _artifact_dir, *, defer_publish):
+        assert defer_publish is True
         yield SimpleNamespace(
             artifact_layout=None,
             snapshot=SimpleNamespace(

@@ -14,14 +14,6 @@ Only native-vLLM and streaming full_gather remain, using IPC/HCCL according to d
 The old consistency machinery, Hyper inference models, and direct_reshard have been removed. New checkpoints explicitly use schema 2 and are incompatible with historical snapshots.
 GRPO/PPO/GSPO, MoE, RM, Teacher, Agent, and both asynchronous modes retain their existing support matrices; directory migration does not expand support.
 
-Experimental synchronous internal Qwen3 MoE runs may set `rollout.vllm.node_local_world_size`.
-The native baseline uses ordinary MoE training without CPU offload and no strict probability gate;
-the unified example retains its shared numerical plan. Native worker models remain vLLM-owned.
-Training meshes and complete-policy tensor publication remain global; each contiguous torchrun node
-group owns its loopback service, HTTP coordinator and IPC device handles. Control failures propagate
-globally before node-local results are admitted. The [consistency example](../hyper_parallel/rl/examples/consistency/README.md#selected-node-full-model-rl-short-run)
-owns the launcher and current acceptance limits; multi-node RL device acceptance is pending.
-
 See the [runtime architecture](../hyper_parallel/rl/docs/architecture.md) for detailed ordering and state contracts,
 [feature navigation](rl-navigation.md) for configuration and validation entry points, and [RL rules](../.agent/rules/hyper-rl.md) for development boundaries.
 Record CPU contract validation, short device flows, and learning outcomes separately.
@@ -31,5 +23,5 @@ Record CPU contract validation, short device flows, and learning outcomes separa
 The optional [unified execution runtime](../hyper_parallel/rl/rl/unified_execution/README.md)
 reuses the HP model builder and complete `train.plan_overrides` for Qwen3 Dense and MoE.
 HP owns TP/SP and expert sharding; vLLM owns scheduling, paged KV cache and graph execution.
-Shared V4 attention, Level 3, ordinary row-parallel PIK and ordered FP32 expert merging define the numerical path.
+Shared V4 attention, Level 3, [row-parallel PIK and ordered FP32 expert merging](../hyper_parallel/components/parallelism_invariant/) define the numerical path.
 Training MoE reuses HP dynamic EP and its autograd. Rollout uses native vLLM-Ascend routing and expert GEMMs. Each expert slot returns to its source for weighted accumulation in router order. The model registers each layer by its stable path for graph replay. Training CP reuses HP sequence sharding and differentiable K/V gather, with RL-owned target alignment and TP×CP request sharing. Inference PCP reuses native Ascend MRV2 scheduling and KV caches, derives HP EP groups from the full DP×PCP×TP domain according to the EP degree, and publishes to all DP×PCP replicas. This retains native scheduler ownership, expert weight layout and publication protocol. PCP1 retains its prior execution path; DCP, PP and expert-internal PIK remain separate work.

@@ -26,13 +26,13 @@ Features:
     - Gradient accumulation
     - Checkpointing
 """
-# pylint: disable=forbidden-backend-import
 
 from __future__ import annotations
 
 import json
 import logging
 import os
+import sys
 from abc import ABC
 from collections import defaultdict
 from collections.abc import Callable
@@ -49,7 +49,6 @@ from transformers import PretrainedConfig, PreTrainedModel, PreTrainedTokenizerB
 from transformers.modeling_outputs import ModelOutput
 
 from hyper_parallel import DTensor, HSDPModule, SkipDTensorDispatch
-from hyper_parallel.compile.compiler import GraphCompiler
 from hyper_parallel.core.tensor_parallel import loss_parallel
 from hyper_parallel.core.utils import clip_grad_norm_
 from hyper_parallel.trainer.config import (
@@ -76,7 +75,8 @@ from hyper_parallel.trainer.runtime.logging import setup_logging
 from hyper_parallel.trainer.runtime.loss_aggregation import count_loss_token
 from hyper_parallel.trainer.runtime.metrics import mean_global_loss
 from hyper_parallel.components.functional.aux_loss import aux_loss_scale_context, bind_aux_loss_scale
-from hyper_parallel.components.modules.moe_utils import MoEMonitorCallback
+from hyper_parallel.trainer.callbacks.moe_monitor_callback import MoEMonitorCallback
+from hyper_parallel.components.ops import ops
 from hyper_parallel.models._transformers.loss_parallel import causal_lm_loss_parallel
 from hyper_parallel.models._transformers.model_builder import _validate_optimize_dtype
 from hyper_parallel.models.external_state import get_model_external_state
@@ -114,13 +114,22 @@ from hyper_parallel.trainer.callbacks import (
     CheckpointerCallback,
     TrainerState,
 )
+from hyper_parallel.trainer.runtime.worker_recovery import (
+    recovery_constructor,
+    recovery_epoch_initialized,
+    recovery_optimizer_update,
+    recovery_train_loop,
+    recovery_train_initialized,
+    recovery_train_step,
+)
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from hyper_parallel.compile.compiler import GraphCompiler
     from hyper_parallel.data.text.chat_template import ChatTemplate
-    from hyper_parallel.distributed_data import BalancingAlgorithm, CostModel
-    from hyper_parallel.distributed_data.schema import SampleMetadata
+    from hyper_parallel.data.distributed import BalancingAlgorithm, CostModel
+    from hyper_parallel.data.distributed.schema import SampleMetadata
 
 
 def _to_swap_optimizer_config(config: OptimizerSwapConfig) -> SwapOptimizerConfig:
@@ -267,6 +276,7 @@ class BaseTrainer(Stateful, ABC):
     # Default seed when training.seed is omitted.
     default_seed: int = 42
 
+    @recovery_constructor
     def __init__(self, config: TrainerConfig) -> None:
         """
         Initialize the trainer.
@@ -381,15 +391,11 @@ class BaseTrainer(Stateful, ABC):
     def _build_model(self) -> None:
         """Build the model and derive Trainer-owned runtime state."""
         self.peft_config = self.config.peft
+        ops.set_backends(getattr(self.config, "ops", {}))
         self.model = self.config.model.build(
             distributed_setup=self.distributed_setup,
             peft_config=self.peft_config,
-            activation_checkpoint=self.config.activation_checkpoint.mode,
-            activation_checkpoint_selection=self.config.activation_checkpoint.selection,
-            swap_inputs=getattr(self.config.activation_checkpoint, "swap_inputs", False),
-            allow_cache_entry_mutation=getattr(
-                self.config.activation_checkpoint, "allow_cache_entry_mutation", False),
-            activation_swap=self.config.activation_swap,
+            activation_checkpoint=self.config.activation_checkpoint,
             compile_config=self.config.compile,
             # The final dtype is applied inside the atomic build (05 stage-5
             # item 5); the Trainer no longer patches it afterwards.
@@ -607,6 +613,9 @@ class BaseTrainer(Stateful, ABC):
         """Build the optional joint-graph compiler for this trainer runtime."""
         if not self.config.compile.selects_graph_compiler():
             return
+        # Keep eager trainers independent of the graph compiler and its pass import tree.
+        from hyper_parallel.compile.compiler import GraphCompiler  # pylint: disable=C0415
+
         self.graph_compiler = GraphCompiler(
             model=self.model,
             train_fn=self._graph_train_fn,
@@ -673,7 +682,8 @@ class BaseTrainer(Stateful, ABC):
             or self.config.checkpoint.save_hf_weights
             or self.config.checkpoint.restore_from is not None
         ):
-            self._callbacks.append(CheckpointerCallback(self))
+            self.checkpoint_callback = CheckpointerCallback(self)
+            self._callbacks.append(self.checkpoint_callback)
         else:
             logger.info(
                 "Checkpointing is inactive (save_ckpt=false, save_hf_weights=false, "
@@ -681,8 +691,11 @@ class BaseTrainer(Stateful, ABC):
                 "no checkpoint callback registered."
             )
 
+    @recovery_train_initialized
     def on_train_begin(self) -> None:
         """Run all registered callbacks at the start of training."""
+        # During process recovery, callbacks must not depend on collective communication.
+        # If collectives are required, process recovery must be adapted for that scenario.
         for callback in self._callbacks:
             callback.on_train_begin(self.state)
 
@@ -739,8 +752,32 @@ class BaseTrainer(Stateful, ABC):
             loss_dict: Named loss values for the optimizer step.
             grad_norm: Gradient norm measured before the optimizer update.
         """
+        if self.state.global_step == 1:
+            self._print_step_one_op_backends()
         for callback in self._callbacks:
             callback.on_step_end(self.state, loss=loss, loss_dict=loss_dict, grad_norm=grad_norm)
+
+    def _print_step_one_op_backends(self) -> None:
+        """Print the first step's operator backends to stderr on global rank zero."""
+        local_usage = ops.used_backends()
+        world_size = get_world_size_safe()
+        reports = [local_usage]
+        if world_size > 1:
+            # Some operators only run on pipeline stages or modality ranks other than rank zero.
+            reports = [()] * world_size
+            dist.all_gather_object(reports, local_usage)
+        if get_global_rank_safe() == 0:
+            usage = sorted({entry for report in reports for entry in report})
+            if usage:
+                rows = [("Op", "Variant", "Backend"), *usage]
+                widths = [max(len(value) for value in column) for column in zip(*rows)]
+                rows.insert(1, tuple("-" * width for width in widths))
+                table = "\n".join(
+                    "  ".join(value.ljust(width) for value, width in zip(row, widths)).rstrip()
+                    for row in rows
+                )
+                # Use the config log stream so torchrun applies the same worker prefix.
+                print(f"Fused operator backends used in training step 1\n\n{table}", file=sys.stderr, flush=True)
 
     def preforward(self, micro_batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Preprocess micro batches before forward pass.
@@ -786,7 +823,15 @@ class BaseTrainer(Stateful, ABC):
         Returns:
             Backward loss and named globally aggregated loss values.
         """
-        local_loss = self.loss_fn(model_output=outputs, labels=labels)
+        # The default empty-shard guard must use the same aligned supervision
+        # count as loss weighting, including already-shifted packed targets.
+        if isinstance(self.loss_fn, ModelOutputLoss):
+            local_loss = self.loss_fn(
+                model_output=outputs, labels=labels,
+                valid_token_count=current_token_counts.get("foundation_tokens"),
+            )
+        else:
+            local_loss = self.loss_fn(model_output=outputs, labels=labels)
         # Names are static graph metadata; diagnostics added below are not losses.
         self.loss_names = tuple(local_loss) if isinstance(local_loss, dict) else ("foundation_loss",)
         # Every foundation-family objective receives the same external token weight.
@@ -993,6 +1038,11 @@ class BaseTrainer(Stateful, ABC):
 
         External providers expose their owned parameters through ``parameters``
         and normalize those gradients in ``prepare_optimizer_step`` instead.
+
+        Args:
+            loss: Summed step objective before token normalization.
+            loss_dict: Step loss metrics, normalized in place.
+            denominator: Optional precomputed valid-token count.
         """
         if denominator is None:
             denominator = self._loss_denominator()
@@ -1014,7 +1064,12 @@ class BaseTrainer(Stateful, ABC):
         return loss / denominator
 
     def prepare_optimizer_step(self, loss: float, loss_dict: Dict[str, float]) -> tuple[float, Any]:
-        """Normalize the step objective before clipping and optimizer preparation."""
+        """Normalize the step objective before clipping and optimizer preparation.
+
+        Args:
+            loss: Summed step objective before token normalization.
+            loss_dict: Step loss metrics, normalized in place.
+        """
         denominator = self._loss_denominator()
         loss = self.loss_normalize(loss, loss_dict, denominator=denominator)
         return loss, self.clip_grad_norm(gradient_divisor=denominator)
@@ -1052,6 +1107,7 @@ class BaseTrainer(Stateful, ABC):
         self.model_integration.after_clip(post_clip_norm)
         return grad_norm
 
+    @recovery_optimizer_update
     def step_optimizers_and_schedulers(self) -> None:
         """Step every optimizer and scheduler, then expose the final state."""
         optimizers = self.optimizer if isinstance(self.optimizer, list) else [self.optimizer]
@@ -1100,6 +1156,7 @@ class BaseTrainer(Stateful, ABC):
         resolved_metrics["samples"] = self.config.training.global_batch_size
         self.model_integration.end_step(resolved_metrics)
 
+    @recovery_train_step
     def train_step(
         self,
         data_iterator: Any,
@@ -1181,13 +1238,27 @@ class BaseTrainer(Stateful, ABC):
         synchronize()
         destroy_process_group()
 
+    @recovery_epoch_initialized
+    def _initialize_train_epoch(self, epoch: int, start_epoch: int) -> None:
+        """Prepare the native epoch iterator and dispatch epoch callbacks."""
+        if epoch != start_epoch:
+            self.train_dataloader.set_epoch(epoch)
+            self.data_iterator = HyperIter(
+                self.train_dataloader,
+                use_background_prefetcher=self.config.dataloader.use_background_prefetcher,
+            )
+        self.state.epoch = epoch
+        self.on_epoch_begin()
+
+    @recovery_train_loop
     def train(self) -> None:
         """Run the configured training loop."""
         try:
             config: TrainerConfig = self.config
             self.on_train_begin()
             self.data_iterator = HyperIter(
-                self.train_dataloader, use_background_prefetcher=config.dataloader.use_background_prefetcher
+                self.train_dataloader,
+                use_background_prefetcher=config.dataloader.use_background_prefetcher,
             )
             logger.info(
                 "Rank%s Start training. Global step: %s. Train iters: %s. Start epoch: %s. Train epochs: %s.",
@@ -1197,14 +1268,7 @@ class BaseTrainer(Stateful, ABC):
             try:
                 start_epoch = self.state.epoch
                 for epoch in range(start_epoch, self.train_epochs):
-                    if epoch != start_epoch:
-                        self.train_dataloader.set_epoch(epoch)
-                        self.data_iterator = HyperIter(
-                            self.train_dataloader, use_background_prefetcher=config.dataloader.use_background_prefetcher
-                        )
-                    self.state.epoch = epoch
-
-                    self.on_epoch_begin()
+                    self._initialize_train_epoch(epoch, start_epoch)
 
                     start_step = self.state.global_step - epoch * self.train_steps
                     train_steps = min(self.train_steps, self.train_iters - epoch * self.train_steps)

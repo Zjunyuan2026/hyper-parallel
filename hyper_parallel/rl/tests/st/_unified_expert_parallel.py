@@ -21,14 +21,20 @@ from types import SimpleNamespace
 import torch
 import torch.distributed as dist
 
-from rl.unified_execution.ops.moe.training_ep import training_ep
-from rl.unified_execution.ops.moe.combine import ordered_combine
-from rl.unified_execution.runtimes.vllm.native_moe import NativeQwen3Experts
 from hyper_parallel.components.modules.grouped_experts import GroupedExperts
+from hyper_parallel.components.functional.moe_token_unpermute import moe_token_unpermute
 from hyper_parallel.distributed.expert_parallel.experts import bind_local_expert_forward
+from hyper_parallel.components.modules.moe.grouped_experts.ep.ep_grouped_experts import EPGroupedExperts
+from hyper_parallel.components.modules.moe.grouped_experts.grouped_experts import GroupedExpertsConfig
+from hyper_parallel.distributed.expert_parallel.ep_context import EPContext
+from hyper_parallel.distributed.module_binding import ParallelBinding
+from rl.unified_execution.training.grouped_experts import bind_native_unpermute
+from rl.unified_execution.vllm.moe.fused_experts import AscendFusedExpertsBackend
+from rl.unified_execution.vllm.moe.grouped_experts import rollout_experts
 
 
 def _experts(count: int, offset: int) -> torch.nn.Module:
+    """Build deterministic expert weights for one contiguous logical expert range."""
     source = torch.nn.Module()
     source.num_experts, source.hidden_size, source.intermediate_size = count, 2048, 768
     source.is_transposed = False
@@ -52,7 +58,10 @@ def _reference_forward(full: torch.nn.Module, states: torch.Tensor, ids: torch.T
     """Evaluate each local token against a complete expert bank without EP routing."""
     slots = ids.shape[1]
     routes = full.experts(states.repeat_interleave(slots, 0), ids.flatten())
-    return ordered_combine(routes.view(states.shape[0], slots, states.shape[1]), weights)
+    if not states.shape[0]:
+        return torch.empty_like(states)
+    inverse = torch.arange(ids.numel(), dtype=torch.int32, device=ids.device)
+    return moe_token_unpermute(routes.contiguous(), inverse, weights.contiguous())
 
 
 def _update_weights(module: torch.nn.Module, full: torch.nn.Module) -> None:
@@ -63,13 +72,31 @@ def _update_weights(module: torch.nn.Module, full: torch.nn.Module) -> None:
 
 
 def _equal(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    if actual.dtype != expected.dtype or actual.shape != expected.shape:
+        raise AssertionError(f"EP output {actual.shape}/{actual.dtype} differs from {expected.shape}/{expected.dtype}")
     if not torch.isfinite(actual).all() or not torch.equal(actual.contiguous().view(torch.uint8),
                                                          expected.contiguous().view(torch.uint8)):
         raise AssertionError(f"EP bitwise gate failed: max_abs={(actual.float() - expected.float()).abs().max()}")
 
 
+def _training_experts(module, options):
+    """Exercise the HP training stages with the same logical weights as rollout."""
+    mesh = SimpleNamespace(ndim=1, size=lambda: options["world_size"], get_group=lambda: options["group"],
+                           get_local_rank=lambda: options["rank"])
+    config = GroupedExpertsConfig(128, 2048, 768, routing_weight_mode="output", num_layers=1)
+    with torch.device("meta"):
+        experts = EPGroupedExperts(config=config)
+    for name in ("gate_up_proj", "down_proj"):
+        local = getattr(module.experts, name).detach().transpose(-1, -2).contiguous()
+        setattr(experts, name, torch.nn.Parameter(local))
+    experts.bind_parallel(ParallelBinding(mesh_binding=None, ep_context=EPContext(mesh, num_experts=128)))
+    bind_native_unpermute(experts)
+    return experts
+
+
 def _gradients(module: torch.nn.Module, states: torch.Tensor, ids: torch.Tensor,
                weights: torch.Tensor, options: dict) -> None:
+    """Compare input, routing-weight and expert gradients with a full expert bank."""
     size, rank, local = options["world_size"], options["rank"], options["local_experts"]
 
     def gather(value: torch.Tensor) -> torch.Tensor:
@@ -80,8 +107,10 @@ def _gradients(module: torch.nn.Module, states: torch.Tensor, ids: torch.Tensor,
     x = states.clone().requires_grad_()
     probs = weights.clone().requires_grad_()
     upstream = torch.randn_like(states)
-    training_ep(module, x, ids, probs, **options).float().mul(upstream).sum().backward()
-    actual = [x.grad, probs.grad, module.experts.gate_up_proj.grad, module.experts.down_proj.grad]
+    experts = _training_experts(module, options)
+    experts(x, ids, probs).float().mul(upstream).sum().backward()
+    actual = [x.grad, probs.grad, experts.gate_up_proj.grad.transpose(-1, -2),
+              experts.down_proj.grad.transpose(-1, -2)]
     full = _experts(128, 0)
     with torch.no_grad():
         full.experts.gate_up_proj.copy_(gather(module.experts.gate_up_proj))
@@ -90,7 +119,9 @@ def _gradients(module: torch.nn.Module, states: torch.Tensor, ids: torch.Tensor,
     all_probs = gather(weights).requires_grad_()
     all_ids, all_upstream = gather(ids), gather(upstream)
     routes = full.experts(all_x.repeat_interleave(8, 0), all_ids.flatten()).view(size * states.shape[0], 8, 2048)
-    ordered_combine(routes, all_probs).float().mul(all_upstream).sum().backward()
+    # Independent FP32 weighted sum supplies the autograd reference.
+    expected_output = (routes.float() * all_probs.float().unsqueeze(-1)).sum(dim=1).to(routes.dtype)
+    expected_output.float().mul(all_upstream).sum().backward()
     rows = states.shape[0]
     expected = [all_x.grad[rank * rows:(rank + 1) * rows], all_probs.grad[rank * rows:(rank + 1) * rows],
                 full.experts.gate_up_proj.grad[rank * local:(rank + 1) * local],
@@ -117,10 +148,14 @@ def main() -> None:
         if dist.get_rank() in ranks:
             group = created_group
     rank, local = group.rank(), 128 // args.ep
+    # Worker-only imports follow explicit NPU and distributed initialization.
+    # pylint: disable=import-outside-toplevel
     from vllm.config import set_current_vllm_config
     from vllm.distributed import init_distributed_environment, initialize_model_parallel
     from vllm.engine.arg_utils import EngineArgs
+    from vllm.forward_context import override_forward_context
     from vllm_ascend.ascend_config import init_ascend_config
+    # pylint: enable=import-outside-toplevel
 
     config = EngineArgs(model=args.model, dtype="bfloat16", max_model_len=512,
                         enforce_eager=True).create_engine_config()
@@ -131,11 +166,22 @@ def main() -> None:
         initialize_model_parallel(tensor_model_parallel_size=1, prefill_context_model_parallel_size=len(domain),
                                   backend="hccl")
         options = {"group": group, "rank": rank, "world_size": args.ep, "local_experts": local}
-        topology = SimpleNamespace(tp_size=1, dp_size=1, pcp_size=len(domain), sequence_parallel=False)
-        kernels = NativeQwen3Experts(config, options, topology)
-    context = SimpleNamespace(dp_metadata=None, batch_descriptor=SimpleNamespace(num_tokens=args.rows))
+        topology = SimpleNamespace(tp_size=1, dp_size=1, pcp_size=len(domain), sequence_parallel=False,
+                                   ep_size=args.ep, ep_rank=rank)
+        kernels = AscendFusedExpertsBackend(config, group, topology)
+    context = SimpleNamespace(no_compile_layers={"experts": kernels}, dp_metadata=None,
+                              batch_descriptor=SimpleNamespace(num_tokens=args.rows))
+    # One owner contributes each slot. A BF16 sum with the other ranks'
+    # positive zero would silently flip the sign before native unpermute.
+    slot_ids = (torch.arange(8, device="npu", dtype=torch.int32) % args.ep * local).repeat(args.ep, 1)
+    inverse = torch.arange(slot_ids.numel(), device="npu", dtype=torch.int32)
+    negative_zero = torch.full((slot_ids.numel(), 64), -0., device="npu", dtype=torch.bfloat16)
+    returned = kernels.token_combine(negative_zero, slot_ids, inverse, local_rows=1, bucket=1)
+    _equal(returned, negative_zero[:8].view(1, 8, 64))
+
     module = _experts(local, rank * local)
     full = _experts(128, 0)
+    training = _training_experts(module, options)
     # Different subgroups must carry different data to detect cross-group mixing.
     torch.manual_seed(21000 + dist.get_rank())
     # Unequal sources (including an empty rank) must issue the same collective.
@@ -144,18 +190,22 @@ def main() -> None:
         ids = torch.zeros(rows, 8, device="npu", dtype=torch.int64)
         weights = torch.zeros(rows, 8, device="npu", dtype=torch.float32)
 
-        def prepare(step: int) -> None:
-            logits = torch.randn(rows, 128, device="npu", dtype=torch.float32)
+        # Bind each row case now; graph replay must mutate these exact tensors.
+        def prepare(step: int, states=x, choices=ids, probabilities=weights) -> None:
+            logits = torch.randn(states.shape[0], 128, device="npu", dtype=torch.float32)
             if step % 2:
                 logits[:, :8] += 20
             probs, selected = logits.softmax(-1).topk(8, dim=-1)
             probs /= probs.sum(-1, keepdim=True)
-            ids.copy_(selected)
-            weights.copy_(probs)
-            x.normal_()
+            choices.copy_(selected)
+            probabilities.copy_(probs)
+            states.normal_()
 
-        def candidate() -> torch.Tensor:
-            return kernels(module.experts, x, ids, weights, context)
+        def candidate(states=x, choices=ids, probabilities=weights) -> torch.Tensor:
+            with override_forward_context(context):
+                return rollout_experts(
+                    states, choices, probabilities, module.experts.gate_up_proj, module.experts.down_proj, "experts",
+                )
 
         with torch.no_grad():
             prepare(0)
@@ -168,13 +218,14 @@ def main() -> None:
                 prepare(step)
                 expected = _reference_forward(full, x, ids, weights)
                 actual = candidate()
-                dynamic = training_ep(module, x, ids, weights, **options)
+                dynamic = training(x, ids, weights)
                 graph.replay()
                 torch.npu.synchronize()
                 _equal(actual, expected)
                 _equal(dynamic, expected)
                 _equal(captured, expected)
             _update_weights(module, full)
+            training = _training_experts(module, options)
             graph.replay()
             torch.npu.synchronize()
             _equal(captured, candidate())

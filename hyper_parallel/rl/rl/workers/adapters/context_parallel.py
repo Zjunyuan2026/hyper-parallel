@@ -24,16 +24,6 @@ from hyper_parallel.data.parallel.batch_parallel import CPBatchSharder
 from hyper_parallel.data.parallel.dataloader_parallel import DataLoaderParallelContext
 
 
-def bind_native_context_parallel(model: Any, cp_mesh: Any) -> None:
-    """Bind ordinary MoE CP ownership without installing PIK, V4 or numerical guards."""
-    if getattr(model.config, "model_type", None) != "qwen3_moe" or cp_mesh.size() != 2:
-        raise ValueError("Native RL context parallelism requires Qwen3 MoE CP2")
-    # These existing Actor coordinates also serve ordinary CP; they do not select kernels.
-    model.unified_cp_mesh = cp_mesh
-    model.unified_sequence_multiple = cp_mesh.size()
-    model.native_cp_attention = True
-
-
 def compute_cp_token_log_probs(model: Any, sequences: torch.Tensor, attention_mask: torch.Tensor,
                                cp_mesh: Any) -> torch.Tensor:
     """Shift targets globally before slicing, including each CP boundary target.
@@ -60,14 +50,7 @@ def compute_cp_token_log_probs(model: Any, sequences: torch.Tensor, attention_ma
     positions = torch.arange(start, start + length, device=sequences.device).unsqueeze(0)
     # Inputs and positions are local, but the attention adapter needs the global
     # padding mask to pack each query's full document prefix after K/V gather.
-    model_mask = attention_mask
-    if getattr(model, "native_cp_attention", False):
-        # The ordinary HP wrapper consumes an explicit allowed Q-local x K-global mask.
-        # Global positions retain cross-rank next-token targets and causal offsets.
-        keys = torch.arange(sequences.shape[1], device=sequences.device)
-        causal = keys.view(1, 1, 1, -1) <= positions.view(1, 1, length, 1)
-        model_mask = causal & attention_mask.bool().view(sequences.shape[0], 1, 1, -1)
-    outputs = model(input_ids=batch["input_ids"], attention_mask=model_mask,
+    outputs = model(input_ids=batch["input_ids"], attention_mask=attention_mask,
                     position_ids=positions, use_cache=False)
     logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
     if logits.shape[:2] != batch["input_ids"].shape:

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Real HP model/Actor CP parity, nonzero updates and activation-memory evidence."""
+"""Compare Actor logits, parameter gradients and real updates across CP degrees."""
 
 import argparse
 from contextlib import nullcontext
@@ -20,7 +20,6 @@ from dataclasses import asdict
 import json
 import math
 from pathlib import Path
-import time
 
 import torch
 import torch.distributed as dist
@@ -30,7 +29,6 @@ import yaml
 from _context_parallel_gradients import ParameterGradientComparison
 from rl.data.contracts import ExperienceBatch
 from rl.trainer.build import build_trainer
-from hyper_parallel.distributed.context_parallel.collectives import flex_cp_allgather
 
 
 def create_checkpoint(path, family):
@@ -59,9 +57,9 @@ def recipe(args):
     base = Path('hyper_parallel/rl/examples/consistency/configs/qwen3_moe_4l_cp_rl.yaml')
     config = yaml.safe_load(base.read_text(encoding='utf-8'))
     if args.family == 'qwen3':
-        fixture_path = Path('tests/ut/rl/unified_execution/fixtures/qwen3_dense_pik.yaml')
+        fixture_path = base.with_name('qwen3_4b_rl.yaml')
         fixture = yaml.safe_load(fixture_path.read_text(encoding='utf-8'))
-        config['train']['plan_overrides'] = fixture['train']['plan_overrides'] + [config['train']['plan_overrides'][-1]]
+        config['train']['plan_overrides'] = fixture['train']['plan_overrides']
     config['model'].update(name=args.family, registry_name='cp_model_test', weights_path=str(args.checkpoint),
                            tokenizer_path='/models/Qwen3-MoE-4L')
     train = config['train']
@@ -119,29 +117,6 @@ def check_logits(actor, ids, mask, args, parallel_dims):
             raise AssertionError('Valid full-vocabulary logits changed across CP')
     elif parallel_dims.cp_rank == 0 and parallel_dims.tp_rank == 0:
         torch.save(actual, args.output / f'dp{parallel_dims.dp_rank}-logits.pt')
-
-
-def cp_communication_measurement(model, args, device):
-    """Measure the reused K/V primitive separately from model/optimizer execution."""
-    size = model.unified_sequence_multiple
-    length = args.length + (-args.length) % size
-    heads = model.config.num_key_value_heads // args.tp
-    full_bytes = 2 * args.batch_size * heads * length * model.config.head_dim * 2
-    mesh = getattr(model, 'unified_cp_mesh', None)
-    if mesh is None:
-        return {'full_kv_bytes_per_layer': full_bytes, 'cp_kv_gather_seconds': 0.0}
-    key = torch.zeros(args.batch_size, heads, length // args.cp, model.config.head_dim,
-                      dtype=torch.bfloat16, device=device)
-    value = torch.zeros_like(key)
-    flex_cp_allgather(key, value, 2, mesh)
-    dist.barrier(group=mesh.get_group())
-    torch.npu.synchronize()
-    started = time.perf_counter()
-    for _ in range(5):
-        flex_cp_allgather(key, value, 2, mesh)
-        torch.npu.synchronize()
-    return {'full_kv_bytes_per_layer': full_bytes,
-            'cp_kv_gather_seconds': (time.perf_counter() - started) / 5}
 
 
 def check_packed_model(model, args, device, parallel_dims):
@@ -235,17 +210,7 @@ def main():
         actions = mask.clone()
         actions[:, :4 if args.empty_query_ranks else max(4, args.length // 3)] = 0
         with torch.no_grad():
-            actor.sequence_log_probs(ids, mask)
-        torch.npu.synchronize()
-        torch.npu.reset_peak_memory_stats()
-        allocated = torch.npu.memory_allocated()
-        started = time.perf_counter()
-        with torch.no_grad():
             old = actor.sequence_log_probs(ids, mask)
-        torch.npu.synchronize()
-        forward_seconds = time.perf_counter() - started
-        forward_peak = torch.npu.max_memory_allocated()
-        forward_reserved = torch.npu.max_memory_reserved()
         valid = actions[:, 1:].bool()
         probabilities = old[valid].cpu().contiguous()
         if args.reference:
@@ -290,14 +255,11 @@ def main():
             comparison = ParameterGradientComparison(actor.actor_model, args.output, args.reference, trainer.device)
             comparison.initial()
             torch.npu.empty_cache()
-        torch.npu.reset_peak_memory_stats()
-        update_started = time.perf_counter()
         saved_tensors = (torch.autograd.graph.save_on_cpu(device_type=trainer.device.type)
                          if args.save_activations_on_cpu else nullcontext())
         with saved_tensors, comparison.observe() if comparison is not None else nullcontext():
             metrics = actor.update(experience)
         torch.npu.synchronize()
-        update_seconds = time.perf_counter() - update_started
         if comparison is not None:
             comparison.finish()
         changed = any(not torch.equal(before[name], local_parameter(param).detach().to(before[name].device))
@@ -311,15 +273,7 @@ def main():
                   'checkpoint': str(args.checkpoint), 'batch_size': args.batch_size,
                   'forward_exact': args.reference is not None,
                   'packed_exact': args.packed_check,
-                  'weights_changed': changed, 'forward_seconds': forward_seconds,
-                  'baseline_allocated': allocated, 'forward_peak_allocated': forward_peak,
-                  'forward_peak_reserved': forward_reserved,
-                  'update_peak_allocated': torch.npu.max_memory_allocated(),
-                  'update_peak_reserved': torch.npu.max_memory_reserved(),
-                  'update_seconds': update_seconds,
-                  'update_valid_tokens_per_second': float(mask.sum()) * args.dp / update_seconds,
-                  'metrics': asdict(metrics)}
-        report.update(cp_communication_measurement(actor.actor_model, args, trainer.device))
+                  'weights_changed': changed, 'metrics': asdict(metrics)}
         if reference_actor is not None:
             with torch.no_grad():
                 frozen_after = reference_actor.sequence_log_probs(ids, mask)

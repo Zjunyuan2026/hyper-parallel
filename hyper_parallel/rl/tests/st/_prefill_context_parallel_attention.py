@@ -33,9 +33,9 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.worker.v2.pcp_manager import AscendPCPManager
 
-from rl.unified_execution.core.batch_invariant import initialize_batch_invariant
-from rl.unified_execution.ops.attention.flash_attention_npu_v4 import varlen_attention
-from rl.unified_execution.runtimes.vllm.attention.ascend_v4 import (
+from rl.unified_execution.batch_invariant import initialize_batch_invariant
+from rl.unified_execution.modules.flash_attention_v4 import varlen_attention
+from rl.unified_execution.vllm.attention.backend_v4 import (
     UnifiedAscendAttentionImpl, UnifiedAttentionMetadataBuilder,
 )
 

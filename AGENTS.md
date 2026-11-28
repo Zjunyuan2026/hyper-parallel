@@ -13,7 +13,7 @@ Primary target hardware: **Ascend NPU and Nvidia GPU**. Primary framework: **PyT
 - For RL-owned code, tests, docs, or agent rules, start with [`.agent/rules/hyper-rl.md`](.agent/rules/hyper-rl.md). It is the sole RL entry.
 - RL rules do not apply to other HyperParallel modules. Handle a required main-project change separately under that module's rules.
 - Use the [RL architecture](docs/rl-architecture.md), [feature navigation](docs/rl-navigation.md), and [module map](.agent/rules/rl/module-map.md) to locate boundaries, implementation/test traces, and ownership.
-- RL unit tests live in `tests/ut/rl/`, system tests in `hyper_parallel/rl/tests/st/`, and shared recipes in `tests/common/rl_st_cases.py`. RL ST is run explicitly and is temporarily outside the main-project PR gate. Follow the repository testing rules as well.
+- RL unit tests live in `tests/ut/rl/`, system tests and their recipes in `hyper_parallel/rl/tests/st/`. RL ST is run explicitly and is temporarily outside the main-project PR gate. Follow the repository testing rules as well.
 
 ---
 
@@ -47,9 +47,8 @@ Distributed ST helpers: `torchrun_case()` via `tests.common.distributed_launcher
 ## Env Gotchas / Do Not
 
 - **Editable must track this tree.** If `pip show hyper_parallel` shows another path (e.g. a deleted `.worktrees/...`), re-run `pip install -e .` from repo root. Do not rely on `PYTHONPATH` alone.
-- **Torch-only.** The `platform/` abstraction layer (and with it the MindSpore backend) has been
-  removed. Every module uses native Torch APIs (`torch.distributed`, `torch.Tensor`, autograd)
-  directly; do not reintroduce Platform dispatch or MindSpore implementations anywhere.
+- **Torch-only.** Every module uses native Torch APIs (`torch.distributed`, `torch.Tensor`, autograd)
+  directly; do not introduce a framework-dispatch abstraction.
 - **Collectives.** Use `torch.distributed` directly, or the thin wrappers in
   `hyper_parallel/core/context_parallel/utils.py` and `hyper_parallel/core/dtensor/_utils.py`.
 - **Never** invent Jenkins build numbers or force-push shared branches in agent workflows.
@@ -69,7 +68,6 @@ Distributed ST helpers: `torchrun_case()` via `tests.common.distributed_launcher
 | **Pipeline** | `core/pipeline_parallel/` | Torch-only stage schedule, micro-batch, P2P |
 | **Activation** | `core/activation_checkpoint/`, `core/activation_memory/` | SAC + activation swap |
 | **Checkpoint** | `core/distributed_checkpoint/` | Distributed save/load |
-| **Multicore** | `core/multicore/` | Torch-only component with private SHMEM and native build |
 | **Collectives** | `collectives/cc.py` | Process groups |
 | **Tests** | `tests/ut/`, `tests/torch/` | UT + distributed ST |
 
@@ -143,6 +141,7 @@ Configured in `.agent/settings.json` (Claude Code–style `PostToolUse` matchers
 | **code-review** | Full distributed review (stream/memory/DTensor/collectives) | `/code-review` |
 | **dist-op-analysis** | Operator analysis → plan (human confirm) | called before dist-op-dev |
 | **dist-op-dev** | Implement + test from confirmed plan | `/dist-op-dev` |
+| **op-select-dev** | OpSelect operator families, fused backends, module call sites and precision acceptance | `$op-select-dev` / OpSelect 算子接入与验收 |
 | **gate-doctor** | GitCode PR gate diagnose → autofix to green | 门禁 / autofix / `/retest` |
 | **parallel-strategy-analyzer** | DP/FSDP/TP/PP/EP/CP strategy + cost estimate | `/parallel-strategy-analyzer` |
 | **sapp-parallel-strategy** | Layout for a job on Ascend dies, every valid layout priced by ND: the pick, the next two, why | `$sapp-parallel-strategy` (Codex), `/sapp-parallel-strategy` |

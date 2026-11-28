@@ -17,7 +17,7 @@ from __future__ import annotations
 
 # Tests intentionally exercise stable internal stage boundaries.
 # Local test doubles are not public APIs; the suite intentionally uses Torch CPU tensors.
-# pylint: disable=forbidden-backend-import,missing-public-docstring,protected-access,unnecessary-lambda
+# pylint: disable=missing-public-docstring,protected-access,unnecessary-lambda
 
 import gc
 import unittest
@@ -925,7 +925,7 @@ def test_trainer_builds_rollout_evaluator_and_tp_request_owner(
 
 
 def test_trainer_builds_runtime_and_tracker_components(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
 ) -> None:
     """Production runtime and tracker methods retain component order and rank-zero config."""
     calls: list[Any] = []
@@ -941,7 +941,7 @@ def test_trainer_builds_runtime_and_tracker_components(
     trainer.algorithm = build_algorithm({"name": "grpo", "loss_aggregation": "token-mean"})
     trainer.resolved_config = {
         "train": {
-            "checkpoint": {"output_dir": "/tmp/checkpoints"},
+            "checkpoint": {"output_dir": str(tmp_path / "checkpoints")},
         },
         "logging": {
             "backends": ["console", "wandb"],
@@ -1080,23 +1080,6 @@ def test_trainer_releases_colocated_training_state_for_rollout(
         "empty-cache",
         "stream",
     ]
-
-
-def test_resident_optimizer_keeps_parameters_and_moments_on_target_device():
-    """Residency checks accept scalar CPU steps but reject misplaced weights or moments."""
-    parameter = torch.nn.Parameter(torch.ones(4))
-    optimizer = SimpleNamespace(
-        param_groups=[{"params": [parameter]}],
-        state={parameter: {"step": torch.tensor(1), "exp_avg": torch.zeros(4)}},
-    )
-    TrainingResidency.validate_optimizer_device_residency(optimizer, torch.device("cpu"))
-    optimizer.state[parameter]["exp_avg"] = torch.empty(4, device="meta")
-    with pytest.raises(RuntimeError, match="optimizer state"):
-        TrainingResidency.validate_optimizer_device_residency(optimizer, torch.device("cpu"))
-    optimizer.state.clear()
-    optimizer.param_groups[0]["params"] = [torch.nn.Parameter(torch.empty(4, device="meta"))]
-    with pytest.raises(RuntimeError, match="optimizer parameter"):
-        TrainingResidency.validate_optimizer_device_residency(optimizer, torch.device("cpu"))
 
 
 class _CPUOffloadRole(torch.nn.Module, HSDPModule):

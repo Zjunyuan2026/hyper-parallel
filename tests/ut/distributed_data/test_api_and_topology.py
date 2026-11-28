@@ -20,11 +20,12 @@ from dataclasses import fields
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from hyper_parallel import distributed_data
-from hyper_parallel.distributed_data import DistributedDatasetConfig, SampleMetadata, build_distributed_dataloader
-from hyper_parallel.distributed_data.locality import _create_locality_groups, _fixed_rank_groups
+from hyper_parallel.data import distributed as distributed_data
+from hyper_parallel.data.distributed import DistributedDatasetConfig, SampleMetadata, build_distributed_dataloader
+from hyper_parallel.data.distributed.locality import _create_locality_groups, _fixed_rank_groups
 from hyper_parallel.data.parallel import build_dataset_batch_sampler
-from hyper_parallel.distributed_data.topology import DataTopology
+from hyper_parallel.data.distributed.topology import DataTopology
+from tests.common.mark_utils import arg_mark
 
 
 class TestDistributedDataPublicApi(unittest.TestCase):
@@ -174,6 +175,7 @@ class TestDistributedDataPublicApi(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must divide the root mesh size"):
             _fixed_rank_groups(topology, 3)
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_locality_groups_use_nodes_or_fixed_rank_order(self) -> None:
         """Feature: Local balancing group discovery.
         Description: Build node-based and fixed-size groups with mocked WORLD communication.
@@ -182,9 +184,11 @@ class TestDistributedDataPublicApi(unittest.TestCase):
         mesh = SimpleNamespace(mesh_shape=(4,), mesh_dim_names=("dp",), rank_list=(0, 1, 2, 3))
         for group_size in (None, 2):
             with self.subTest(group_size=group_size), patch(
-                    "hyper_parallel.distributed_data.locality.dist",
+                    "hyper_parallel.data.distributed.locality.dist",
             ) as distributed, patch(
-                    "hyper_parallel.distributed_data.locality.all_gather_control_object",
+                    "hyper_parallel.data.distributed.transport.dist", distributed,
+            ), patch(
+                    "hyper_parallel.data.distributed.locality.all_gather_control_object",
                     return_value=[(0, "node-a"), (1, "node-b"), (2, "node-a"), (3, "node-b")],
             ) as gather, patch.dict("os.environ", {"GROUP_RANK": "node-a"}):
                 distributed.is_available.return_value = True
@@ -198,11 +202,13 @@ class TestDistributedDataPublicApi(unittest.TestCase):
 
                 if group_size is None:
                     gather.assert_called_once()
+                    distributed.destroy_process_group.assert_called_once_with(gather.call_args.kwargs["group"])
                     self.assertEqual(gather.call_args.args[0], (0, "node-a"))
                     expected_groups = [[0, 1, 2, 3], [0, 2], [1, 3]]
                     self.assertEqual(groups.data_plane_ranks, (0, 2))
                 else:
                     gather.assert_not_called()
+                    distributed.destroy_process_group.assert_not_called()
                     expected_groups = [[0, 1], [2, 3]]
                     self.assertEqual(groups.data_plane_ranks, (0, 1))
                 self.assertEqual(
@@ -247,7 +253,7 @@ class TestDistributedDataBuildState(unittest.TestCase):
         sampler = build_dataset_batch_sampler(
             total_samples=2, micro_batch_size=1, global_batch_size=1, dp_world_size=1, dp_rank=0,
         )
-        with patch("hyper_parallel.distributed_data.api.create_data_groups") as create_groups:
+        with patch("hyper_parallel.data.distributed.api.create_data_groups") as create_groups:
             with self.assertRaisesRegex(ValueError, "metadata must align with the mapping Dataset"):
                 build_distributed_dataloader(
                     [0, 1], self._mesh(),
@@ -264,7 +270,7 @@ class TestDistributedDataBuildState(unittest.TestCase):
         """
         for config in (None, {}, object()):
             with self.subTest(config=config), patch(
-                    "hyper_parallel.distributed_data.api.create_data_groups",
+                    "hyper_parallel.data.distributed.api.create_data_groups",
             ) as create_groups:
                 with self.assertRaisesRegex(ValueError, "config must be DistributedDatasetConfig"):
                     build_distributed_dataloader([], self._mesh(), config)
@@ -289,7 +295,7 @@ class TestDistributedDataBuildState(unittest.TestCase):
                     metadata_mode=metadata_mode,
                 )
                 with self.subTest(sharded=sharded, message=message), patch(
-                        "hyper_parallel.distributed_data.api.create_data_groups",
+                        "hyper_parallel.data.distributed.api.create_data_groups",
                 ) as create_groups:
                     with self.assertRaisesRegex(ValueError, message):
                         build_distributed_dataloader([0, 1], self._mesh(), config, **kwargs)

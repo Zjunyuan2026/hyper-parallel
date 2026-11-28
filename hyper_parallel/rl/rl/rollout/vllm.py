@@ -34,33 +34,38 @@ import torch
 import torch.distributed as dist
 
 from rl.data.contracts import RouterTrace, resize_router_trace
-from rl.unified_execution.core.batch_invariant import verify_batch_invariant
-from rl.utils.cpu_threads import configure_inference_cpu_threads
-from rl.workers.engine.model import (
-    ModelRegistration,
-    VLLMModelRegistration,
-    resolve_vllm_model,
-)
 from rl.rollout.base import GenerationRequest, GenerationResult
 from rl.rollout.router_capture import (
     RouterCaptureSpec,
     decode_router_trace,
     router_trace_from_wire,
     router_trace_to_wire,
+    uses_v2_router_capture,
 )
 from rl.rollout.topology import (
     VLLMRolloutTopology,
-    resolve_vllm_rollout_topology,
     model_parallel_size,
+    resolve_vllm_rollout_topology,
     worker_tensor_parallel_size,
 )
-from rl.weight_sync.sync import (
-    ActorRolloutWeightSync, PolicySnapshot, create_node_control_group, synchronize_error, synchronized_call,
-)
-from rl.weight_sync.vllm_client import VLLMWeightSyncClientMixin
-from rl.weight_sync.transfer import WeightPublisher, build_weight_publisher
+from rl.unified_execution.batch_invariant import verify_batch_invariant
+from rl.unified_execution.contract import parse_unified_payload
+from rl.utils.cpu_threads import configure_inference_cpu_threads
 from rl.weight_sync.config import resolve_weight_sync_config
-from rl.unified_execution.core.contract import parse_unified_payload
+from rl.weight_sync.sync import (
+    ActorRolloutWeightSync,
+    PolicySnapshot,
+    create_node_control_group,
+    synchronize_error,
+    synchronized_call,
+)
+from rl.weight_sync.transfer import WeightPublisher, build_weight_publisher
+from rl.weight_sync.vllm_client import VLLMWeightSyncClientMixin
+from rl.workers.engine.model import (
+    ModelRegistration,
+    VLLMModelRegistration,
+    resolve_vllm_model,
+)
 
 _DISTRIBUTED_ENVIRONMENT_VARIABLES = (
     "RANK",
@@ -69,9 +74,6 @@ _DISTRIBUTED_ENVIRONMENT_VARIABLES = (
     "WORLD_SIZE",
     "MASTER_ADDR",
     "MASTER_PORT",
-    "NNODES",
-    "NODE_RANK",
-    "NODE_ADDR",
     "GROUP_RANK",
     "ROLE_RANK",
     "ROLE_WORLD_SIZE",
@@ -737,7 +739,6 @@ class VLLMGenerationEngine:
         client: Optional[Any] = None,
         publisher: Optional[WeightPublisher] = None,
         rollout_model: Optional[VLLMModelRegistration] = None,
-        control_group: Any = None,
     ) -> None:
         """Initialize the lazy vLLM client and policy synchronization."""
         self._model = model
@@ -769,7 +770,7 @@ class VLLMGenerationEngine:
             self._ensure_client,
             publisher,
             sleep_level=self._config.get("sleep_level", 1),
-            control_group=control_group,
+            control_group=getattr(getattr(publisher, "transport", None), "_control_group", None),
         )
 
     @property
@@ -803,12 +804,6 @@ class VLLMGenerationEngine:
         self._trainer_tp_group = group
         self._trainer_tp_rank = int(tp_rank)
         self._trainer_tp_size = int(tp_size)
-        local_world = self._config.get("node_local_world_size")
-        if local_world is not None:
-            if int(local_world) % tp_size:
-                raise ValueError("Trainer TP x CP request groups must stay within each rollout node")
-            request_size = int(local_world) // tp_size
-            request_rank %= request_size
         self._trainer_request_rank = int(request_rank)
         self._trainer_request_size = int(request_size)
 
@@ -926,30 +921,7 @@ class VLLMGenerationEngine:
             command.extend(("--api-server-count", "1"))
         if self._rollout_model.family == "qwen3_5":
             command.append("--language-model-only")
-        for key, default in (
-            ("trust_remote_code", True),
-            ("enable_expert_parallel", False),
-            ("enforce_eager", True),
-            ("disable_log_stats", False),
-            ("enable_prompt_tokens_details", False),
-            ("skip_mm_profiling", False),
-            ("enable_auto_tool_choice", False),
-            ("enable_return_routed_experts", False),
-        ):
-            if bool(self._config.get(key, default)):
-                command.append(f"--{key.replace('_', '-')}")
-        for key, option in (
-            ("enable_prefix_caching", "--enable-prefix-caching"),
-            ("enable_chunked_prefill", "--enable-chunked-prefill"),
-        ):
-            if key in self._config:
-                command.append(option if bool(self._config[key]) else f"--no-{option[2:]}")
-        for key, option in (
-            ("tool_call_parser", "--tool-call-parser"),
-            ("reasoning_parser", "--reasoning-parser"),
-        ):
-            if self._config.get(key) is not None:
-                command.extend((option, str(self._config[key])))
+        command.extend(self._server_feature_arguments())
         additional_config = {}
         if int(self._config.get("context_parallel_size", 1)) > 1:
             command.extend(("--prefill-context-parallel-size", str(self._config["context_parallel_size"]),
@@ -987,6 +959,35 @@ class VLLMGenerationEngine:
             command.extend(("--compilation-config", json.dumps(self._config["compilation_config"])))
         return command
 
+    def _server_feature_arguments(self) -> list[str]:
+        """Build optional feature flags and parser arguments in CLI order."""
+        command = []
+        for key, default in (
+            ("trust_remote_code", True),
+            ("enable_expert_parallel", False),
+            ("enforce_eager", True),
+            ("disable_log_stats", False),
+            ("enable_prompt_tokens_details", False),
+            ("skip_mm_profiling", False),
+            ("enable_auto_tool_choice", False),
+            ("enable_return_routed_experts", False),
+        ):
+            if bool(self._config.get(key, default)):
+                command.append(f"--{key.replace('_', '-')}")
+        for key, option in (
+            ("enable_prefix_caching", "--enable-prefix-caching"),
+            ("enable_chunked_prefill", "--enable-chunked-prefill"),
+        ):
+            if key in self._config:
+                command.append(option if bool(self._config[key]) else f"--no-{option[2:]}")
+        for key, option in (
+            ("tool_call_parser", "--tool-call-parser"),
+            ("reasoning_parser", "--reasoning-parser"),
+        ):
+            if self._config.get(key) is not None:
+                command.extend((option, str(self._config[key])))
+        return command
+
     def _server_environment(self, visible_devices: str) -> dict[str, str]:
         """Build an isolated environment for the owned vLLM process."""
         if (self._unified_execution is not None and "batch_invariant" in self._unified_execution
@@ -994,7 +995,8 @@ class VLLMGenerationEngine:
             raise ValueError("Unified Level 3 conflicts with inherited VLLM_BATCH_INVARIANT=1")
         server_environment = os.environ.copy()
         configure_inference_cpu_threads(server_environment)
-        if int(self._config.get("context_parallel_size", 1)) > 1:
+        if (int(self._config.get("context_parallel_size", 1)) > 1
+                or (self._config.get("enable_return_routed_experts") and uses_v2_router_capture())):
             server_environment["VLLM_USE_V2_MODEL_RUNNER"] = "1"
         for variable in _DISTRIBUTED_ENVIRONMENT_VARIABLES:
             server_environment.pop(variable, None)
@@ -1264,9 +1266,6 @@ class VLLMGenerationEngine:
         if self._trainer_request_size is not None:
             trainer_world_size = self._trainer_request_size
             trainer_rank = self._trainer_request_rank
-        elif self._config.get("node_local_world_size") is not None:
-            trainer_world_size = int(self._config["node_local_world_size"])
-            trainer_rank = int(os.environ["LOCAL_RANK"])
         else:
             try:
                 trainer_world_size = dist.get_world_size()
@@ -1276,6 +1275,16 @@ class VLLMGenerationEngine:
                 trainer_rank = 0
         if trainer_rank is None:
             raise RuntimeError("Trainer logical request rank was not configured")
+        if self._deployment == "colocated":
+            world = int(os.environ.get("WORLD_SIZE", "1"))
+            local_world = int(os.environ.get("LOCAL_WORLD_SIZE", str(world)))
+            nodes = world // local_world
+            if nodes > 1:
+                if trainer_world_size % nodes:
+                    raise ValueError("Trainer request groups must divide evenly across rollout nodes")
+                # Each independent node server admits only this node's request owners.
+                trainer_world_size //= nodes
+                trainer_rank %= trainer_world_size
         engine_count = int(self._config.get("data_parallel_size", 1))
         global_capacity = engine_count * per_engine_capacity
         local_capacity, remainder = divmod(global_capacity, trainer_world_size)
@@ -1589,8 +1598,6 @@ def build_vllm_engine(
     """Build the registered optional vLLM generation engine."""
     vllm_config = config.get("vllm", {})
     deployment = vllm_config.get("deployment", "disjoint")
-    local_world = vllm_config.get("node_local_world_size")
-    control_group = None if local_world is None else create_node_control_group(int(local_world))
     rollout_model = resolve_vllm_model(
         model,
         vllm_config.get("model_implementation", "native")
@@ -1605,6 +1612,11 @@ def build_vllm_engine(
         model_family=rollout_model.family,
         rollout_tp=rollout_tp,
     )
+    control_group = None
+    world = dist.get_world_size() if dist.is_initialized() else 1
+    local_world = int(os.environ.get("LOCAL_WORLD_SIZE", world))
+    if deployment == "colocated" and world > local_world:
+        control_group = create_node_control_group(local_world)
     weight_transfer = build_weight_publisher(
         deployment,
         rollout_model,
@@ -1621,7 +1633,6 @@ def build_vllm_engine(
         config,
         publisher=weight_transfer,
         rollout_model=rollout_model,
-        control_group=control_group,
     )
 
 

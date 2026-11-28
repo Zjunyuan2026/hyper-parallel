@@ -57,7 +57,10 @@ plan_overrides:
       source_type: transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeGatedDeltaNet
       exact_type: true
       implementation:
-        _target_: hyper_parallel.components.modules.TritonGDN
+        _target_: hyper_parallel.components.modules.GatedDeltaNet
+        backend: triton
+        conv_backend: triton
+        ulysses_degree: null
   - match: "*.mlp.experts"
     replace:
       kind: module
@@ -65,18 +68,6 @@ plan_overrides:
       exact_type: true
       implementation:
         _target_: hyper_parallel.components.modules.GroupedExperts
-  - match: "*.mlp.forward"
-    when: ep
-    replace:
-      kind: method
-      implementation:
-        _target_: hyper_parallel.models.qwen3_5_moe.adapter.distributed.expert_parallel.qwen3_5_moe_ep_compute_fn
-        use_grouped_gemm: true
-  - match: "*.linear_attn.forward"
-    when: cp
-    replace:
-      kind: method
-      implementation: hyper_parallel.distributed.context_parallel.wrappers.gdn_ulysses_cp_wrapper
   - match: "*.self_attn.forward"
     when: cp
     replace:
@@ -87,9 +78,7 @@ mixed_precision:
   enabled: false
 
 activation_checkpoint:
-  mode: full
-
-activation_swap: none
+  mode: 'off'
 
 compile:
   enabled: false

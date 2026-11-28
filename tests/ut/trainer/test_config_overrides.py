@@ -72,6 +72,39 @@ class TestConfigOverrides(unittest.TestCase):
             yaml_path.write_text(_SAMPLE_YAML.format(module=__name__), encoding="utf-8")
             return parse_training_args([str(yaml_path), *overrides])
 
+    def test_worker_recovery_defaults_and_overrides(self) -> None:
+        """Resolve the nested recovery switch and Controller endpoint overrides."""
+        config = self._parse()
+        self.assertFalse(config.high_availability.worker_recovery.enable)
+        config = self._parse(
+            "--high_availability.worker_recovery.enable=true",
+            "--high_availability.worker_recovery.controller_ip=127.0.0.1",
+            "--high_availability.worker_recovery.controller_port=18000",
+        )
+        recovery = config.high_availability.worker_recovery
+        self.assertTrue(recovery.enable)
+        self.assertEqual(recovery.controller_ip, "127.0.0.1")
+        self.assertEqual(recovery.controller_port, 18000)
+        self.assertEqual(config.to_dict()["high_availability"]["worker_recovery"], {
+            "enable": True, "controller_ip": "127.0.0.1", "controller_port": 18000,
+        })
+
+    def test_worker_recovery_yaml(self) -> None:
+        """Parse nested recovery YAML and preserve the default Controller port."""
+        recovery_yaml = """high_availability:
+  worker_recovery:
+    enable: true
+    controller_ip: 127.0.0.1
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yaml_path = Path(tmpdir) / "train.yaml"
+            yaml_path.write_text(
+                _SAMPLE_YAML.format(module=__name__) + recovery_yaml, encoding="utf-8"
+            )
+            config = parse_training_args([str(yaml_path)])
+        self.assertTrue(config.high_availability.worker_recovery.enable)
+        self.assertEqual(config.high_availability.worker_recovery.controller_port, 8000)
+
     def test_reads_yaml_without_overrides(self) -> None:
         """YAML values survive, and the callable default is filled in."""
         config = self._parse()
@@ -84,6 +117,18 @@ class TestConfigOverrides(unittest.TestCase):
         self.assertEqual(
             config.model.activation, "gelu",
             msg=f"case: keyword_default_is_filled, activation={config.model.activation!r}")
+
+    def test_removed_activation_swap_root_field_is_rejected(self) -> None:
+        """Standalone activation swap is no longer a Trainer configuration field."""
+        for value in ("none", "attention"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as tmpdir:
+                yaml_path = Path(tmpdir) / "train.yaml"
+                yaml_path.write_text(
+                    _SAMPLE_YAML.format(module=__name__) + f"\nactivation_swap: {value}\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(ConfigResolutionError, "activation_swap"):
+                    parse_training_args([str(yaml_path)])
 
     def test_scalar_overrides_are_coerced(self) -> None:
         """Scalar overrides are coerced against the declared annotations."""
@@ -276,6 +321,29 @@ class TestConfigOverrides(unittest.TestCase):
         )
         self.assertTrue(config.compile.selects_graph_compiler())
         self.assertEqual(config.compile.dynamic_arg_dims, {"model_inputs.input_ids": [0, 1], "labels": 0})
+
+    def test_ops_overrides_preserve_other_families(self) -> None:
+        """Family overrides merge into selections and later values replace earlier ones."""
+        config = self._parse("--ops.swiglu=native", "--ops.rms_norm=native", "--ops.swiglu=auto")
+        self.assertEqual(config.ops, {"swiglu": "auto", "rms_norm": "native"})
+
+    def test_invalid_ops_overrides_report_cli_path(self) -> None:
+        """Invalid families, implementations and YAML value types identify their CLI key."""
+        for token in ("--ops.unknown=native", "--ops.swiglu=unknown", "--ops.swiglu=null"):
+            key = token.split("=", 1)[0][2:]
+            with self.subTest(token=token), self.assertRaisesRegex(ConfigResolutionError, f"CLI.{key}"):
+                self._parse(token)
+
+    def test_duplicate_ops_yaml_keys_are_rejected(self) -> None:
+        """Reject duplicate root ops mappings and repeated family keys before resolution."""
+        cases = (("ops: {}\nops: {}\n", "duplicate ops mapping"),
+                 ("ops:\n  swiglu: native\n  swiglu: auto\n", "duplicate family"))
+        for selections, message in cases:
+            with self.subTest(selections=selections), tempfile.TemporaryDirectory() as tmpdir:
+                path = Path(tmpdir) / "train.yaml"
+                path.write_text(_SAMPLE_YAML.format(module=__name__) + selections, encoding="utf-8")
+                with self.assertRaisesRegex(ConfigResolutionError, message):
+                    parse_training_args([str(path)])
 
 
 if __name__ == "__main__":

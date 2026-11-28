@@ -85,6 +85,7 @@ class TestCPUThreadBudget(unittest.TestCase):
     """Manual overrides and role isolation remain explicit and independently testable."""
 
     def test_shared_launcher_budget_is_divided_by_local_ranks(self) -> None:
+        """Divide the shared CPU quota by local ranks and apply the thread cap."""
         for cores, ranks, threads in ((192, 8, 8), (64, 8, 4), (31, 4, 3), (8, 1, 4)):
             with self.subTest(cores=cores, ranks=ranks):
                 plan = resolve_cpu_threads({"available_cores": cores}, ranks,
@@ -97,6 +98,7 @@ class TestCPUThreadBudget(unittest.TestCase):
         self.assertEqual(single["threads_per_rank"], 4)
 
     def test_device_training_and_manual_limits(self) -> None:
+        """Respect manual thread limits and choose role-appropriate defaults."""
         cases = [({}, False, 1, "auto"), ({"OMP_NUM_THREADS": "3"}, False, 3, "OMP_NUM_THREADS"),
                  ({"OMP_NUM_THREADS": "8", "MKL_NUM_THREADS": "2"}, True, 2, "MKL_NUM_THREADS"),
                  ({"OMP_NUM_THREADS": "16"}, True, 16, "OMP_NUM_THREADS"),

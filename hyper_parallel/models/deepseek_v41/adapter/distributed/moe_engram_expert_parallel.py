@@ -16,14 +16,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from functools import partial
 import inspect
 from types import MethodType
 from typing import Any, Callable
 
-import torch  # pylint: disable=forbidden-backend-import
-import torch.distributed as dist  # pylint: disable=forbidden-backend-import
+import torch
+import torch.distributed as dist
 
 from hyper_parallel.components.modules.engram import local_token_mask
+from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.distributed.expert_parallel.experts import (
     bind_local_expert_forward,
     ep_routed_forward,
@@ -34,6 +37,7 @@ from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import (
     DeepseekV41MegaMoeExperts, _swiglu_limit,
 )
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import deepseek_v41_swiglu
+from hyper_parallel.models.replacement import module_replacement
 
 
 def _deepseek_v41_unclamped_gate(gate_up: torch.Tensor) -> torch.Tensor:
@@ -98,12 +102,55 @@ def _configure_router_statistics(gate: Any, mesh: Any, tp_mesh: Any, cp_mesh: An
         axis.get_group() for axis in (cp_mesh, tp_mesh)
         if axis is not None and axis.size() > 1
     )
+    # A local compute region can receive a TP submesh. Bias counts cover the
+    # entire data batch, so recover its DP axes from the job mesh.
+    statistics_mesh = mesh
+    if isinstance(mesh, DeviceMesh) and mesh.root_mesh is not None:
+        statistics_mesh = mesh.root_mesh
+    mesh_axes = statistics_mesh.mesh_dim_names or () if statistics_mesh is not None else ()
     dp_groups = tuple(
-        mesh[name].get_group() for name in (mesh.mesh_dim_names if mesh is not None else ())
-        if name in ("dp", "dp_replicate", "dp_shard") and mesh[name].size() > 1
+        statistics_mesh[name].get_group() for name in mesh_axes
+        if name in ("dp", "dp_replicate", "dp_shard") and statistics_mesh[name].size() > 1
     )
     gate.expert_bias_update_groups = dp_groups + sequence_groups
     return sequence_groups
+
+
+@module_replacement
+def replace_deepseek_v41_grouped_experts(
+        *, module: torch.nn.Module, module_fqn: str, context: Mapping[str, Any],
+        moonep: bool = False, moonep_replica_capacity: int | None = None,
+) -> torch.nn.Module:
+    """Adopt the packed V4.1 projections with native FP32 clamped SwiGLU.
+
+    Args:
+        module: Original routed experts with the packed Transformers layout.
+        module_fqn: Path of the routed experts in the model.
+        context: Builder context for selecting the local or EP member.
+        moonep: Use collective MoonEP while preserving the model-owned activation policy.
+        moonep_replica_capacity: Maximum distinct remote experts per execution rank.
+
+    Returns:
+        GroupedExperts family member preserving the source parameters.
+
+    Note:
+        The source uses the Transformers 5.11+ packed expert contract. Only
+        the activation differs: clamp and SwiGLU use the model's FP32 helper.
+        Parameter packing, router decisions and shared experts are unchanged.
+    """
+    # Load the optional grouped-expert kernels only when this replacement is selected.
+    from hyper_parallel.components.modules import GroupedExperts  # pylint: disable=C0415
+    from hyper_parallel.components.modules.moe.grouped_experts.grouped_experts import (  # pylint: disable=C0415
+        GroupedExpertsModule,
+    )
+
+    source = GroupedExpertsModule(
+        module=module, module_fqn=module_fqn, context=context,
+        activation=partial(deepseek_v41_swiglu, limit=module.limit),
+    )
+    experts = GroupedExperts(module=source, module_fqn=module_fqn, context=context,
+                             moonep=moonep, moonep_replica_capacity=moonep_replica_capacity)
+    return experts
 
 
 def _router(
@@ -142,7 +189,15 @@ def _routed_and_shared_forward(
 ) -> torch.Tensor:
     """Dispatch routed experts and add the V4.1 shared expert branch."""
     def router_fn(target: Any, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Route with statistics over the current token partitions."""
+        """Route with statistics over the current token partitions.
+
+        Args:
+            target: MoE block exposing the learned router.
+            states: Token activations on the current partition.
+
+        Returns:
+            Selected expert indices and differentiable routing weights.
+        """
         return _router(
             target, states, image_mask, router_token_mask, router_sequence_ids,
             router_num_sequences, sequence_partition_groups=sequence_partition_groups,
@@ -207,7 +262,7 @@ def deepseek_v41_ep_compute_fn(
 
     Args:
         module: V4.1 MoE block exposing gate, experts, and shared_experts.
-        mesh: Full mesh supplying data-parallel bias statistics groups.
+        mesh: Region mesh whose root supplies data-parallel bias statistics groups.
         tp_mesh: Tensor-parallel mesh used to align router metadata and statistics.
         cp_mesh: Context-parallel mesh supplying token-partition statistics groups.
         ep_mesh: Expert-parallel mesh owning the routed experts.
@@ -333,7 +388,7 @@ def deepseek_v41_megamoe_compute_fn(
 
     Args:
         module: V4.1 MoE block with the MegaMoe expert replacement.
-        mesh: Full mesh supplying data-parallel bias statistics groups.
+        mesh: Region mesh whose root supplies data-parallel bias statistics groups.
         tp_mesh: Tensor-parallel mesh used to align router metadata and statistics.
         cp_mesh: Context-parallel mesh supplying token-partition statistics groups.
         ep_mesh: Expert-parallel mesh owning the routed experts, or None for EP=1.
@@ -366,7 +421,7 @@ def deepseek_v41_megamoe_compute_fn(
     if dist.is_initialized() and dist.get_world_size(ep_group) != ep_size:
         raise ValueError("MegaMoe EP mesh and process group sizes must match")
     sequence_groups = _configure_router_statistics(module.gate, mesh, tp_mesh, cp_mesh)
-    module.experts.configure(ep_group, ep_size, module.gate.top_k)
+    module.experts.configure(ep_group, module.gate.top_k)
 
     def compute_fn(
             module: Any, hidden_states: torch.Tensor,
@@ -395,7 +450,15 @@ def deepseek_v41_megamoe_compute_fn(
             local_image_mask = local_image_mask.contiguous()
 
         def router_fn(target: Any, states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            """Keep training metadata attached to the learned gate before balancing."""
+            """Keep training metadata attached to the learned gate before balancing.
+
+            Args:
+                target: MoE block exposing the learned router.
+                states: Token activations on the current partition.
+
+            Returns:
+                Selected expert indices and differentiable routing weights.
+            """
             return _router(
                 target, states, local_image_mask,
                 router_token_mask=_local_router_metadata(router_token_mask, states, tp_mesh),
@@ -469,7 +532,7 @@ def deepseek_v41_engram_compute_fn(
             segment_starts: Optional packed sequence boundaries.
             token_mask: CP-local mask selecting Engram updates.
         """
-        from hyper_parallel.models.deepseek_v41.adapter.engram.host_table import (  # pylint: disable=C0415
+        from hyper_parallel.components.modules.engram.host_engram_table import (  # pylint: disable=C0415
             HostEngramTable,
         )
         if isinstance(module.embed, HostEngramTable):

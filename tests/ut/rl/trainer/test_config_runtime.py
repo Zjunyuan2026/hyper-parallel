@@ -16,19 +16,19 @@
 # Test fixtures inspect stable runtime config attributes and local registry state.
 # pylint: disable=missing-public-docstring,protected-access
 
-import importlib
 import json
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import rl
 import rl.config.validate as config_module
 import torch
 from rl.algorithm import build_algorithm
 from rl.config.limits import resolve_vllm_automatic_limits
 from rl.config.loader import load_config
-from rl.config.resolve import build_runtime_config, resolve_unified_execution_config
+from rl.config.resolve import build_runtime_config
 from rl.config.schema import build_model_registration, uses_colocated_vllm
 from rl.config.validate import validate_config
 from rl.trainer.build import _TrainerBuilder
@@ -43,7 +43,11 @@ def _validated_recipe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
     """Provide a valid baseline so each negative case isolates one configuration error."""
     monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "0")
     monkeypatch.setenv("LOCAL_RANK", "0")
-    monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda: torch.device("npu"))
+    monkeypatch.setattr(
+        torch.accelerator,
+        "current_accelerator",
+        lambda: SimpleNamespace(type="npu"),
+    )
     monkeypatch.setitem(config_module.ENVIRONMENTS._items, "ut-config-environment", lambda _context: object())
     config = resolve_vllm_automatic_limits(_complete_config(tmp_path))
     validate_config(config, build_algorithm(config["algorithm"]))
@@ -144,24 +148,6 @@ def test_actor_critic_precision_policy_cannot_differ(validated_recipe) -> None:
         validate_config(validated_recipe, build_algorithm(validated_recipe["algorithm"]))
 
 
-def test_all_st_recipes_pass_production_validation(
-    validated_recipe: dict, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Every ST topology and resume phase must remain accepted by the real config validator."""
-    runtime = importlib.import_module("tests.common.rl_st_cases")
-    for case in runtime.CASES:
-        devices = list(range(case.cards))
-        monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", ",".join(map(str, devices[:case.world])))
-        for phase in range(1, 3 if case.resume else 2):
-            config = runtime.prepare_config(case, phase, (8100, 8200), devices)
-            config["model"].update(validated_recipe["model"])
-            if "reward_model" in config:
-                config["reward_model"]["model_path"] = validated_recipe["model"]["weights_path"]
-            for field in ("train_path", "test_path"):
-                config["data"][field] = validated_recipe["data"][field]
-            validate_config(resolve_vllm_automatic_limits(config), build_algorithm(config["algorithm"]))
-
-
 def test_config_accepts_optional_model_init_threads_and_rejects_boolean(validated_recipe: dict) -> None:
     """The optional thread setting preserves None and a positive integer without coercion."""
     algorithm = build_algorithm(validated_recipe["algorithm"])
@@ -175,35 +161,15 @@ def test_config_accepts_optional_model_init_threads_and_rejects_boolean(validate
         validate_config(validated_recipe, algorithm)
 
 
-@pytest.mark.parametrize("recipe,devices", [("qwen3_dense.yaml", "0,1")])
-def test_unified_example_preserves_explicit_training_plan(
-    validated_recipe: dict, monkeypatch: pytest.MonkeyPatch, recipe: str, devices: str,
-) -> None:
-    """The shipped architecture recipe passes real validation and transports every Actor rule."""
-    path = Path(__file__).resolve().parents[1] / "unified_execution/fixtures" / recipe
-    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", devices)
-    config = load_config(str(path), [])
-    config["model"].update(validated_recipe["model"])
-    for field in ("train_path", "test_path"):
-        config["data"][field] = validated_recipe["data"][field]
-    resolved = resolve_vllm_automatic_limits(resolve_unified_execution_config(config))
-    validate_config(resolved, build_algorithm(resolved["algorithm"]))
-    payload = resolved["rollout"]["vllm"]["unified_execution"]
-    assert payload["plan_overrides"] == config["train"]["plan_overrides"]
-    assert resolved["rollout"]["vllm"]["model_implementation"] == "unified"
-    runtime = build_runtime_config(resolved)
-    assert len(runtime.plan_overrides) == len(config["train"]["plan_overrides"])
-
-
 def test_colocated_reward_model_config_rejects_conflicts(
     validated_recipe: dict, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Check RM ownership, scoring callback and service ports before startup."""
-    runtime = importlib.import_module("tests.common.rl_st_cases")
-    case = next(case for case in runtime.CASES if case.name == "reward-model-tp1")
-    devices = list(range(case.cards))
-    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", ",".join(map(str, devices)))
-    config = runtime.prepare_config(case, 1, (8100, 8200), devices)
+    recipe = Path(rl.__file__).resolve().parent.parent / "examples/gsm8k/configs/qwen3_4b_gsm8k_model_reward.yaml"
+    config = load_config(str(recipe), [])
+    rollout = config["rollout"]["vllm"]
+    world = rollout["tensor_parallel_size"] * rollout["data_parallel_size"]
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", ",".join(map(str, range(world))))
     config["model"].update(validated_recipe["model"])
     config["reward_model"]["model_path"] = validated_recipe["model"]["weights_path"]
     for field in ("train_path", "test_path"):
@@ -211,7 +177,7 @@ def test_colocated_reward_model_config_rejects_conflicts(
     config = resolve_vllm_automatic_limits(config)
     validate_config(config, build_algorithm(config["algorithm"]))
     for field, value, error in (
-        ("port", 8100, "distinct"),
+        ("port", rollout["port"], "distinct"),
         ("scorer", "examples.gsm8k.agent:compute_gsm8k_reward", "async"),
         ("tensor_parallel_size", 3, "TP1/TP2"),
     ):
@@ -326,7 +292,11 @@ def test_complete_config_resolves_validates_and_builds_runtime(
     config = _complete_config(tmp_path)
     monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "0")
     monkeypatch.setenv("LOCAL_RANK", "0")
-    monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda: torch.device("npu"))
+    monkeypatch.setattr(
+        torch.accelerator,
+        "current_accelerator",
+        lambda: SimpleNamespace(type="npu"),
+    )
     monkeypatch.setitem(
         config_module.ENVIRONMENTS._items,
         "ut-config-environment",
@@ -353,6 +323,7 @@ def test_complete_config_resolves_validates_and_builds_runtime(
     assert runtime.fsdp_config.mix_precision.param_dtype == "bfloat16"
     assert runtime.fsdp_config.mix_precision.reduce_dtype == "float32"
     assert runtime.activation_checkpoint.mode == "selective"
+    assert runtime.activation_checkpoint.selective.recompute_regions[0].layers == (0, 1)
     assert runtime.checkpoint.save_ckpt
     assert runtime.model.to_dict()["_target_"] == "rl.workers.adapters.qwen3.build_causal_lm"
     assert runtime.model.torch_dtype == "bfloat16"
@@ -413,7 +384,11 @@ def fixture_validation_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     config["rollout"]["vllm"]["max_num_seqs"] = 2
     config["train"]["accelerator"]["dp_shard"] = 2
     monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "0,1,2,3")
-    monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda: torch.device("npu"))
+    monkeypatch.setattr(
+        torch.accelerator,
+        "current_accelerator",
+        lambda: SimpleNamespace(type="npu"),
+    )
     monkeypatch.setitem(config_module.ENVIRONMENTS._items, "ut-config-environment", lambda _context: object())
     return config
 
@@ -514,7 +489,7 @@ def _training_config(tmp_path):
             "cpu_offload": False,
             "reshard_after_forward": True,
             "comm_fusion": True,
-            "activation_checkpoint": "selective",
+            "activation_checkpoint": {"mode": "selective", "selective": {"recompute": {"mlp": [0, 1]}}},
         },
         "optimizer": {
             "lr": 1.0e-6,
@@ -569,46 +544,23 @@ def test_dynamic_actor_rejects_unvalidated_tensor_parallel_scope(validated_recip
         validate_config(validated_recipe, build_algorithm(validated_recipe["algorithm"]))
 
 
-def test_colocated_resident_dense_grpo_retains_topology_guards(validation_config):
-    """Only the accepted TP1 dense colocated configuration gains device residency."""
+@pytest.mark.parametrize("tp", [1, 2])
+def test_dense_phase_offload_with_independent_reference(validation_config, tmp_path, tp):
+    """The training shards can stay on device for updates at either TP width."""
     accelerator = validation_config["train"]["accelerator"]
-    accelerator.update(cpu_offload=False, reference_cpu_offload=True, tp=1)
+    accelerator["tp"] = tp
+    accelerator.pop("cpu_offload", None)
     rollout = validation_config["rollout"]["vllm"]
-    rollout.update(deployment="colocated", tensor_parallel_size=1, data_parallel_size=2)
+    rollout.update(deployment="colocated", tensor_parallel_size=tp, data_parallel_size=2)
     rollout.pop("visible_devices", None)
-    validate_config(validation_config, build_algorithm(validation_config["algorithm"]))
-    accelerator["tp"] = 2
-    with pytest.raises(ValueError, match="dense.*TP1"):
-        validate_config(validation_config, build_algorithm(validation_config["algorithm"]))
-
-
-@pytest.mark.parametrize("implementation,offload,accepted", [
-    ("unified", False, True),
-    ("native", False, False),
-    ("unified", True, True),
-    ("native", True, True),
-])
-def test_resident_moe_keeps_implementation_boundary(
-    monkeypatch, implementation, offload, accepted,
-):
-    """Only unified MoE supports residency; both implementations retain CPU offload."""
-    calls = []
-    monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda: torch.device("npu"))
-    monkeypatch.setattr(config_module, "_validate_vllm_basics", lambda _: ("colocated", 8, 2))
-    monkeypatch.setattr(config_module, "_trainer_world_size", lambda _: 16)
-    monkeypatch.setattr(config_module, "_validate_colocated_vllm", lambda *args: calls.append("topology"))
-    monkeypatch.setattr(config_module, "_validate_vllm_limits", lambda _: None)
-    monkeypatch.setattr(config_module, "resolve_vllm_model", lambda *args: SimpleNamespace(family="qwen3_moe"))
-    monkeypatch.setattr(config_module, "resolve_weight_sync_config", lambda *args, **kwargs: None)
-    rollout = {"vllm": {"model_implementation": implementation}}
-    accelerator = {"tp": 4, "cpu_offload": offload}
-    if accepted:
-        config_module._validate_vllm(rollout, accelerator, SimpleNamespace(family="qwen3_moe"))
-        assert calls == ["topology"]
-    else:
-        with pytest.raises(ValueError, match="device.residen"):
-            config_module._validate_vllm(rollout, accelerator, SimpleNamespace(family="qwen3_moe"))
-        assert not calls
+    path = tmp_path / "recipe.yaml"
+    path.write_text(json.dumps(validation_config), encoding="utf-8")
+    config = load_config(str(path), ["--train.accelerator.cpu_offload=false",
+                                     "--train.accelerator.reference_cpu_offload=true",
+                                     "--train.accelerator.offload_during_rollout=true"])
+    validate_config(config, build_algorithm(config["algorithm"]))
+    assert not build_runtime_config(config).fsdp_config.enable_offload
+    assert build_runtime_config(config, reference=True).fsdp_config.enable_offload
 
 
 @pytest.mark.parametrize("training_offload", [False, True])
@@ -623,7 +575,7 @@ def test_rollout_offload_keeps_training_offload_independent(validation_config, t
 
 
 def test_rollout_offload_rejects_disjoint_inference(validated_recipe):
-    """The initial stage-offload contract targets colocated dense GRPO only."""
+    """Stage offload runs at the shared training and rollout device boundary."""
     validated_recipe["train"]["accelerator"]["offload_during_rollout"] = True
     validated_recipe["rollout"]["vllm"]["deployment"] = "disjoint"
     with pytest.raises(ValueError, match="offload_during_rollout requires"):

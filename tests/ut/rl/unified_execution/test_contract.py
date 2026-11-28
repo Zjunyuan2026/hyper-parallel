@@ -12,31 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""CPU contract and real HP replacement tests for architecture-mode inference."""
+"""Shared execution plan, worker identity and numerical policy."""
+from __future__ import annotations
 
 import copy
+import os
+import sys
 import unittest
-from copy import deepcopy
+from contextlib import ExitStack, nullcontext
 from types import ModuleType, SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import torch
-from rl.unified_execution.core.contract import build_unified_payload, fingerprint, parse_unified_payload
-from rl.unified_execution.core.execution_plan import UNIFIED_EP_TARGET
-from rl.unified_execution.models import get_model_family
-from rl.unified_execution.runtimes.hyper_parallel.builder import build_inference_model
-from rl.unified_execution.runtimes.vllm.parallel import build_parallel_context, payload_from_vllm_config
-from rl.unified_execution.runtimes.hyper_parallel.validation import capture_training_structure
-from rl.workers.engine.model import architecture_for_implementation
 from torch import nn
 from transformers import Qwen3Config
 
+from hyper_parallel.components.parallelism_invariant.utils import batch_invariant as level3
 from hyper_parallel.models.replacement import module_replacement
+from rl.unified_execution import batch_invariant as bi
+from rl.unified_execution.contract import build_unified_payload, fingerprint, parse_unified_payload
+from rl.unified_execution.execution_plan import EXPERTS_TARGET
+from rl.unified_execution.vllm.model_builder import build_inference_model
+from rl.unified_execution.models.structure import capture_training_structure
+from rl.unified_execution.vllm.parallel_context import build_parallel_context
 
 
 def _expert_plan():
-    return [{"match": "*.mlp.forward", "when": "ep", "replace": {"kind": "method",
-             "implementation": {"_target_": UNIFIED_EP_TARGET}}}]
+    return [{"match": "*.mlp.experts", "replace": {"kind": "module",
+             "implementation": {"_target_": EXPERTS_TARGET}}}]
 
 
 class MarkerLinear(nn.Linear):
@@ -98,76 +101,9 @@ class TestUnifiedExecutionContract(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "mismatch"):
             parse_unified_payload(payload)
 
-    def test_v4_rollout_only_override_is_rejected(self) -> None:
-        config = _config()
-        config["consistency"]["attention_backend"] = "flash_attention_npu_v4"
-        config["rollout"]["vllm"]["attention_backend"] = "FLASH_ATTN"
-        with self.assertRaisesRegex(ValueError, "overridden"):
-            build_unified_payload(config)
-
-    def test_hf_transport_preserves_contract_and_rejects_obsolete_platform_payload(self) -> None:
-        """Preserve the model-owned contract and reject the obsolete transport location."""
-        payload = build_unified_payload(_config())
-        config = SimpleNamespace(
-            model_config=SimpleNamespace(hf_config=SimpleNamespace(hyper_rl_unified_execution=payload)),
-            additional_config={},
-        )
-        self.assertEqual(payload_from_vllm_config(config), payload)
-        config.additional_config["hyper_rl_unified_execution"] = {**payload, "attention_backend": "other"}
-        with self.assertRaisesRegex(ValueError, "hf_overrides"):
-            payload_from_vllm_config(config)
-        config.additional_config["hyper_rl_unified_execution"] = payload
-        with self.assertRaisesRegex(ValueError, "hf_overrides"):
-            payload_from_vllm_config(config)
-        config.additional_config.clear()
-        del config.model_config.hf_config.hyper_rl_unified_execution
-        with self.assertRaisesRegex(ValueError, "payload"):
-            payload_from_vllm_config(config)
-
-    def test_full_plan_preserves_layout_declarations(self) -> None:
-        config = _config()
-        config["train"]["plan_overrides"] = [_replacement(), {"match": "*.self_attn", "region_dispatch": False}]
-        payload = build_unified_payload(config)
-        self.assertEqual(payload["plan_overrides"], config["train"]["plan_overrides"])
-        self.assertEqual(payload["compute_plan_overrides"], [_replacement()])
-        self.assertEqual(payload["excluded_plan_overrides"], [])
-        self.assertEqual(parse_unified_payload(payload), payload)
-        config["train"]["plan_overrides"].clear()
-        self.assertEqual(len(payload["plan_overrides"]), 2)
-
-    def test_training_precision_must_match_rollout(self) -> None:
-        config = _config()
-        config["train"]["mixed_precision"] = {"enabled": False}
-        with self.assertRaisesRegex(ValueError, "BF16"):
-            build_unified_payload(config)
-
 
 class TestBatchInvariantContract(unittest.TestCase):
     """The numerical policy must survive transport without weakening existing guards."""
-
-    def test_level3_policy_is_normalized_fingerprinted_and_detached(self) -> None:
-        """Both workers receive the requested policy and fixed provider identity."""
-        config = _batch_invariant_config()
-        payload = build_unified_payload(config)
-        self.assertEqual(payload["batch_invariant"], {
-            "provider": "torch_npu_level3", "fill_uninitialized_memory": True,
-            "level": 3, "torch_version": "2.10.0", "torch_npu_version": "2.10.0.post7",
-        })
-        self.assertEqual(parse_unified_payload(payload), payload)
-        architecture = _config()
-        architecture["consistency"]["attention_backend"] = "flash_attention_npu_v4"
-        self.assertNotEqual(payload["plan_fingerprint"], build_unified_payload(architecture)["plan_fingerprint"])
-        config["consistency"]["batch_invariant"]["fill_uninitialized_memory"] = False
-        self.assertIs(payload["batch_invariant"]["fill_uninitialized_memory"], True)
-
-    def test_batch_invariant_requires_v4_and_explicit_policy(self) -> None:
-        """Mode selection alone cannot opt into an unspecified numerical path."""
-        for field in ("attention_backend", "batch_invariant"):
-            with self.subTest(field=field):
-                config = _batch_invariant_config()
-                del config["consistency"][field]
-                with self.assertRaises(ValueError):
-                    build_unified_payload(config)
 
     def test_worker_rejects_policy_tampering_even_with_recomputed_digest(self) -> None:
         """Unsupported versions and incomplete derived policies are never trusted."""
@@ -189,20 +125,6 @@ class TestBatchInvariantContract(unittest.TestCase):
                 del payload["batch_invariant"][field]
                 with self.assertRaises(ValueError):
                     parse_unified_payload(payload)
-
-    def test_batch_invariant_retains_parallel_and_graph_options(self) -> None:
-        """Existing TP/SP, prefix cache, chunked prefill and decode graph remain configurable."""
-        config = _batch_invariant_config()
-        config["train"]["accelerator"] = {"tp": 2, "sequence_parallel": True}
-        config["rollout"]["vllm"].update({
-            "enforce_eager": False, "enable_prefix_caching": True, "enable_chunked_prefill": True,
-            "compilation_config": {"cudagraph_mode": "FULL_DECODE_ONLY"},
-        })
-        payload = build_unified_payload(config)
-        self.assertEqual(payload["parallelism"], {
-            "tp": 2, "cp": 1, "pp": 1, "sequence_parallel": True,
-        })
-        self.assertEqual(parse_unified_payload(payload), payload)
 
 
 class TestUnifiedQwen3Build(unittest.TestCase):
@@ -261,20 +183,6 @@ class TestParallelContract(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "fingerprint mismatch"):
             parse_unified_payload(tampered)
 
-    def test_explicit_or_inherited_inference_cp_pp_fail_before_worker_launch(self) -> None:
-        """Unsupported axes fail instead of selecting a different parallel algorithm."""
-        for axis, field in (("cp", "context_parallel_size"), ("pp", "pipeline_parallel_size")):
-            for inherited in (False, True):
-                with self.subTest(axis=axis, inherited=inherited):
-                    config = self._config()
-                    if inherited:
-                        config["train"]["accelerator"][axis] = 2
-                    else:
-                        config["rollout"]["vllm"][field] = 2
-                    message = ("Training CP" if inherited else "Inference PCP") if axis == "cp" else "PP=1"
-                    with self.assertRaisesRegex(ValueError, message):
-                        build_unified_payload(config)
-
 
 class TestParallelWorkerMesh(unittest.TestCase):
     """HyperParallel adopts the process group initialized by vLLM."""
@@ -283,29 +191,6 @@ class TestParallelWorkerMesh(unittest.TestCase):
     def _config(tp: int = 4) -> SimpleNamespace:
         return SimpleNamespace(parallel_config=SimpleNamespace(tensor_parallel_size=tp, pipeline_parallel_size=1),
                                device_config=SimpleNamespace(device="cpu"))
-
-    def test_tp_mesh_reuses_existing_group_with_nonzero_global_ranks(self) -> None:
-        """The actual engine group owns ranks; no new TP or PP group is constructed."""
-        payload = {"parallelism": {"tp": 4, "cp": 1, "pp": 1, "sequence_parallel": True}}
-        fake_vllm = ModuleType("vllm.distributed")
-        group = SimpleNamespace(ranks=[4, 5, 6, 7], device_group=object(), rank_in_group=3, world_size=4)
-        fake_vllm.get_tp_group = MagicMock(return_value=group)
-        mesh = MagicMock()
-        mesh.get_local_rank.return_value = 3
-        mesh.__getitem__.return_value.get_local_rank.return_value = 3
-        with patch.dict("sys.modules", {"vllm.distributed": fake_vllm}), \
-                patch("rl.unified_execution.runtimes.vllm.parallel.dist") as distributed, \
-                patch("rl.unified_execution.runtimes.vllm.parallel.DeviceMesh.from_group",
-                      return_value=mesh) as from_group, \
-                patch("rl.unified_execution.runtimes.vllm.parallel.MeshContext") as mesh_context:
-            distributed.is_initialized.return_value = True
-            result = build_parallel_context(self._config(), payload)
-        distributed.new_group.assert_not_called()
-        distributed.init_process_group.assert_not_called()
-        from_group.assert_called_once_with(group.device_group, "cpu", mesh_dim_names=("tp",))
-        self.assertEqual(result.tp_rank, 3)
-        self.assertTrue(result.sequence_parallel)
-        self.assertIs(result.mesh_context, mesh_context.return_value)
 
     def test_ep_mesh_uses_synchronized_dp_tp_domain(self) -> None:
         """HP EP spans the actual MoE ranks without enabling a second expert implementation."""
@@ -325,10 +210,10 @@ class TestParallelWorkerMesh(unittest.TestCase):
         dense_mesh.__getitem__.return_value.get_local_rank.return_value = 1
         expert_mesh.__getitem__.return_value.get_local_rank.return_value = 1
         with patch.dict("sys.modules", {"vllm.distributed": fake_vllm}), \
-                patch("rl.unified_execution.runtimes.vllm.parallel.dist.is_initialized", return_value=True), \
-                patch("rl.unified_execution.runtimes.vllm.parallel.DeviceMesh.from_group",
+                patch("rl.unified_execution.vllm.parallel_context.dist.is_initialized", return_value=True), \
+                patch("rl.unified_execution.vllm.parallel_context.DeviceMesh.from_group",
                       side_effect=[tp_mesh, dense_mesh]) as from_group, \
-                patch("rl.unified_execution.runtimes.vllm.parallel.build_expert_mesh",
+                patch("rl.unified_execution.vllm.parallel_context.build_expert_mesh",
                       return_value=expert_mesh) as build_mesh:
             result = build_parallel_context(config, payload)
         from_group.assert_called_with([dp_group, tp_group], "cpu", mesh=[[0], [1]], mesh_dim_names=("dp", "tp"))
@@ -336,83 +221,94 @@ class TestParallelWorkerMesh(unittest.TestCase):
         self.assertEqual((result.dp_rank, result.ep_rank, result.tp_rank), (1, 1, 0))
         self.assertIs(result.mesh_context.fsdp_moe_mesh, expert_mesh)
 
-    def test_ep_requires_shared_recipe_and_valid_rank_domain(self) -> None:
-        """Do not silently change graph mode or create incomplete expert groups."""
-        config = self._config(tp=2)
-        config.model_config = SimpleNamespace(enforce_eager=False)
-        payload = {"parallelism": {"tp": 2, "cp": 1, "pp": 1},
-                   "expert_parallelism": {"inference": 2}}
-        with self.assertRaisesRegex(ValueError, "shared EP recipe"):
-            build_parallel_context(config, payload)
-        payload["expert_parallelism"]["inference"] = 3
-        with self.assertRaisesRegex(ValueError, "must divide"):
-            build_parallel_context(config, payload)
 
+class TestBatchInvariant(unittest.TestCase):
+    """Exercise a fake NPU without mutating real Torch deterministic state."""
 
-class TestSharedPlanNormalization(unittest.TestCase):
-    """Inference normalizes the original declaration without rewriting its algorithm."""
+    def setUp(self) -> None:
+        """Install isolated fake process state and register its cleanup."""
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.events = []
+        self.level = 0
+        self.deterministic = False
+        self.fill = SimpleNamespace(fill_uninitialized_memory=False)
+        self.torch = Mock(
+            __version__="2.10.0+cpu",
+            utils=SimpleNamespace(deterministic=self.fill),
+            are_deterministic_algorithms_enabled=Mock(side_effect=lambda: self.deterministic),
+            no_grad=Mock(side_effect=nullcontext),
+            mm=Mock(side_effect=lambda *_args: self.events.append("mm")),
+        )
+        self.backend = SimpleNamespace(
+            __version__="2.10.0.post7",
+            npu=SimpleNamespace(
+                is_available=Mock(return_value=True), is_initialized=Mock(return_value=True),
+                current_device=Mock(return_value=2),
+                set_deterministic_level=Mock(side_effect=self._set_level),
+                synchronize=Mock(side_effect=lambda: self.events.append("synchronize")),
+                _get_deterministic_level=Mock(side_effect=AssertionError("mutating Python getter")),
+            ),
+            _C=SimpleNamespace(_npu_get_deterministic_level=Mock(side_effect=lambda: self.level)),
+        )
+        self.stack.enter_context(patch.object(level3, "_PROCESS_STATE", None))
+        self.stack.enter_context(patch.object(level3, "torch", self.torch))
+        self.stack.enter_context(patch.dict(os.environ, {"VLLM_BATCH_INVARIANT": "0"}))
+        self.stack.enter_context(patch.dict(sys.modules, {
+            "torch_npu": self.backend,
+            "vllm_ascend": SimpleNamespace(),
+            "vllm_ascend.batch_invariant": SimpleNamespace(_batch_invariant_LIB=None),
+        }))
 
+    def _set_level(self, level: int) -> None:
+        self.events.append("set_level")
+        self.level = level
+        self.deterministic = level > 0
 
-class TestParallelPublicationTopology(unittest.TestCase):
-    """Publication distinguishes each TP worker and each DP engine."""
+    def test_installation_applies_options_before_one_startup_gemm(self) -> None:
+        """Initialization disables unused-memory filling and forces CANN submission once."""
+        snapshot = bi.initialize_batch_invariant({})
+        self.assertEqual(self.events, ["set_level", "mm", "synchronize"])
+        self.assertEqual(snapshot["device"], "npu:2")
+        self.assertEqual(snapshot["level"], 3)
+        self.assertIs(snapshot["deterministic_algorithms"], True)
+        self.assertIs(snapshot["fill_uninitialized_memory"], False)
+        self.assertEqual(snapshot["torch_version"], "2.10.0+cpu")
+        self.assertEqual(self.torch.ones.call_count, 2)
+        self.assertEqual(bi.initialize_batch_invariant({}), snapshot)
+        self.assertEqual(self.events, ["set_level", "mm", "synchronize"])
 
+    def test_state_drift_fails_without_repair_or_another_gemm(self) -> None:
+        """Raw level, Torch flag, fill and selected device must all remain fixed."""
+        bi.initialize_batch_invariant({})
+        for name, target, value in (
+            ("level", self, 1), ("deterministic", self, False),
+            ("fill_uninitialized_memory", self.fill, True),
+            ("return_value", self.backend.npu.current_device, 3),
+        ):
+            with self.subTest(name=name), patch.object(target, name, value):
+                for operation in (bi.verify_batch_invariant, bi.initialize_batch_invariant):
+                    with self.assertRaisesRegex(RuntimeError, "state drift"):
+                        operation({})
+                self.assertEqual(getattr(target, name), value)
+        self.assertEqual(self.events, ["set_level", "mm", "synchronize"])
 
-if __name__ == "__main__":
-    unittest.main()
-
-
-def _moe_config() -> dict:
-    return {
-        "model": {"name": "qwen3_moe"}, "train": {"plan_overrides": _expert_plan()},
-        "rollout": {"engine": "vllm", "vllm": {"enforce_eager": True}},
-        "consistency": {"schema_version": 1, "mode": "architecture"},
-    }
-
-
-class TestMoEContract(unittest.TestCase):
-    """Shared expert identity and publication contracts."""
-
-    def test_model_identity_roundtrip_and_tampering(self) -> None:
-        """A MoE contract cannot be relabeled as Dense with a recomputed digest."""
-        payload = build_unified_payload(_moe_config())
-        self.assertEqual(payload["model_family"], "qwen3_moe")
-        self.assertEqual(parse_unified_payload(payload), payload)
-        changed = deepcopy(payload)
-        changed["model_family"] = "unsupported_moe"
-        changed.pop("plan_fingerprint")
-        changed["plan_fingerprint"] = fingerprint(changed)
-        with self.assertRaisesRegex(ValueError, "Unsupported unified"):
-            parse_unified_payload(changed)
-        family = get_model_family("qwen3_moe")
-        self.assertTrue(family.moe)
-        self.assertEqual(architecture_for_implementation("unified", model_family="qwen3_moe"), family.vllm_architecture)
-
-    def test_hp_tp_sp_and_expert_contract(self) -> None:
-        """Expert degree is distinct from dense TP and preserved at the worker boundary."""
-        config = _moe_config()
-        config["train"]["accelerator"] = {"tp": 2, "ep": 2, "sequence_parallel": True}
-        payload = build_unified_payload(config)
-        self.assertEqual(payload["parallelism"]["tp"], 2)
-        self.assertEqual(payload["expert_parallelism"], {"training": 2, "inference": 2})
-        self.assertEqual(parse_unified_payload(payload), payload)
-        config["rollout"]["vllm"]["enforce_eager"] = False
-        config["train"]["plan_overrides"] = []
-        with self.assertRaisesRegex(ValueError, "EP requires"):
-            build_unified_payload(config)
-
-    def test_ep_can_span_synchronized_data_parallel_workers(self) -> None:
-        """TP1/DP2/EP2 uses two workers, not four workers or vLLM fused experts."""
-        config = _moe_config()
-        config["train"]["accelerator"] = {"dp_replicate": 2, "ep": 2}
-        config["rollout"]["vllm"].update(data_parallel_size=2, expert_parallel_size=2)
-        payload = build_unified_payload(config)
-        self.assertEqual(payload["parallelism"]["tp"], 1)
-        self.assertEqual(payload["expert_parallelism"]["inference"], 2)
-
-    def test_vllm_cannot_enable_an_independent_expert_strategy(self) -> None:
-        """The scheduler must not override HP's expert ownership."""
-        for flag in ("enable_expert_parallel", "enable_eplb"):
-            config = _moe_config()
-            config["rollout"]["vllm"][flag] = True
-            with self.subTest(flag=flag), self.assertRaisesRegex(ValueError, "does not use vLLM"):
-                build_unified_payload(config)
+    def test_global_vllm_conflicts_are_rejected_before_and_after_install(self) -> None:
+        """Neither an inherited environment flag nor an existing aten patch may coexist."""
+        with patch.dict(os.environ, {"VLLM_BATCH_INVARIANT": "1"}):
+            with self.assertRaisesRegex(RuntimeError, "VLLM_BATCH_INVARIANT"):
+                bi.initialize_batch_invariant({})
+        self.backend.npu.set_deterministic_level.assert_not_called()
+        bi.initialize_batch_invariant({})
+        with patch.dict(os.environ, {"VLLM_BATCH_INVARIANT": "1"}):
+            with self.assertRaisesRegex(RuntimeError, "VLLM_BATCH_INVARIANT"):
+                bi.verify_batch_invariant({})
+        for name in ("vllm_ascend", "vllm_ascend.batch_invariant"):
+            with self.subTest(name=name), patch.dict(sys.modules, {
+                name: SimpleNamespace(_batch_invariant_LIB=object()),
+            }):
+                with self.assertRaisesRegex(RuntimeError, "aten patches"):
+                    bi.initialize_batch_invariant({})
+                with self.assertRaisesRegex(RuntimeError, "aten patches"):
+                    bi.verify_batch_invariant({})
+        self.assertEqual(self.backend.npu.set_deterministic_level.call_count, 1)

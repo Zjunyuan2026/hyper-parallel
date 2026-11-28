@@ -17,7 +17,6 @@
 # pylint: disable=line-too-long,missing-public-type-hints,missing-public-docstring
 # pylint: disable=used-before-assignment,unsupported-binary-operation,unused-argument
 # pylint: disable=invalid-name,missing-module-docstring,missing-function-docstring
-# pylint: disable=forbidden-backend-import
 
 from typing import Optional, Tuple
 
@@ -326,7 +325,8 @@ def chunk_gated_delta_rule_fwd_h(
     'USE_FINAL_STATE_GRADIENT': lambda args: args['dht'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.autotune(
+# Preserve all cache keys without interpreting them as automatic tiling axes.
+@triton.runtime.autotuner.autotune(
     configs=get_autotune_config(multibuffer_list=(True, False)),
     key=['H', 'K', 'V', 'BT', 'BV', 'USE_G', 'IS_VARLEN'],
 )

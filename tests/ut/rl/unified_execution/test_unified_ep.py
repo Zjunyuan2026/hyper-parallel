@@ -12,27 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Role binding, selection and gradient checks independent of NPU hardware."""
+"""Dynamic training dispatch and graph-safe rollout expert execution."""
+from __future__ import annotations
 
-import subprocess
-import sys
 import unittest
-from functools import partial
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
 
-from rl.unified_execution.core.execution_plan import UNIFIED_EP_TARGET, has_unified_ep
-from rl.unified_execution.ops.moe.training_ep import training_ep
-from rl.unified_execution.runtimes.hyper_parallel.builder import build_inference_model
-from rl.unified_execution.runtimes.vllm.moe import (
-    bind_inference_ep,
-    register_inference_experts,
-    validate_inference_ep,
+from rl.unified_execution.execution_plan import EXPERTS_TARGET, ROLLOUT_EXPERTS_TARGET
+from rl.unified_execution.vllm.model_builder import build_inference_model
+from rl.unified_execution.training.grouped_experts import bind_native_unpermute
+from rl.unified_execution.vllm.moe.grouped_experts import (
+    RolloutEPGroupedExperts, build_rollout_experts, register_expert_backend,
 )
-
-from hyper_parallel.components.modules.grouped_experts import GroupedExperts
+from rl.unified_execution.vllm.moe.fused_experts import AscendFusedExpertsBackend
 
 
 class TestUnifiedEP(unittest.TestCase):
@@ -40,140 +35,123 @@ class TestUnifiedEP(unittest.TestCase):
 
     def test_inference_builder_binds_role_without_mutating_shared_plan(self) -> None:
         """Worker adaptation must not change the serialized Actor plan or EP1 model."""
-        entry = {"match": "*.mlp.forward", "when": "ep", "replace": {"kind": "method",
-                 "implementation": {"_target_": UNIFIED_EP_TARGET}}}
+        entry = {"match": "*.mlp.experts", "replace": {"kind": "module",
+                 "implementation": {"_target_": EXPERTS_TARGET}}}
         model_class = Mock()
-        context = SimpleNamespace(ep_size=2, mesh_context=object())
-        scope = "rl.unified_execution.runtimes.hyper_parallel.builder"
+        context = SimpleNamespace(ep_size=2, sequence_parallel=True, mesh_context=object())
+        scope = "rl.unified_execution.vllm.model_builder"
         with patch(scope + ".resolve_runtime_symbol", return_value=model_class), \
                 patch(scope + ".normalized_compute_setup") as setup:
             build_inference_model(SimpleNamespace(model_type="qwen3_moe"), [entry], parallel_context=context)
+        self.assertEqual(len(setup.call_args.args[0]), 1)
         implementation = setup.call_args.args[0][0]["replace"]["implementation"]
-        self.assertTrue(implementation["_target_"].endswith(".inference_ep_compute_fn"))
+        self.assertEqual(implementation["_target_"], ROLLOUT_EXPERTS_TARGET)
         self.assertEqual(set(implementation), {"_target_"})
-        self.assertEqual(entry["replace"]["implementation"]["_target_"], UNIFIED_EP_TARGET)
-        context.ep_size = 1
+        self.assertEqual(entry["replace"]["implementation"]["_target_"], EXPERTS_TARGET)
+        context.sequence_parallel = False
+        mixed_config = SimpleNamespace(model_type="qwen3_moe", num_hidden_layers=3,
+                                       mlp_only_layers=[1], decoder_sparse_step=1)
         with patch(scope + ".resolve_runtime_symbol", return_value=model_class), \
                 patch(scope + ".normalized_compute_setup") as setup:
-            build_inference_model(SimpleNamespace(model_type="qwen3_moe"), [entry], parallel_context=context)
-        self.assertEqual(setup.call_args.args[0], [entry])
+            build_inference_model(mixed_config, [entry], parallel_context=context)
+        overrides = setup.call_args.args[0][1:]
+        self.assertEqual([entry["match"] for entry in overrides], ["model.layers.0.mlp", "model.layers.2.mlp"])
+        override = overrides[-1]
+        self.assertEqual(override["in_dst"]["hidden_states"]["tp"], "replicate")
+        self.assertEqual(override["out_src"]["output"]["tp"], "replicate")
+        self.assertEqual(entry["replace"]["implementation"]["_target_"], EXPERTS_TARGET)
+        from hyper_parallel.components.modules.module_family import FamilyRequest, resolve_family
+        from hyper_parallel.components.modules.moe.grouped_experts.grouped_experts import GroupedExpertsModule
 
-    def test_training_import_does_not_load_inference_runtime(self) -> None:
-        """Training/config imports must not register vLLM custom ops or compile entrypoints."""
-        subprocess.run([sys.executable, "-c", (
-            "import sys; import rl.unified_execution.runtimes.hyper_parallel.moe; "
-            "assert not any(n.startswith('rl.unified_execution.runtimes.vllm') for n in sys.modules); "
-            "assert 'vllm' not in sys.modules"
-        )], check=True, timeout=60)
+        request = FamilyRequest(build_rollout_experts, {})
+        for degree, expected in ((1, GroupedExpertsModule), (2, RolloutEPGroupedExperts)):
+            with self.subTest(ep=degree):
+                self.assertIs(resolve_family(request, context={"ep_size": degree}).constructor, expected)
 
-    def test_inference_audit_rejects_registry_and_ownership_drift(self) -> None:
-        """The object reached by the graph must retain the audited experts and limits."""
-        group = Mock()
-        group.size.return_value, group.rank.return_value = 2, 0
-        source = torch.nn.Module()
-        source.num_experts, source.hidden_size, source.intermediate_size = 2, 4, 3
-        source.config = SimpleNamespace(hidden_act="silu")
-        source.gate_up_proj = torch.nn.Parameter(torch.zeros(2, 6, 4))
-        source.down_proj = torch.nn.Parameter(torch.zeros(2, 4, 3))
-        experts = GroupedExperts(module=source)
-        experts.local_expert_count = 2
-        experts._ep_use_grouped_gemm = True  # pylint: disable=protected-access
-        module = torch.nn.Module()
-        module.experts = experts
-        options = {"group": group, "rank": 0, "world_size": 2, "local_experts": 2}
-        router = Mock()
+    def test_empty_source_preserves_activation_dtype_and_router_gradient(self):
+        """Empty FP32 scores retain their gradient without promoting BF16 expert outputs."""
+        from hyper_parallel.components.modules.moe.grouped_experts.grouped_experts import (
+            GroupedExpertsConfig, GroupedExpertsModule,
+        )
+
+        config = GroupedExpertsConfig(2, 4, 3, routing_weight_mode="output", num_layers=1)
+        experts = GroupedExpertsModule(config=config)
+        bind_native_unpermute(experts)
+        values = torch.empty(0, 4, dtype=torch.bfloat16, requires_grad=True)
+        weights = torch.empty(0, 2, dtype=torch.float32, requires_grad=True)
+        result = experts.unpermute(values, torch.empty(0, dtype=torch.int32), weights, (0, 4))
+        self.assertEqual(result.dtype, values.dtype)
+        result.sum().backward()
+        self.assertEqual(values.grad.dtype, values.dtype)
+        self.assertEqual(weights.grad.dtype, weights.dtype)
+
+    def test_graph_reads_each_layers_live_weights(self) -> None:
+        """One backend serves both layers; a replay reads the latest published values."""
+        from torch.fx.experimental.proxy_tensor import make_fx
+        from hyper_parallel.components.modules.moe.grouped_experts.grouped_experts import GroupedExpertsConfig
+
         registry = {}
         config = SimpleNamespace(compilation_config=SimpleNamespace(static_forward_context=registry))
-        fake_config = SimpleNamespace(get_current_vllm_config=lambda: config)
-        native = SimpleNamespace(group=group, local_count=2, first=0)
-        scope = "rl.unified_execution.runtimes.vllm.moe"
-        with patch.dict("sys.modules", {"vllm.config": fake_config}), \
-                patch(scope + ".NativeQwen3Experts", return_value=native), \
-                patch(scope + ".bind_expert_ownership", return_value=(router, options)):
-            compute = bind_inference_ep(module, object())
-            register_inference_experts(module, object(), "mlp")
-            validate_inference_ep(module, partial(compute, module), 2, "mlp", router, native=native)
-            with patch.object(experts, "add_bias", True), self.assertRaisesRegex(ValueError, "bias-free"):
-                validate_inference_ep(module, partial(compute, module), 2, "mlp", router, native=native)
-            key = next(iter(registry))
-            registry[key] = object()
-            with self.assertRaisesRegex(ValueError, "expert ownership differs"):
-                validate_inference_ep(module, partial(compute, module), 2, "mlp", router, native=native)
-            registry[key] = module.unified_expert_executor
-            options["rank"] = 1
-            with self.assertRaisesRegex(ValueError, "expert ownership differs"):
-                validate_inference_ep(module, partial(compute, module), 2, "mlp", router, native=native)
+        context = SimpleNamespace(get_forward_context=lambda: SimpleNamespace(no_compile_layers=registry))
+        topology = SimpleNamespace(mesh_context=SimpleNamespace(fsdp_moe_mesh={"ep": Mock()}))
+        expert_config = GroupedExpertsConfig(2, 4, 3, num_layers=1)
+        layers = torch.nn.ModuleList([RolloutEPGroupedExperts(config=expert_config) for _ in range(2)])
+        states = torch.zeros(1, 4)
+        ids, weights = torch.zeros(1, 1, dtype=torch.long), torch.ones(1, 1)
 
-    def test_cached_graph_keeps_expert_layer_across_registration_orders(self) -> None:
-        """A saved layer call must reach that layer in a newly constructed worker."""
-        registry = {}
-        config = SimpleNamespace(compilation_config=SimpleNamespace(static_forward_context=registry))
-        fake_config = SimpleNamespace(get_current_vllm_config=lambda: config)
-        fake_context = SimpleNamespace(get_forward_context=lambda: SimpleNamespace(no_compile_layers=registry))
-        scope = "rl.unified_execution.runtimes.vllm.moe"
-        saved_graphs = {}
-        names = ("layer0", "layer1", "layer2")
+        def compute(states, counts, gate_up, down):
+            self.assertTrue(gate_up.is_contiguous() and down.is_contiguous())
+            return states + gate_up[0, 0, 0]
 
-        def expert_forward(experts, states, indices, weights, context):
-            del indices, weights, context
-            return states + experts.marker
+        def unpermute(slots, inverse, weights):
+            routes = slots[inverse.long()].reshape(*weights.shape, -1)
+            return (routes * weights.unsqueeze(-1)).sum(dim=1)
 
-        with patch.dict("sys.modules", {"vllm.config": fake_config, "vllm.forward_context": fake_context}), \
-                patch(scope + ".bind_expert_ownership", return_value=(Mock(), {})), \
-                patch(scope + ".NativeQwen3Experts", return_value=expert_forward):
-            for run, order in enumerate((names, tuple(reversed(names)))):
-                registry.clear()
-                # Other native layers can register first without changing EP identity.
-                registry.update({f"unrelated{index}": object() for index in range(run + 1)})
-                model = torch.nn.Module()
-                for name in order:
-                    module = torch.nn.Module()
-                    module.experts = SimpleNamespace(marker=10 * run + names.index(name) + 1)
-                    model.add_module(name, module)
-                    bind_inference_ep(module, object())
-                register_inference_experts(model, object(), "model")
+        backend = Mock(local_count=2)
+        backend.token_dispatch.side_effect = lambda x, ids: (x, None, ids, None, len(x))
+        backend.compute_experts.side_effect = compute
+        backend.token_combine.side_effect = lambda x, *_: x.unsqueeze(1)
+        with patch.dict("sys.modules", {"vllm.forward_context": context}), patch(
+            "rl.unified_execution.vllm.moe.grouped_experts.AscendFusedExpertsBackend", return_value=backend
+        ), patch("rl.unified_execution.vllm.moe.grouped_experts.moe_token_unpermute",
+                 side_effect=unpermute), torch.no_grad():
+            mesh = Mock()
+            for layer in layers:
+                layer.bind_parallel(SimpleNamespace(mesh_binding=mesh))
+            register_expert_backend(layers, config, topology, "test")
+            for i, layer in enumerate(layers):
+                layer.gate_up_proj.fill_(i)
+                graph = make_fx(layer)(states, ids, weights)
+                layer.gate_up_proj.add_(2)
+                torch.testing.assert_close(graph(states, ids, weights), states + i + 2)
 
-                for name in names:
-                    key = model.get_submodule(name).unified_expert_executor.layer_name
-                    self.assertEqual(key, f"hyper_rl.ep.model.{name}")
-                    if run == 0:
-                        graph = torch.fx.Graph()
-                        inputs = [graph.placeholder(arg) for arg in ("states", "indices", "weights")]
-                        graph.output(graph.call_function(torch.ops.hyper_rl.inference_ep.default, (*inputs, key)))
-                        saved_graphs[name] = torch.fx.GraphModule(torch.nn.Module(), graph)
 
-                    # Reuse the first worker's graph without retracing or rewriting its key.
-                    states = torch.ones(2, 3)
-                    actual = saved_graphs[name](states, torch.zeros(2, 1, dtype=torch.int64), torch.ones(2, 1))
-                    expected = states + 10 * run + names.index(name) + 1
-                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+class TestNativeExpertLayout(unittest.TestCase):
+    """Cover sparse shard ownership and the distinction between rows and replicas."""
 
-    def test_dynamic_inverse_permutation_and_gradients(self) -> None:
-        """A deliberately shuffled return must restore token slots before FP32 weighting."""
-        states = torch.tensor([[2., 3.], [4., 5.]], requires_grad=True)
-        ids = torch.tensor([[0, 1], [1, 0]])
-        weights = torch.tensor([[.123456, .876544], [.234567, .765433]], requires_grad=True)
-        order = torch.tensor([3, 0, 2, 1])
-        routed = states.repeat_interleave(2, 0) * (ids.flatten()[:, None] + 1)
-        dispatch = SimpleNamespace(states=states, expert_indices=ids, send_counts=[2, 2],
-                                   receive_counts=[2, 2], dispatch_order=order)
-        with patch("rl.unified_execution.ops.moe.training_ep._prepare_ep_dispatch", return_value=dispatch), \
-                patch("rl.unified_execution.ops.moe.training_ep._run_ep_local_experts", return_value=routed[order]):
-            actual = training_ep(object(), states, ids, weights, group=object(), rank=0,
-                                world_size=2, local_experts=1)
-        expected = states * ((ids + 1) * weights).sum(-1, keepdim=True)
-        torch.testing.assert_close(actual, expected)
-        grads = torch.autograd.grad(actual.sum(), (states, weights), retain_graph=True)
-        reference = torch.autograd.grad(expected.sum(), (states, weights))
-        for value, target in zip(grads, reference):
-            torch.testing.assert_close(value, target)
+    def test_source_exchange_preserves_bits_and_pads_after_sp(self):
+        """Source-row packets preserve integer IDs and zero padding on partial and empty ranks."""
+        native = Mock(spec=AscendFusedExpertsBackend)
+        native.common_source_rows = False
+        native.dp_size, native.sp_size, native.source_count = 2, 2, 2
+        native.source_group = object()
+        native.config = SimpleNamespace(num_experts=513)
+        context = SimpleNamespace(dp_metadata=SimpleNamespace(num_tokens_across_dp_cpu=torch.tensor([3, 5])))
+        states = torch.tensor([[-0., 1.], [2., -3.]], dtype=torch.bfloat16)
+        ids = torch.tensor([[511, 1], [256, 17]], dtype=torch.int32)
 
-    def test_recipe_requires_one_expert_binding(self) -> None:
-        entry = {"match": "*.mlp.forward", "when": "ep", "replace": {"kind": "method",
-                 "implementation": {"_target_": UNIFIED_EP_TARGET}}}
-        self.assertTrue(has_unified_ep([entry]))
-        self.assertFalse(has_unified_ep([]))
-        with self.assertRaisesRegex(ValueError, "unambiguous"):
-            has_unified_ep([entry, entry])
-        entry["replace"]["implementation"] = UNIFIED_EP_TARGET
-        self.assertTrue(has_unified_ep([entry]))
+        def gather(destination, packet, *, group):
+            self.assertIs(group, native.source_group)
+            destination.copy_(packet.repeat(2, 1))
+
+        with patch("torch.distributed.all_gather_into_tensor", side_effect=gather):
+            for rows in (2, 0):
+                values, routes, bucket = AscendFusedExpertsBackend._gather_source_rows(
+                    native, states[:rows], ids[:rows], context,
+                )
+                self.assertEqual(bucket, 3)
+                for offset in (0, bucket):
+                    self.assertTrue(torch.equal(values[offset:offset+rows].view(torch.int16),
+                                                states[:rows].view(torch.int16)))
+                    self.assertTrue(torch.equal(routes[offset:offset+rows], ids[:rows]))
+                    self.assertTrue(routes[offset+rows:offset+bucket].eq(513).all())

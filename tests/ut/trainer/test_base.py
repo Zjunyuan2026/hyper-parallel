@@ -15,7 +15,10 @@
 """Unit tests for trainer lifecycle cleanup."""
 
 import importlib
+import io
+import logging
 import unittest
+from contextlib import ExitStack, redirect_stderr
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -23,9 +26,46 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from hyper_parallel.models.deepseek_v41.adapter.engram.host_state import DeepseekV41HostState
-from hyper_parallel.models.deepseek_v41.adapter.engram.host_table import HostEngramTable
+from hyper_parallel.components.modules.engram.host_engram_table import HostEngramTable
 
 base_module = importlib.import_module("hyper_parallel.trainer.base")
+
+
+class TestBaseTrainerCallbacks(unittest.TestCase):
+    """Checkpoint callback identity is shared by dispatch and recovery integration."""
+
+    def test_checkpoint_member_tracks_save_restore_and_disabled_modes(self) -> None:
+        """Feature: Direct checkpoint callback access.
+
+        Description: Initialize callbacks for save, export, restore-only and disabled configurations.
+        Expectation: Active modes expose the dispatched instance; disabled mode has no checkpoint member.
+        """
+        for save, export, restore in ((False, False, None), (True, False, None),
+                                     (False, True, None), (False, False, "checkpoint")):
+            with self.subTest(save=save, export=export, restore=restore):
+                trainer = SimpleNamespace(
+                    mesh=SimpleNamespace(dp_cp_mesh=None, sequence_parallel=False),
+                    model=object(),
+                    config=SimpleNamespace(
+                        checkpoint=SimpleNamespace(save_ckpt=save, save_hf_weights=export, restore_from=restore),
+                        stress_detect=SimpleNamespace(op_stress_detect=SimpleNamespace(detection_interval=0)),
+                    ),
+                )
+                with ExitStack() as stack:
+                    for name in (
+                        "MoEMonitorCallback", "EnvironMeterCallback", "TqdmCallback", "LoggingCallback",
+                        "EvaluateCallback", "GarbageCollectionCallback", "ProfilerCallback",
+                    ):
+                        stack.enter_context(patch.object(base_module, name))
+                    checkpoint = stack.enter_context(patch.object(base_module, "CheckpointerCallback"))
+                    base_module.BaseTrainer._init_callbacks(trainer)
+                if save or export or restore is not None:
+                    checkpoint.assert_called_once_with(trainer)
+                    self.assertIs(trainer.checkpoint_callback, checkpoint.return_value)
+                    self.assertEqual(trainer._callbacks.count(trainer.checkpoint_callback), 1)
+                else:
+                    checkpoint.assert_not_called()
+                    self.assertFalse(hasattr(trainer, "checkpoint_callback"))
 
 
 class TestBaseTrainerCleanup(unittest.TestCase):
@@ -114,6 +154,64 @@ class TestHcclDeterminismSetup(unittest.TestCase):
                         base_module.BaseTrainer._setup(trainer)
 
 
+class TestStepOneOperatorBackends(unittest.TestCase):
+    """Check the first optimizer-step report across ranks."""
+
+    def test_rank_zero_prints_all_backend_triples_at_step_one(self) -> None:
+        """Print deduplicated triples to stderr even at ERROR logging level."""
+        trainer = base_module.BaseTrainer.__new__(base_module.BaseTrainer)
+        trainer.state = SimpleNamespace(global_step=1)
+        trainer._callbacks = []  # pylint: disable=protected-access
+        local = (("rms_norm", "fp32_affine", "torch_npu"),)
+        remote = (*local, ("rms_norm", "fp32_affine", "native"), ("swiglu", "standard", "native"))
+
+        def gather(reports: list, usage: tuple) -> None:
+            self.assertEqual(usage, local)
+            reports[:] = [local, remote]
+
+        self.addCleanup(base_module.logger.setLevel, base_module.logger.level)
+        base_module.logger.setLevel(logging.ERROR)
+        with (
+            patch.object(base_module, "get_world_size_safe", return_value=2),
+            patch.object(base_module, "get_global_rank_safe", return_value=0),
+            patch.object(base_module.ops, "used_backends", return_value=local),
+            patch.object(base_module.dist, "all_gather_object", side_effect=gather) as collective,
+            redirect_stderr(io.StringIO()) as output,
+        ):
+            trainer.on_step_end()
+            trainer.state.global_step = 2
+            trainer.on_step_end()
+
+        collective.assert_called_once()
+        self.assertEqual(
+            output.getvalue(),
+            "Fused operator backends used in training step 1\n\n"
+            "Op        Variant      Backend\n"
+            "--------  -----------  ---------\n"
+            "rms_norm  fp32_affine  native\n"
+            "rms_norm  fp32_affine  torch_npu\n"
+            "swiglu    standard     native\n",
+        )
+
+    def test_nonzero_rank_participates_with_empty_local_usage(self) -> None:
+        """A rank with no local backend usage still participates in the step-one collective."""
+        trainer = base_module.BaseTrainer.__new__(base_module.BaseTrainer)
+        trainer.state = SimpleNamespace(global_step=1)
+        trainer._callbacks = []  # pylint: disable=protected-access
+
+        with (
+            patch.object(base_module, "get_world_size_safe", return_value=2),
+            patch.object(base_module, "get_global_rank_safe", return_value=1),
+            patch.object(base_module.ops, "used_backends", return_value=()),
+            patch.object(base_module.dist, "all_gather_object") as collective,
+            redirect_stderr(io.StringIO()) as output,
+        ):
+            trainer.on_step_end()
+
+        collective.assert_called_once_with([(), ()], ())
+        self.assertEqual(output.getvalue(), "")
+
+
 class TestBaseTrainerExternalState(unittest.TestCase):
     """Cover the host external-state branches of optimizer build and clip."""
 
@@ -122,6 +220,7 @@ class TestBaseTrainerExternalState(unittest.TestCase):
         """Return a build_optimizer stub that captures the wrap_dense hook."""
         def build_optimizer(optimizer_config: Any, *, wrap_dense: Any) -> Any:
             """Capture wrap_dense and return the prebuilt optimizer."""
+            del optimizer_config
             captured["wrap_dense"] = wrap_dense
             return built
         return build_optimizer

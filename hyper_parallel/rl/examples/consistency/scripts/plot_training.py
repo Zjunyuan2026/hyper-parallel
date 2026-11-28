@@ -98,7 +98,7 @@ def topology_caption(directory: Path) -> str:
     rollout = config["rollout"]["vllm"]
     ep = rollout.get("expert_parallel_size", rollout["data_parallel_size"] * rollout["tensor_parallel_size"]
                      if rollout.get("enable_expert_parallel", False) else 1)
-    return (f'Train: TP{train["tp"]} DP{train["dp_shard"]} EP{train["ep"]} '
+    return (f'Training: TP{train["tp"]} DP{train["dp_shard"]} EP{train["ep"]} '
             f'CP{train.get("cp", 1)} SP={train["sequence_parallel"]}\n'
             f'Rollout: TP{rollout["tensor_parallel_size"]} DP{rollout["data_parallel_size"]} '
             f'EP{ep} PCP{rollout.get("context_parallel_size", 1)} '

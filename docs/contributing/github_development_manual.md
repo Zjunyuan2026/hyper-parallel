@@ -2,13 +2,13 @@
 
 **English** | [简体中文](github_development_manual.zh.md)
 
-Version: 1.0 · Updated: 2026-09-18 · Repository: [mindspore-ai/hyper-parallel](https://github.com/mindspore-ai/hyper-parallel)
+Version: 1.1 · Updated: 2026-11-12 · Repository: [mindspore-ai/hyper-parallel](https://github.com/mindspore-ai/hyper-parallel)
 
 This manual gives developers, reviewers, repository administrators, and CI maintainers migrating from GitCode to GitHub practical procedures, acceptance checks, and troubleshooting entry points. Commands use Bash/Zsh; Windows users can use Git Bash, while hardware tests still require supported environments.
 
 **Distinguishing rules from recommendations:**
 
-- **Current configuration**: Repository settings verified on 2026-09-18; update this manual when settings change.
+- **Current CI guidance**: The CI workflow and retest guidance was refreshed on 2026-11-12. Use the [contributing guide](../../CONTRIBUTING.md#ci-review-and-merge), [detailed merge policy](github_auto_merge.md), and target branch's live rules for current merge requirements. Other configuration audits dated 2026-09-18 are historical snapshots, not a new audit of today's permissions or settings.
 - **Operating procedure**: How to develop and collaborate under current rules.
 - **Recommended implementation**: Platform changes not yet completed; do not treat them as enabled capabilities.
 - **Historical example**: A snapshot of a PR or rule execution, not a claim about its present state.
@@ -75,7 +75,7 @@ Use a useful small documentation or test fix for your first contribution; do not
 | CI | Required checks for the current SHA have terminal results and accessible logs | CI maintainer |
 | Merge | PR is Merged and target branch contains expected results | Merger |
 
-**Migration status:** At this version, required-check lists are still empty, and the default template and some CODEOWNERS entries need repair. No red Checks does not mean tests passed. During transition, mergers must manually verify complete evidence and advance the changes in Chapters 3 and 5.
+**Merge requirements:** Jenkins reports test results, while GitHub Actions checks CI-label validity and review approvals. Follow the [merge checklist and troubleshooting steps](../../CONTRIBUTING.md#ci-review-and-merge); missing results are not a pass. Older migration findings about templates and CODEOWNERS require current verification before acting on them.
 
 ## 1. GitHub/GitCode Differences and Migration Conventions
 
@@ -101,7 +101,7 @@ See [GitHub repository roles](https://docs.github.com/en/organizations/managing-
 
 ### 1.3 Responsibilities of GitHub, GitCode, Jenkins, and Sync Bots
 
-**Observed migration path:** GitHub PRs have Paired GitCode merge requests; external Jenkins runs tests and bots report results to GitHub. No GitHub Actions workflows are currently registered; Jenkins can still be used.
+**Current division of work:** GitHub PRs can have paired GitCode merge requests. External Jenkins runs tests and bots report results to GitHub. GitHub Actions enforces CI-label validity and reviewer approvals; it does not replace the Jenkins hardware pipeline. See the [workflow sources](../../.github/workflows) and [merge policy](github_auto_merge.md).
 
 ~~~mermaid
 flowchart LR
@@ -161,16 +161,10 @@ Install [Git](https://git-scm.com/downloads) and [GitHub CLI](https://cli.github
 ~~~bash
 git --version
 gh --version
-conda env list
+python --version
 ~~~
 
-Use an existing py312 environment. Otherwise, create Python 3.12 according to team standards:
-
-~~~bash
-conda create -n py312 python=3.12
-~~~
-
-Use `conda run -n py312` for subsequent Python commands to avoid system Python. Install drivers, CANN, CUDA, and framework combinations according to the target branch's [Installation Guide](../installation.md).
+Use a Python version supported by the project and activate your chosen development environment before running these commands. See the target branch’s [Installation Guide](../installation.md) for drivers, CANN, CUDA, and framework combinations.
 
 ### 2.2 SSH / HTTPS Authentication and Multiple Accounts
 
@@ -264,12 +258,12 @@ Replace the hostname if using an SSH alias. Verify origin points to your GitHub 
 
 ### 2.7 Environment, Editable Installation, and Local Tests
 
-Install matching framework/hardware dependencies into py312 using the [Installation Guide](../installation.md), then run from this worktree's root:
+Install matching framework/hardware dependencies in your development environment using the [Installation Guide](../installation.md), then run from this worktree's root:
 
 ~~~bash
-conda run -n py312 python -m pip install -e .
-conda run -n py312 python -m pip show hyper_parallel
-conda run -n py312 python -c "import hyper_parallel; print(hyper_parallel.__file__)"
+python -m pip install -e .
+python -m pip show hyper_parallel
+python -c "import hyper_parallel; print(hyper_parallel.__file__)"
 ~~~
 
 The import path must point to this worktree. Reinstall editably after changing worktrees or discovering a stale path; PYTHONPATH alone does not satisfy this check.
@@ -277,7 +271,7 @@ The import path must point to this worktree. Reinstall editably after changing w
 Unit-test example:
 
 ~~~bash
-conda run -n py312 python -m pytest -vs tests/ut
+python -m pytest -vs tests/ut
 ~~~
 
 Run affected modules first, then required gate suites. Without NPU/GPU resources, report completed logic tests and remaining CI validation honestly. For ST that spawns workers through torchrun_case or similar, run pytest at the case entry point and let the launcher manage processes; do not wrap the entire launcher suite in another torchrun. Follow the [testing rules](../../.agent/rules/testing.md), rather than duplicating test implementation standards here.
@@ -374,13 +368,13 @@ gh api 'repos/mindspore-ai/hyper-parallel/codeowners/errors?ref=r1.0.0'
 
 ### 3.5 Rulesets: Approvals, Signatures, Discussions, and Checks
 
-Current master/release rules require at least one approval, Code Owner review, another person's approval of the latest reviewable push, resolved discussions, stale-approval handling, signed commits, and protection from deletion/force-push. Protected branches allow Merge only.
+The 2026-09-18 audit recorded at least one approval, Code Owner review, independent approval of the latest push, resolved discussions, stale-approval handling, signed commits, and protection from deletion/force-push. Verify the current target branch's rules before applying those settings.
 
-**Current gap:** Both rules configure “Require status checks,” but their check-name lists are empty, so no real CI test is enforced by that setting.
+**Current CI policy:** `label-check` validates CI-label age and `all-reviewers-approved` enforces the review quorum with fresh CI. Their implementation and required Ruleset bindings are documented in the [merge policy](github_auto_merge.md). The empty required-check lists recorded in the September audit are historical.
 
 In Settings → Rules → Rulesets, inspect branch scope, enforcement, specific checks, and bypass users. Rulesets can stack; a 404 from the old branch-protection API does not mean no Rulesets exist. See [creating rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/creating-rulesets-for-a-repository).
 
-**Recommended implementation:** Establish real checks following Chapter 5, then require them and bind expected sources. Never require a check no service reports, which can leave every PR waiting.
+When adding a check, verify that it reports on the intended commits before requiring it, and bind its expected source. Never require a check no service reports, which can leave every PR waiting.
 
 ### 3.6 PR / Issue Templates and Validators
 
@@ -493,7 +487,7 @@ Inspect the patch first, then run tests required by the change:
 git diff --check
 git diff upstream/master...HEAD
 git log --oneline upstream/master..HEAD
-conda run -n py312 python -m pytest -vs tests/ut
+python -m pytest -vs tests/ut
 ~~~
 
 Full UT may require platform dependencies. If unavailable locally, state missing conditions and the CI environment responsible for validation. “Not run” cannot be recorded as “passed.”
@@ -599,13 +593,13 @@ gh pr view PR_NUMBER --repo mindspore-ai/hyper-parallel \
   --json headRefOid,statusCheckRollup,url
 ~~~
 
-Missing Checks does not mean success. If retesting uses comments, use only commands published by CI maintainers and validated for GitHub; do not assume old GitCode commands such as `/retest` work identically.
+Missing Checks does not mean success. For Jenkins retests, post `/retest` as a separate GitHub PR Conversation comment and verify the bot's new build link and tested SHA. Follow the [retest and troubleshooting steps](../../CONTRIBUTING.md#when-a-gate-fails), including escalation when the command is rejected or no build starts. Rerunning an Actions gate does not rerun Jenkins or renew CI validity.
 
 Explain retest reasons: fixed code, restored infrastructure, or a known intermittent failure. Read logs rather than repeatedly rerunning blindly.
 
 ### 4.11 Pre-Merge Checks, Merge, and Cleanup
 
-Use Appendix D to inspect current head, valid approvals, signatures, discussions, conflicts, and real CI results. Because required checks are currently empty, manually verify agreed external evidence too.
+Use the [current merge requirements](../../CONTRIBUTING.md#ci-review-and-merge) and Appendix D to inspect the head, valid approvals, applicable signatures, discussions, conflicts, and CI evidence. Required checks must pass for the current commit; a previous build's success does not establish readiness.
 
 Normally use Create a merge commit. CLI can bind the reviewed head to prevent merging a later unreviewed update:
 
@@ -657,9 +651,9 @@ Revert through a separate PR explaining reasons, affected versions, and follow-u
 
 ### 5.1 Current and Target Workflows
 
-**Verified status:** No GitHub Actions workflows exist yet. Some checks run through GitCode/Jenkins with bot comments/labels; native statuses are mainly CLA. Some PRs lack native checks, and target required-check lists are empty.
+**Current implementation:** Jenkins runs the project pipeline and reports results through the bot. GitHub Actions runs [Label Gate Check](../../.github/workflows/label-check.yml), [Reviewer approval gate](../../.github/workflows/reviewer-approval-gate.yml), and [CI label expiry](../../.github/workflows/expire-ci-pass-labels.yml), among other workflows. See the [merge policy](github_auto_merge.md) for their interaction, required-check bindings, and asynchronous enforcement limits.
 
-External CI execution and GitHub-enforced passing CI are therefore not fully connected. The recommended loop is:
+The diagram below is the broader reporting target for external CI. It is not an inventory of enabled checks; actual pipeline stages appear in Jenkins reports, and live branch rules determine required statuses:
 
 ~~~mermaid
 flowchart LR
@@ -928,7 +922,7 @@ For absent issues or inapplicable checks, state the facts and agree on conventio
 - **Owner:** Primarily CI maintainers; author supplies PR, SHA, and wait duration.
 - **Success:** The matching job is discoverable, reaches a terminal result, and reports the required name.
 
-There are currently no Actions workflows, so an empty Actions page alone does not mean Jenkins did not run.
+Check Jenkins through the bot's build link and Actions through the linked gate run. An absent Actions result does not prove Jenkins did not run, and an Actions rerun is not a Jenkins retest.
 
 ### 6.8 Comments Report Success but Checks Is Empty
 
@@ -984,7 +978,7 @@ Do not automatically retry permanently noncompliant pushes or remove all protect
 - [ ] Repository name/email are correct and associated with GitHub.
 - [ ] Signing key registered; new commits show Verified.
 - [ ] CLA signed under current requirements with correct account/email mapping.
-- [ ] Python uses py312; editable install points to this checkout.
+- [ ] The development environment is active and the editable install points to this checkout.
 - [ ] Relevant local checks run; hardware-CI scope is understood.
 - [ ] Target-branch rules read; module owners/support known.
 - [ ] First PR has no placeholders and includes real evidence.
@@ -1049,7 +1043,7 @@ Record date, operator, test PR, target, configuration diff, actual results, and 
 
 ### F. Branch, Permission, Review, and CI Matrix
 
-**Branch rules verified on 2026-09-18:**
+**Historical branch-rule snapshot from 2026-09-18:** This table is retained for migration history, including the then-empty checks and bypass list. Do not use it as the current permission or merge policy; consult the [live rules](https://github.com/mindspore-ai/hyper-parallel/rules) and [merge policy](github_auto_merge.md).
 
 | Item | master / default-branch rules | Release rules |
 |---|---|---|
@@ -1226,6 +1220,7 @@ This manual invents no named owners for CI/CLA roles. The migration lead should 
 
 | Version | Date | Changes |
 |---|---|---|
+| 1.1 | 2026-11-12 | Refresh CI workflow, merge-gate, and verified GitHub retest guidance; explicitly mark September configuration matrices as historical. Other permissions and configuration were not re-audited. |
 | 1.0 | 2026-09-18 | Based on migration PR/configuration audits; establishes local setup, access/rules, PR collaboration, CI/CD, troubleshooting, and checklists, distinguishing current state from proposals |
 
 Future edits must keep prose, matrices, examples, and FAQ consistent. When teams, CODEOWNERS, rulesets, checks, template fields, CLA, or sync change, record the configuration change/acceptance PR and update current-configuration verification dates.

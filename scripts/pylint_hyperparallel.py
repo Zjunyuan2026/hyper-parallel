@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Any, Iterable, Optional, Tuple
 
 from astroid import nodes
@@ -27,6 +28,7 @@ APACHE_HEADER_SNIPPETS: Tuple[str, ...] = (
     "Licensed under the Apache License, Version 2.0",
     "WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND",
 )
+APACHE_COPYRIGHT = re.compile(r"Copyright \d{4}(?:-\d{4})? Huawei Technologies Co\., Ltd")
 PUBLIC_MAGIC_ALLOWLIST = {
     "__init__", "__call__", "__enter__", "__exit__", "__iter__", "__next__",
     "__len__", "__getitem__", "__setitem__", "__delitem__", "__contains__",
@@ -99,11 +101,6 @@ class HyperParallelChecker(BaseChecker):
             "Python files must start with the Apache 2.0 license header",
             "missing-apache-license-header",
             "Used when a Python file is missing the required Apache 2.0 header.",
-        ),
-        "C9002": (
-            "Direct backend import '%s' is forbidden in platform-agnostic code",
-            "forbidden-backend-import",
-            "Retained as a compatibility name for existing local suppressions.",
         ),
         "C9004": (
             "Avoid mutating sys.path with insert(0, ...)",
@@ -184,7 +181,8 @@ class HyperParallelChecker(BaseChecker):
         except OSError:
             return
         header_window = "\n".join(content.splitlines()[:16])
-        if all(snippet in header_window for snippet in APACHE_HEADER_SNIPPETS):
+        complete_license = all(snippet in header_window for snippet in APACHE_HEADER_SNIPPETS)
+        if APACHE_COPYRIGHT.search(header_window) and complete_license:
             return
         self.add_message("missing-apache-license-header", node=node)
 

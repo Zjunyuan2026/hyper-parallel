@@ -21,6 +21,7 @@ Qwen3 adapter and explicit DistributedSetup declarations.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from functools import wraps
 from typing import Any
 
@@ -31,6 +32,7 @@ from hyper_parallel.distributed import ShardingPlanner
 from hyper_parallel.distributed._builder.fsdp_adapter import FSDP2Manager
 from hyper_parallel.distributed._builder.source_shard import build_source_shard_info
 from hyper_parallel.models import HyperAutoModelForCausalLM
+from hyper_parallel.models.registry import resolve_model_adapter
 from hyper_parallel.distributed.mesh import DistributedSetup
 
 
@@ -80,6 +82,17 @@ class _PlannerModelView:
     def __init__(self, model: Any) -> None:
         """Store the real model without registering or changing its modules."""
         self.model = model
+        requests = tuple(module._rl_native_parallel_request for module in model.modules()
+                         if hasattr(module, "_rl_native_parallel_request"))
+        if requests:
+            spec = resolve_model_adapter(model)
+
+            def native_parallel(*, model, context):
+                if spec.native_parallel is not None:
+                    yield from spec.native_parallel(model=model, context=context)
+                yield from requests
+
+            self._hp_model_adapter_spec = replace(spec, native_parallel=native_parallel)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.model, name)

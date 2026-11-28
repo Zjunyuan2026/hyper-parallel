@@ -127,11 +127,7 @@ These requirements apply to training containers; see the code deployment guide a
 The container entry point loads CANN; launch scripts invoke `docker/install_runtime.sh` to install RL and register the vLLM plugin.
 After manual `docker exec` or overriding `PYTHONPATH`, rerun
 `source /usr/local/Ascend/ascend-toolkit/set_env.sh` in the shell that launches the model, preserving CANN Python paths so `import acl` works.
-`docker/patches/patch_sampler.py` applies the sampling tensor `record_stream` fix for validated vLLM-Ascend versions,
-verifies source hashes before/after modification, supports repeated execution, and logs results; unknown versions are rejected. The GSM8K launcher invokes it inside the container.
-
-`docker/patches/vllm-dp-coordinator-timeout.patch` extends vLLM DP Coordinator startup timeout from 30 to 120 seconds.
-The GSM8K TP launch script applies it inside the container. Confirm the patch still applies after upgrading vLLM.
+The eight-device GSM8K launcher prepares the native vLLM-Ascend 0.23 runtime inside the container.
 See the [Hyper-RL README](../README.md) for execution and the [ST guide](../README.md#system-tests) for system tests.
 Custom images must retain launcher `HYPER_*_IMAGE` and test `RL_ST_*_IMAGE` overrides.
 
@@ -198,9 +194,8 @@ wheel_dir=$(realpath ../wheels/v4-build)
 (cd "$wheel_dir" && sha256sum --check SHA256SUMS)
 V4_WHEEL="$wheel_dir/flash_attn_npu-0.5.0+hpbi1-cp312-cp312-linux_aarch64.whl" \
 V4_WHEEL_SHA256=$(cut -d ' ' -f 1 "$wheel_dir/SHA256SUMS") \
-  bash hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_docker.sh
+  bash hyper_parallel/rl/examples/consistency/scripts/run_qwen3_moe_consistency_docker.sh
 ```
 
 构建检查 native library 可加载；上面的两步 RL 示例负责验证实际训推数值一致性。
 校验和用于核对所选产物，源码与补丁身份记录在 `build.json` 中。
-新一致性镜像的 vLLM-Ascend 0.30.0 已包含 `q.record_stream(...)`，不需要运行旧版 `patch_sampler.py`。

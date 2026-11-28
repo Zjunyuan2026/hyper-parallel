@@ -1,0 +1,158 @@
+# Copyright 2026 Huawei Technologies Co., Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ============================================================================
+"""Step-level MoE monitoring, also callable from an independent training loop."""
+
+from typing import Any, Optional
+
+import torch
+from torch import nn
+
+from hyper_parallel.core.activation_memory.wrapper import ActivationWrapper
+from hyper_parallel.components.modules.moe.moe_utils import sync_and_update_expert_bias
+
+
+class MoEMonitorCallback:
+    """Callback that automates expert bias updates across all MoE layers.
+
+    Provides a three-layer invocation architecture:
+
+    - **Layer 0**: :func:`sync_and_update_expert_bias` — per-module sync + update
+    - **Layer 1**: :meth:`on_step_end` — iterates all MoE layers, calling Layer 0
+    - **Layer 2**: :meth:`register` — registers optimizer post-hook for auto-trigger
+
+    Each layer can be used independently; Layer 0 is sufficient for basic usage,
+    while Layers 1–2 add convenience for production training loops.
+
+    Args:
+        model: The model containing MoE layers to monitor.
+        lr: Step size for expert bias updates. Defaults to ``1e-3``.
+        tp_group: Tensor parallel process group. Only needed for TP+SP
+            (sequence-sharded activations across TP ranks). Standard TP
+            does not need this — pass ``None``.
+        cp_group: Context parallel process group. Sync across sequence shards.
+        dp_group: Data parallel process group. Sync across different samples.
+        num_recomputations: Number of forward executions per optimizer step.
+            Default ``1``. Set to ``2`` when activation checkpoint is enabled.
+
+    Example:
+        >>> # Layer 1: manual trigger in training loop
+        >>> callback = MoEMonitorCallback(
+        ...     model, lr=1e-3, dp_group=dp_group_info,
+        ... )
+        >>> for batch in dataloader:
+        ...     loss = model(batch)
+        ...     loss.backward()
+        ...     optimizer.step()
+        ...     callback.on_step_end()  # auto-updates all MoE layers
+        ...     optimizer.zero_grad()
+        >>>
+        >>> # Layer 2: auto-trigger via optimizer post-hook
+        >>> callback = MoEMonitorCallback(model, lr=1e-3, dp_group=dp_group_info)
+        >>> callback.register(optimizer)
+        >>> # optimizer.step() now auto-triggers callback.on_step_end()
+
+    Note:
+        Sync dimensions use ``dp_group``/``tp_group``/``cp_group`` (not ``ep_group``).
+        The adapter reduces unique data and token partition axes. A TP-extended
+        dispatch group overlaps those axes and must not be reduced again.
+    """
+
+    def __init__(
+        self,
+        model: "nn.Module",
+        lr: float = 1e-3,
+        tp_group: Optional[Any] = None,
+        cp_group: Optional[Any] = None,
+        dp_group: Optional[Any] = None,
+        num_recomputations: int = 1,
+    ) -> None:
+        """Initialize MoEMonitorCallback."""
+        self.model = model
+        self.lr = lr
+        self.tp_group = tp_group
+        self.cp_group = cp_group
+        self.dp_group = dp_group
+        self.num_recomputations = num_recomputations
+        self._hook_handle = None
+
+    @property
+    def last_mean_aux_loss(self) -> Optional[torch.Tensor]:
+        """Return the mean router metric as an on-device scalar Tensor.
+
+        Keep the mean on-device so graph capture never reads a Python scalar.
+        Logging callbacks convert the result only when formatting output.
+        Writers detach ``last_aux_loss`` at the source, so the result carries
+        no autograd graph in production. Auxiliary loss remains observable
+        when expert-bias updates are disabled.
+        """
+        # Transparent wrappers expose the same router; its child owns the metric.
+        aux_losses = [
+            module.last_aux_loss
+            for module in self.model.modules()
+            if not isinstance(module, ActivationWrapper) and getattr(module, "last_aux_loss", None) is not None
+        ]
+        return torch.stack(aux_losses).mean() if aux_losses else None
+
+    def on_step_end(self) -> None:
+        """Update expert bias for all MoE layers in the model.
+
+        Iterates over router modules with
+        ``enable_expert_bias=True`` and calls
+        :func:`sync_and_update_expert_bias` for each one.
+
+        Auxiliary loss is read separately through ``last_mean_aux_loss`` so
+        bias updates do not synchronize device scalars for logging each step.
+        """
+        for moe in self.model.modules():
+            if isinstance(moe, ActivationWrapper) or not getattr(moe, "enable_expert_bias", False):
+                continue
+            sync_and_update_expert_bias(
+                moe,
+                lr=self.lr,
+                tp_group=self.tp_group,
+                cp_group=self.cp_group,
+                dp_group=self.dp_group,
+                num_recomputations=self.num_recomputations,
+            )
+
+    def register(self, optimizer: Any) -> None:
+        """Register an optimizer post-hook to auto-trigger :meth:`on_step_end`.
+
+        Uses ``optimizer.register_step_post_hook``.
+        The hook fires after each ``optimizer.step()`` call, so that
+        expert bias is updated once parameters have been updated. Repeated
+        calls replace the existing hook registration.
+
+        Args:
+            optimizer: The optimizer instance to register the hook on.
+
+        Raises:
+            RuntimeError: If the optimizer does not support step post-hooks.
+        """
+        if not hasattr(optimizer, "register_step_post_hook"):
+            raise RuntimeError(
+                "Optimizer does not support register_step_post_hook. "
+                "Requires PyTorch 2.0+. Call on_step_end() manually instead."
+            )
+        self.remove()
+        self._hook_handle = optimizer.register_step_post_hook(
+            lambda *_: self.on_step_end(),
+        )
+
+    def remove(self) -> None:
+        """Remove the optimizer post-hook if registered."""
+        if self._hook_handle is not None:
+            self._hook_handle.remove()
+            self._hook_handle = None

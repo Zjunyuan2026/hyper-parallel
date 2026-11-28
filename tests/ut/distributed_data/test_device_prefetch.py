@@ -21,7 +21,8 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from hyper_parallel.distributed_data.device_prefetch import DeviceStepPrefetcher, _move_to_device, _resolve_device
+from hyper_parallel.data.distributed.device_prefetch import DeviceStepPrefetcher, _move_to_device, _resolve_device
+from tests.common.mark_utils import arg_mark
 
 
 class _DeviceBatch:
@@ -86,7 +87,7 @@ class TestDeviceStepPrefetcher(unittest.TestCase):
         first.to.return_value = object()
         second.to.side_effect = RuntimeError("copy failed")
         with patch.object(torch, "cuda", device_module), patch(
-                "hyper_parallel.distributed_data.device_prefetch._pin_memory", side_effect=lambda value: value,
+                "hyper_parallel.data.distributed.device_prefetch._pin_memory", side_effect=lambda value: value,
         ):
             prefetcher = DeviceStepPrefetcher("cuda:0")
             with self.assertRaisesRegex(RuntimeError, "copy failed"):
@@ -107,7 +108,7 @@ class TestDeviceStepPrefetcher(unittest.TestCase):
         device_module.Event.return_value.query.return_value = False
         pinned = {"pinned": object()}
         with patch.object(torch, "cuda", device_module), patch(
-                "hyper_parallel.distributed_data.device_prefetch._pin_memory", return_value=pinned,
+                "hyper_parallel.data.distributed.device_prefetch._pin_memory", return_value=pinned,
         ):
             prefetcher = DeviceStepPrefetcher("cuda:0")
             prefetcher({"host": 1})
@@ -117,6 +118,7 @@ class TestDeviceStepPrefetcher(unittest.TestCase):
             device_module.Event.return_value.synchronize.assert_called_once()
             self.assertEqual(prefetcher._pending_staging, [])
 
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="dryrun", essential_mark="essential")
     def test_producer_prefetch_binds_device_and_hands_off_storage(self) -> None:
         """Feature: Producer-owned H2D.
         Description: Stage two steps on one copy stream and consume the first.
@@ -126,10 +128,16 @@ class TestDeviceStepPrefetcher(unittest.TestCase):
         device_module = Mock()
         device_module.stream.side_effect = lambda _stream: nullcontext()
         device_batch = _DeviceBatch(events)
+
+        def pin(batch: object) -> object:
+            """Check device selection before the pinned allocator is used."""
+            device_module.set_device.assert_called_with(torch.device("cuda:0"))
+            return batch
+
         with patch.object(torch, "cuda", device_module), patch(
-                "hyper_parallel.distributed_data.device_prefetch._pin_memory", side_effect=lambda value: value,
+                "hyper_parallel.data.distributed.device_prefetch._pin_memory", side_effect=pin,
         ), patch(
-                "hyper_parallel.distributed_data.device_prefetch._move_to_device", return_value=device_batch,
+                "hyper_parallel.data.distributed.device_prefetch._move_to_device", return_value=device_batch,
         ):
             prefetcher = DeviceStepPrefetcher("cuda:0")
             first = prefetcher({"host": 1})
@@ -161,7 +169,7 @@ class TestDeviceStepPrefetcher(unittest.TestCase):
                 host_batch = container([{"data": item} for item in host_items])
                 expected = container([{"data": item} for item in device_items])
                 with patch.object(torch, "cuda", device_module), patch(
-                        "hyper_parallel.distributed_data.device_prefetch._pin_memory", side_effect=lambda value: value,
+                        "hyper_parallel.data.distributed.device_prefetch._pin_memory", side_effect=lambda value: value,
                 ):
                     prefetcher = DeviceStepPrefetcher("cuda:0")
                     staged = prefetcher(host_batch)
@@ -185,7 +193,7 @@ class TestDeviceStepPrefetcher(unittest.TestCase):
                     event.query.return_value = False
                 device_module.Event.side_effect = events
                 with patch.object(torch, "cuda", device_module), patch(
-                        "hyper_parallel.distributed_data.device_prefetch._move_to_device",
+                        "hyper_parallel.data.distributed.device_prefetch._move_to_device",
                         new=lambda value, _device: value.to("meta"),
                 ):
                     prefetcher = DeviceStepPrefetcher("cuda:0")

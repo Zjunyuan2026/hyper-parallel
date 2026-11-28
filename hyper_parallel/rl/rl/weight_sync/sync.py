@@ -18,7 +18,6 @@ __all__ = [
     "ActorRolloutWeightSync",
     "PolicySnapshot",
     "coordinator_call",
-    "create_node_control_group",
     "synchronized_call",
     "synchronize_error",
 ]
@@ -142,8 +141,7 @@ class ActorRolloutWeightSync:
         self._model_name = model_name
         self._deployment = deployment
         self._sleep_level = sleep_level
-        self._control_call = (coordinator_call if control_group is None
-                              else partial(coordinator_call, group=control_group))
+        self._control_call = partial(coordinator_call, group=control_group)
         self._client_provider = client_provider
         self._weight_transfer = weight_transfer
         self._policy_version = 0
@@ -185,17 +183,16 @@ class ActorRolloutWeightSync:
             )
         if not isinstance(client, VLLMWeightSyncClientMixin):
             raise RuntimeError("Generation requires the owned vLLM HTTP client")
-        def verify_version() -> int:
-            """Reject a stale node before any node admits the next rollout."""
-            worker_version = committed_policy_version(client)
-            if worker_version != self._policy_version:
-                raise RuntimeError(
-                    "vLLM worker policy version differs from the published version: "
-                    f"expected={self._policy_version}, actual={worker_version}"
-                )
-            return worker_version
-
-        return self._control_call("generation rollout version", verify_version)
+        worker_version = self._control_call(
+            "generation rollout version",
+            lambda: committed_policy_version(client),
+        )
+        if worker_version != self._policy_version:
+            raise RuntimeError(
+                "vLLM worker policy version differs from the published version: "
+                f"expected={self._policy_version}, actual={worker_version}"
+            )
+        return worker_version
 
     def _server_owner_call(
         self,
@@ -214,15 +211,15 @@ class ActorRolloutWeightSync:
         client = synchronized_call("server startup", self._client_provider)
         if client is None:
             raise RuntimeError("vLLM server startup failed without a synchronized error")
-        worker_version = self._control_call(
-            "initial rollout version",
-            lambda: committed_policy_version(client),
-        )
-        if worker_version != self._policy_version:
-            raise RuntimeError(
-                "Initial rollout worker version differs from controller: "
-                f"expected={self._policy_version}, actual={worker_version}"
-            )
+        def verify_initial_version() -> None:
+            """Keep a node's stale policy from stranding other nodes in sleep."""
+            worker_version = committed_policy_version(client)
+            if worker_version != self._policy_version:
+                raise RuntimeError(
+                    "Initial rollout worker version differs from controller: "
+                    f"expected={self._policy_version}, actual={worker_version}"
+                )
+        self._control_call("initial rollout version", verify_initial_version)
         # Sleep may discard weights before an error reaches the controller.
         self._phase = "training"
         self._server_owner_call(
@@ -308,14 +305,13 @@ class ActorRolloutWeightSync:
                 verify_post_publication_pause,
             )
             def verify_pending_version() -> None:
-                """Keep all node services paused if one node retained stale weights."""
+                """Propagate a node's version mismatch to every training rank."""
                 worker_version = committed_policy_version(client)
                 if worker_version != self._pending_policy_version:
                     raise RuntimeError(
                         "vLLM worker version differs from the pending policy: "
                         f"expected={self._pending_policy_version}, actual={worker_version}"
                     )
-
             self._control_call("pending rollout version", verify_pending_version)
         self._resume_rollout(client, check_residency=True)
         if self._pending_policy_version is not None:

@@ -32,7 +32,10 @@ import torch.distributed as dist
 from rl.weight_sync.config import validate_weight_sync_support
 from rl.weight_sync.hccl import HCCLWeightTransport
 from rl.weight_sync.ipc import IPCContext, IPCWeightTransport
-from rl.weight_sync.model_adapter import alias_tied_embeddings, build_model_weight_adapter
+from rl.weight_sync.model_adapter import (
+    alias_tied_embeddings,
+    build_model_weight_adapter,
+)
 from rl.weight_sync.packed_weight import (
     PackedWeightBucket,
     build_packed_weight_buckets,
@@ -123,8 +126,7 @@ class WeightPublisher:
     ) -> None:
         """Own the bucket plan, transport, and latest result."""
         self.source = source
-        self._control_call = (coordinator_call if control_group is None
-                              else partial(coordinator_call, group=control_group))
+        self._control_call = partial(coordinator_call, group=control_group)
         self._buckets: Optional[tuple[PackedWeightBucket, ...]] = None
         self._parameter_names: frozenset[str] = frozenset()
         self._context: Optional[Union[IPCContext, str]] = None
@@ -159,16 +161,12 @@ class WeightPublisher:
                 execute_transfer,
             )
             self._control_call("weight-sync finish", client.finish_weight_update)
-
             def verify_committed_version() -> None:
-                """Reject every Trainer if any node committed a different policy version."""
                 committed_version = committed_policy_version(client)
                 if committed_version != snapshot.version:
                     raise RuntimeError(
-                        "vLLM committed a different policy version: "
-                        f"expected={snapshot.version}, actual={committed_version}"
+                        f"vLLM committed version {committed_version}, expected {snapshot.version}"
                     )
-
             self._control_call("weight-sync committed version", verify_committed_version)
             self.last_strategy = self.configured_strategy
             self.last_streaming_stats = streaming_stats
@@ -319,12 +317,10 @@ def build_weight_publisher(
     )
     if data_parallel_size <= 0 or bucket_size_bytes <= 0:
         raise ValueError("Weight-sync DP size and bucket bytes must be positive")
+    if control_group is not None and deployment != "colocated":
+        raise ValueError("Node-local control groups require colocated IPC transport")
     source = WeightSource(model, bucket_size_bytes)
     transport_type = IPCWeightTransport if deployment == "colocated" else HCCLWeightTransport
     options = {"control_group": control_group} if control_group is not None else {}
-    if options and deployment != "colocated":
-        raise ValueError("Node-local control groups require colocated IPC publication")
-    transport = transport_type(
-        data_parallel_size=data_parallel_size, tensor_parallel_size=tensor_parallel_size, **options,
-    )
-    return WeightPublisher(source, transport, **options)
+    transport = transport_type(data_parallel_size=data_parallel_size, tensor_parallel_size=tensor_parallel_size, **options)
+    return WeightPublisher(source, transport, control_group=control_group)

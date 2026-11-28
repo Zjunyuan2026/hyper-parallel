@@ -15,10 +15,9 @@
 """Model descriptions composed with the shared HP/vLLM execution components."""
 
 from rl.unified_execution.models.registry import (
-    component_family,
     get_model_family,
     model_families,
     resolve_runtime_symbol,
 )
 
-__all__ = ["component_family", "get_model_family", "model_families", "resolve_runtime_symbol"]
+__all__ = ["get_model_family", "model_families", "resolve_runtime_symbol"]

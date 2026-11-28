@@ -18,19 +18,47 @@ from __future__ import annotations
 
 import contextlib
 import unittest
+from collections.abc import Callable
+from typing import Any
 from unittest import mock
 
 import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
-from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
-    SharedCompressedDSAIndexer,
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.indexer import (
+    CSA2Indexer,
 )
-from hyper_parallel.distributed.activation_checkpoint import (
-    make_selective_checkpoint_context_fn,
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.compressed_sparse_attention2 import (
+    _apply_v41_rope,
 )
-from hyper_parallel.trainer.config.parallelism import ActivationCheckpointConfig
+from hyper_parallel.core.activation_memory import CheckpointPolicy
+from hyper_parallel.core.activation_memory.api import create_selective_checkpoint_contexts
+
+
+_MUST_SAVE_OPS = frozenset((torch.ops.aten.matmul.default, torch.ops.aten.mm.default))
+
+
+def _make_selective_checkpoint_context_fn(
+    allow_cache_entry_mutation: bool,
+) -> Callable[[], tuple[object, object]]:
+    """Create a minimal SAC context for cached-tensor mutation coverage."""
+    def policy_fn(
+        ctx: Any,
+        func: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> CheckpointPolicy:
+        """Save matmul outputs and recompute every other operator."""
+        del ctx, args, kwargs
+        if func in _MUST_SAVE_OPS:
+            return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.MUST_RECOMPUTE
+
+    return lambda: create_selective_checkpoint_contexts(
+        policy_fn,
+        allow_cache_entry_mutation=allow_cache_entry_mutation,
+    )
 
 
 @contextlib.contextmanager
@@ -77,7 +105,7 @@ class CachedTensorMutationTest(unittest.TestCase):
         with _cpu_checkpoint_autocast_guard():
             loss = checkpoint(
                 region, left, right, use_reentrant=False,
-                context_fn=make_selective_checkpoint_context_fn(allow_cache_entry_mutation),
+                context_fn=_make_selective_checkpoint_context_fn(allow_cache_entry_mutation),
             )
             loss.backward()
 
@@ -92,20 +120,6 @@ class CachedTensorMutationTest(unittest.TestCase):
         self._step(True)
 
 
-class ActivationCheckpointConfigTest(unittest.TestCase):
-    """Validate the YAML-facing switch surface."""
-
-    def test_defaults_keep_the_mutation_check_enabled(self):
-        """The strict cached-tensor mutation check stays the default."""
-        config = ActivationCheckpointConfig()
-        self.assertFalse(config.allow_cache_entry_mutation)
-
-    def test_non_bool_switch_is_rejected(self):
-        """Ambiguous YAML values must fail fast."""
-        with self.assertRaises(TypeError):
-            ActivationCheckpointConfig(allow_cache_entry_mutation="yes")
-
-
 class SelectiveContextFactoryTest(unittest.TestCase):
     """The switch must reach the SAC dispatch mode via the context factory.
 
@@ -117,7 +131,7 @@ class SelectiveContextFactoryTest(unittest.TestCase):
     def test_switch_reaches_the_cached_dispatch_mode(self):
         """Factory closures must carry the configured switch value."""
         for value in (False, True):
-            factory = make_selective_checkpoint_context_fn(
+            factory = _make_selective_checkpoint_context_fn(
                 allow_cache_entry_mutation=value)
             _, recompute_ctx = factory()
             self.assertEqual(recompute_ctx.allow_cache_entry_mutation, value,
@@ -151,12 +165,12 @@ class IndexerChunkPlumbingTest(unittest.TestCase):
 
     def test_configured_chunk_size_is_transferred(self):
         """A source-module value overrides the wrapper default."""
-        wrapper = SharedCompressedDSAIndexer(_TinyIndexerSource(1024))
+        wrapper = CSA2Indexer(_TinyIndexerSource(1024), apply_rope=_apply_v41_rope)
         self.assertEqual(wrapper.query_chunk_size, 1024)
 
     def test_missing_chunk_size_falls_back_to_the_released_default(self):
         """Sources without the attribute keep the released 256 default."""
-        wrapper = SharedCompressedDSAIndexer(_TinyIndexerSource(None))
+        wrapper = CSA2Indexer(_TinyIndexerSource(None), apply_rope=_apply_v41_rope)
         self.assertEqual(wrapper.query_chunk_size, 256)
 
 

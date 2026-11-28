@@ -20,10 +20,11 @@ from collections.abc import Mapping
 from math import lcm
 from typing import Any
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
-from hyper_parallel.components.modules.shared_compressed_dsa_attention import (
-    GraphPackedSequence, SharedCompressedPackedSequence,
+from hyper_parallel.components.modules.attention.compressed_sparse_attention2.document_layout import (
+    GraphPackedSequence,
+    SharedCompressedPackedSequence,
 )
 from hyper_parallel.data.batching.runtime_input import (
     RuntimeInputAdapter,

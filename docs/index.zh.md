@@ -21,11 +21,13 @@
 | [KDA 上下文并行](./guide/kda_context_parallel.zh.md) | KDA P2P、AllGather、Ulysses 及混合方式的配置与显存 |
 | [KDA 递归倍增与 Ulysses 混合 CP](./guide/kda_recursive_doubling.md) | RD 状态扫描、TND reset 剪枝与转移缓存 |
 | [线性注意力 TND 上下文并行](./guide/linear_attention_tnd_cp.md) | KDA / GDN 的文档边界、配置、状态交换与数值语义 |
-| [EP 专家并行](./guide/expert_parallel.zh.md) | ExpertParallel、MoE 构建模块、负载均衡 |
+| [EP 专家并行](./guide/expert_parallel.zh.md) | MoE recipe 和 token 派发 |
+| [算子后端选型与接入](./guide/op_select.zh.md) | YAML 配置、参考实现、后端支持矩阵与算子注册 |
 | [Activation Checkpoint / Swap](./guide/activation_checkpoint.zh.md) | checkpoint_wrapper、swap_wrapper、swap_tensor_wrapper、协同配置 |
 | [Optimizer](./guide/optimizer.zh.md) | AdamW、Muon、ChainedOptimizer、学习率调度器 |
 | [Chunk Loss](./guide/chunk_loss.zh.md) | 大词表输出投影与交叉熵分块、Trainer 和 Qwen3-MoE 接入 |
-| [DCP 分布式检查点](./guide/distributed_checkpoint.zh.md) | 检查点保存/加载、异步 staging、离线转换 |
+| [DCP 分布式检查点](./guide/high_availability/distributed_checkpoint.zh.md) | 检查点保存/加载、异步 staging、离线转换 |
+| [进程级快恢](./guide/high_availability/process_recovery.zh.md) | 基于等价副本的 worker 恢复、Trainer 配置和使用限制 |
 | [自动并行](./guide/auto_parallel.zh.md) | SAPP-ND、SAPP-PPB |
 | [LlamaFactory + HyperParallel SFT 训练](./guide/llama_factory_hyperparallel_sft_guide.zh.md) | 基于 LlamaFactory 和 HyperParallel 的 SFT 配置、启动、精度与性能验证 |
 | [模型接入验证使用指南](./guide/trainer/model_integration_validation.zh.md) | Adapter 声明、结构检查、模块对齐、精度矩阵与证据报告 |
@@ -49,6 +51,8 @@
 |------|------|
 | [开发环境搭建](./contributing/dev_environment.zh.md) | 开发环境配置、依赖安装 |
 | [测试流程规范](./contributing/testing.zh.md) | 测试框架、标记规范、分布式测试 |
+| [OpSelect 算子开发与验收](./contributing/op_select_development.zh.md) | 计算契约、后端接入、native 精度基线及模块和性能验收 |
+| [OpSelect开发事项](./contributing/op_select_tasks.zh.md) | PR 分支基准、多后端验收与 function/module/网络整改分工 |
 | [发布流程规范](./contributing/release.zh.md) | 版本发布流程、文档更新规范 |
 
 ## 其他

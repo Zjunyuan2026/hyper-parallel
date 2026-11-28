@@ -22,8 +22,8 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import replace
 from typing import Any
 
-import torch  # pylint: disable=forbidden-backend-import
-from torch.utils.data import IterableDataset, default_collate  # pylint: disable=forbidden-backend-import
+import torch
+from torch.utils.data import IterableDataset, default_collate
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from hyper_parallel.data.batching.dynamic_batch import (
@@ -41,7 +41,7 @@ from hyper_parallel.data.parallel.batch_sampler import (
     get_sampler_checkpoint_state, has_torchdata_state, sampler_optimizer_step_progress, sampler_state_for_load,
 )
 
-from hyper_parallel.distributed_data import (
+from hyper_parallel.data.distributed import (
     BalancingAlgorithm,
     CostModel,
     DistributedDatasetConfig,
@@ -106,7 +106,7 @@ def _resolve_load_balance(
     """Validate the balancing block and reject obsolete Dataset-side settings."""
     removed_options = {
         "load_balance", "distributed_dataloader", "balance_window_size", "device_prefetch_depth",
-        "log_balance", "min_balance_gain", "repack_sequences",
+        "log_balance", "min_balance_gain", "repack_sequences", "use_data_process",
     }.intersection(data_config)
     if removed_options:
         raise ValueError(f"Move data_config balancing options {sorted(removed_options)} to dataloader.load_balance")
@@ -478,6 +478,12 @@ class FixedBatchDataLoader(StatefulDataLoader):
         Args:
             state_dict: State saved by the ordinary or balanced native loader.
         """
+        # The training frame may still retain the old iterator during rollback.
+        # Stop its producers before torchdata drops the loader's iterator reference.
+        iterator = self._iterator
+        if self.num_workers > 0 and iterator is not None:
+            # torchdata exposes worker shutdown only through its iterator's private API.
+            iterator._shutdown_workers()  # pylint: disable=protected-access
         sampler = get_sampler_checkpoint_state(state_dict)
         snapshot = state_dict.get("_snapshot", {}).get("_main_snapshot", {})
         native_sampler = sampler if sampler is not None else snapshot.get("_index_sampler_state")

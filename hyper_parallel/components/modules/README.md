@@ -7,7 +7,7 @@ Python or declaratively replace existing model modules through Trainer YAML.
 
 | Category | Modules |
 | --- | --- |
-| Attention | `GQAAttention`, `GatedGQAAttention`, `MLAAttention`, `DSAAttention`, `DeepseekV32DSAAttention` |
+| Attention | `GroupedQueryAttention`, `GatedGroupedQueryAttention`, `MultiLatentAttention`, `GatedMultiLatentAttention`, `DeepseekSparseAttention` |
 | MoE and MLP | `GroupedExperts`, `SharedExpert`, `SwiGLUMLP` |
 | Normalization | `RMSNorm`, `OffsetRMSNorm` |
 | MHC | `MhcPreModule`, `MhcPostModule` |
@@ -26,12 +26,44 @@ output = norm(hidden_states)
 ## Module families
 
 Registered module families select an implementation from explicit configuration rules before model construction.
-See [Module Family](README.module_family.md) for GroupedExperts MXFP8 examples, rule semantics, and extension guidance.
+The public [GroupedExperts family](moe/grouped_experts/README.md) selects local or EP execution.
+See [Module Family](README.module_family.md) for legacy MXFP8 examples, rule semantics, and extension guidance.
+
+For attention replacement parameters, topology settings and framework-injected arguments, see
+[Attention YAML configuration](attention/readme.md). The
+[DeepSeek Sparse Attention guide](attention/deepseek_sparse_attention/readme.md) explains native `config=`
+construction, source-module replacement, and CP / TP support.
+
+## Attention families
+
+Choose an attention family for the model's mathematical variant:
+
+| Family | Features and guide |
+| --- | --- |
+| [GroupedQueryAttention](attention/grouped_query_attention/README.md) | GQA with fused or separate QKV; Ulysses, KV AllGather and hybrid CP with input overlap |
+| [GatedGroupedQueryAttention](attention/gated_grouped_query_attention/README.md) | Qwen3.5 full attention with RoPE and a sigmoid output gate |
+| [MultiLatentAttention](attention/multi_latent_attention/README.md) | MLA with expanded or latent KV communication and supported forward/backward overlap |
+| [GatedMultiLatentAttention](attention/gated_multi_latent_attention/README.md) | NoPE MLA with an independent output gate and gate-aware CP scheduling |
+| [DeepseekSparseAttention](attention/deepseek_sparse_attention/readme.md) | DeepSeek-V3.2 sparse attention, native construction and KV-AllGather CP |
+
+Each guide includes a YAML fragment, configuration choices, file responsibilities, the execution flow and support limits.
+Families support direct `config=` construction or `module=` conversion from a compatible source.
+Trainer YAML selects the family through `replace.implementation._target_`; `accelerator.cp_size` selects its local or CP member.
+
+```text
+YAML / config → family selection and layout → framework binding → shared attention forward
+```
+
+The algorithm owns the math and shared forward; the CP member handles input exchange and output restoration.
+TP/SP uses the framework's existing layout redistribution. Model/runtime inputs must provide the position information
+and document boundaries required by the selected attention family. Full training recipes are linked from the guides.
 
 ## Install custom operators
 
 Some modules depend on the training operators from [Omni Ops](https://gitee.com/omniai/omni-ops). Ensure that CANN,
-PyTorch and `torch_npu` are compatible before building the operators.
+PyTorch and `torch_npu` are compatible before building the operators. MHC functions default to the CANN
+ops-transformer operators instead (see `hyper_parallel/components/functional/README.md`); Omni Ops remains the
+deprecated `backend="omni"` fallback for them and the operator source for other Omni-only paths.
 
 ```bash
 git clone https://gitee.com/omniai/omni-ops.git
@@ -94,7 +126,7 @@ plan_overrides:
       source_type: transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextAttention
       exact_type: true
       implementation:
-        _target_: hyper_parallel.components.modules.GQAAttention
+        _target_: hyper_parallel.components.modules.GroupedQueryAttention
 
   - match: "*.language_model.layers.*.mlp.experts"
     replace:
@@ -123,8 +155,9 @@ plan_overrides:
 
 Invalid patterns, incompatible module types and unavailable weight conversions raise an error.
 
-Replacements use `make_transforms()` only when parameter names or layouts change. Otherwise, they reuse the source
-parameters directly.
+Replacements declare checkpoint conversion through `make_transforms()` and can retain source parameter identity.
+A replacement with a custom `reset_parameters()` must also declare `make_transforms()`, returning an empty list
+when no conversion is needed. The builder then arranges its reset after meta parameters are materialized.
 
 ## Run training
 

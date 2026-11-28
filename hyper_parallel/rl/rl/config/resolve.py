@@ -24,7 +24,7 @@ from rl.config.schema import (
     _trainer_topology, build_model_registration, optional_mapping, required_mapping, router_replay_mode,
 )
 from rl.config.validate import _validate_model_scope
-from rl.unified_execution.core.contract import build_unified_payload
+from rl.unified_execution.contract import build_unified_payload
 from hyper_parallel.components.checkpoint.config import CheckpointingConfig
 from hyper_parallel.components.optim import AdamW, MultiLRScheduler
 from hyper_parallel.models import HyperAutoModelForCausalLM
@@ -289,6 +289,14 @@ def build_runtime_config(
     mixed_precision_enabled = bool(mixed_precision_config.get("enabled", True))
     backend = _runtime_backend(train_config, accelerator_config)
 
+    checkpoint_policy = accelerator_config.get("activation_checkpoint", "off")
+    if isinstance(checkpoint_policy, Mapping):
+        activation_checkpoint = resolve_component(
+            checkpoint_policy, annotation=ActivationCheckpointConfig, path="train.accelerator.activation_checkpoint",
+        )
+    else:
+        activation_checkpoint = ActivationCheckpointConfig(mode=_activation_checkpoint_mode(accelerator_config))
+
     return TrainerConfig(
         model=_build_model_target(
             model_config, param_dtype_name, mixed_precision_enabled,
@@ -316,8 +324,6 @@ def build_runtime_config(
             accelerator_config, mixed_precision_config, dp_shard
         ),
         mixed_precision=MixedPrecisionConfig(enabled=mixed_precision_enabled),
-        activation_checkpoint=ActivationCheckpointConfig(
-            mode=_activation_checkpoint_mode(accelerator_config)
-        ),
+        activation_checkpoint=activation_checkpoint,
         checkpoint=_build_checkpoint_config(checkpoint_config),
     )

@@ -52,7 +52,7 @@ YAML 解析结果为 `list[PlanOverride]`；Trainer 侧先归一化为替换规�
 2. `replace.implementation` 指向训练环境可导入的替换工厂；静态参数可用 `{_target_: 路径, ...}` 映射填写。
 3. 工厂使用 `@module_replacement`，声明 `module`、`module_fqn`、`context` 三个参数，并返回 `torch.nn.Module`。
 
-完整实现可参考 [`RMSNorm`](../../../hyper_parallel/components/modules/rms_norm.py#L31-L82)。
+完整实现可参考 [`RMSNorm`](../../../hyper_parallel/components/modules/common/rms_norm.py#L269)。
 
 模型族 adapter 按职责统一划分：模块/权重转换位于 `adapter/conversion/`，数据编码、processor、
 transform 和 runtime-input 位于 `adapter/data/`，模型前向合约位于 `adapter/runtime/`，CP/EP
@@ -163,7 +163,7 @@ optimizer:
 
 | 配置字段 | 构建位置 | Trainer 提供的运行时参数 |
 |---|---|---|
-| `model` | [`BaseTrainer._build_model()`](../../../hyper_parallel/trainer/base.py#L285-L314) | `distributed_setup`、`peft_config`、`activation_checkpoint`、`activation_swap`、`compile_config` |
+| `model` | [`BaseTrainer._build_model()`](../../../hyper_parallel/trainer/base.py#L285-L314) | `distributed_setup`、`peft_config`、`activation_checkpoint`、`compile_config` |
 | `dataset` | [`BaseTrainer._build_dataset()`](../../../hyper_parallel/trainer/base.py#L334-L349) | `transform`、`tokenizer`、`mesh_context`、`training_config` |
 | `dataloader` | [`BaseTrainer._build_dataloader()`](../../../hyper_parallel/trainer/base.py#L354-L370) → [`build_dataloader()`](../../../hyper_parallel/data/batching/build_dataloader.py#L171-L269) | `dataset`、构建后的 `collate_fn`、`batch_sampler`、`batch_size`、`dp_world_size`、`max_seq_len`、`seed` |
 | `optimizer` | [`BaseTrainer._build_optimizer()`](../../../hyper_parallel/trainer/base.py#L405-L414) | `model` |

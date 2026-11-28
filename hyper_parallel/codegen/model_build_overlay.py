@@ -13,33 +13,30 @@
 # limitations under the License.
 # ============================================================================
 """Codegen-owned model observation layered over the native AutoModel API."""
-# pylint: disable=forbidden-backend-import
 
+from collections.abc import Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import inspect
 import random
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 import torch
 
 from hyper_parallel.codegen.manager import ensure_codegen_artifact_from_snapshot
 from hyper_parallel.codegen.session import CodegenBuildSession
-from hyper_parallel.components.checkpoint.weight_conversion import get_model_conversion_mapping
+from hyper_parallel.components.modules.module_family import get_family_build_info
 from hyper_parallel.core.dtensor.init_weights import init_empty_weights
 from hyper_parallel.distributed._builder.applier import (
     _get_active_mesh,
     _preflight_compute_injection,
 )
 from hyper_parallel.models._transformers import auto_model, model_builder
-from hyper_parallel.models import replacement as replacement_api
-from hyper_parallel.models.registry import get_model_adapter
+from hyper_parallel.models import module_build, replacement as replacement_api
 
 
-def _prepare_model_source_compat(hf_config: Any) -> None:
+def _prepare_model_source_compat(adapter: Any) -> None:
     """Run an optional model-owned compatibility hook before construction."""
-    model_type = getattr(hf_config, "model_type", None)
-    adapter = get_model_adapter(model_type) if model_type else None
     loader = getattr(adapter, "codegen", None) if adapter is not None else None
     provider = loader() if loader is not None else None
     prepare = getattr(provider, "prepare_model_import", None)
@@ -53,6 +50,7 @@ class CodegenModelBuildResult:
 
     artifact_layout: Optional[Any] = None
     snapshot: Optional[Any] = None
+    model: Optional[Any] = field(default=None, repr=False)
 
 
 @contextmanager
@@ -62,6 +60,11 @@ def _codegen_model_init_context() -> Iterator[None]:
         True
     ):
         yield
+
+
+def _codegen_current_device() -> torch.device:
+    """Preserve the target backend without querying an ordinal that lazily initializes it."""
+    return torch.device(auto_model.get_device_type())
 
 
 def _record_source(
@@ -98,78 +101,99 @@ def _observe_replacements(
     session: CodegenBuildSession,
 ) -> Any:
     """Apply native replacement declarations while recording their result."""
-    weights_mapping = get_model_conversion_mapping(model)
-    specs = tuple(getattr(distributed_setup, "module_replacements", None) or ())
+    specs = list(getattr(distributed_setup, "module_replacements", None) or ())
+    original_compile = module_build.compile_module_replacements
+
+    def _observe_compile(*args: Any, **kwargs: Any) -> Any:
+        plan = original_compile(*args, **kwargs)
+        specs[:] = plan.specs
+        return plan
+
+    module_build.compile_module_replacements = _observe_compile
     try:
-        with _observe_replacement_installations(model, specs) as applications:
-            model, _ = replacement_api._apply_module_replacement_actions(  # pylint: disable=protected-access
-                model,
-                specs,
-                weights_mapping=weights_mapping,
-                context=model_builder._build_replacement_context(  # pylint: disable=protected-access
-                    distributed_setup,
-                    low_precision_config,
-                ),
-                capture_checkpoint_metadata=load_base_model,
+        with _observe_replacement_installations(specs) as applications:
+            model, _ = model_builder._maybe_apply_module_replacements(  # pylint: disable=protected-access
+                model, distributed_setup, low_precision_config, load_base_model,
             )
     except replacement_api.ModuleReplacementMatchError as exc:
         session.record_replacements(
             declarations=replacement_api.describe_replacement_declarations(specs),
-            applications=(),
-            unmatched=exc.unmatched,
+            applications=(), unmatched=exc.unmatched,
         )
         raise
+    finally:
+        module_build.compile_module_replacements = original_compile
     session.record_replacements(
         declarations=replacement_api.describe_replacement_declarations(specs),
-        applications=applications,
-        unmatched=(),
+        applications=applications, unmatched=(),
     )
     return model
 
 
 @contextmanager
-def _observe_replacement_installations(
-    model: Any,
-    specs: tuple[Any, ...],
-) -> Iterator[list[dict[str, Any]]]:
-    """Observe native replacement installation without changing its API."""
+def _observe_replacement_installations(specs: Sequence[Any]) -> Iterator[list[dict[str, Any]]]:
+    """Record metadata only after the shared installer commits a prepared candidate."""
     applications: list[dict[str, Any]] = []
     spec_indexes = {id(spec): index for index, spec in enumerate(specs)}
-    original_install = replacement_api._install_replacement_target  # pylint: disable=protected-access
+    pending = {}
+    original_prepare = replacement_api._prepare_replacement_target  # pylint: disable=protected-access
+    original_install = replacement_api._install_module_candidates  # pylint: disable=protected-access
 
-    def _observe_install(*args: Any, **kwargs: Any) -> None:
-        """Record the source and result of the one native installation call."""
-        target = args[1]
-        transforms = args[3]
-        transform_count = len(transforms)
-        source_type = _symbol_path(type(target.source))
-        original_install(*args, **kwargs)
-        replacement = model.get_submodule(target.module_fqns[0])
-        applications.append({
-            "rule_id": replacement_api._replacement_rule_id(  # pylint: disable=protected-access
-                target.spec,
-                spec_indexes.get(id(target.spec), 0),
-            ),
+    def _observe_prepare(target: Any, *args: Any, **kwargs: Any) -> Any:
+        candidate, transforms = original_prepare(target, *args, **kwargs)
+        if id(target.spec) not in spec_indexes:
+            spec_indexes.update({id(spec): index for index, spec in enumerate(specs)})
+        index = spec_indexes.setdefault(id(target.spec), len(spec_indexes))
+        pending[(target.module_fqns, id(candidate))] = {
+            "rule_id": replacement_api._replacement_rule_id(target.spec, index),  # pylint: disable=protected-access
             "module_fqns": list(target.module_fqns),
             "primary_fqn": target.module_fqns[0],
-            "source_type": source_type,
-            "replacement_type": _symbol_path(type(replacement)),
-            "weight_transforms": [
-                _symbol_path(type(transform))
-                for transform in transforms[transform_count:]
-            ],
-        })
+            "source_type": replacement_api._symbol_path(type(target.source)),
+            "replacement_type": replacement_api._symbol_path(type(candidate)),
+            "weight_transforms": [replacement_api._symbol_path(type(transform)) for transform in transforms],
+        }
+        family = get_family_build_info(candidate)
+        if family is not None:
+            # Model depth is needed by expert constructors even when their source
+            # does not retain a config. Keep the native result without runtime owners.
+            context = args[0] if args else kwargs["context"]
+            construction_context = {f"{axis}_size": size for axis, size in family.resolved.axis_sizes.items()}
+            if context.get("num_layers") is not None:
+                construction_context["num_layers"] = context["num_layers"]
+            pending[(target.module_fqns, id(candidate))]["family_request"] = {
+                "factory": replacement_api._symbol_path(family.request.target),  # pylint: disable=protected-access
+                "kwargs": dict(family.request.kwargs),
+                "context": construction_context,
+            }
+        return candidate, transforms
 
-    replacement_api._install_replacement_target = _observe_install  # pylint: disable=protected-access
+    def _observe_install(root: Any, candidates: Any) -> Any:
+        candidates = tuple(candidates)
+        source_scopes = {}
+        for fqn, module in root.named_modules(remove_duplicate=False):
+            source_scopes.setdefault(replacement_api._symbol_path(type(module)), []).append(fqn)
+        result = original_install(root, candidates)
+        for fqns, _, candidate in candidates:
+            record = pending.pop((fqns, id(candidate)), None)
+            if record is not None:
+                record["construction"] = {
+                    "implementation": record["replacement_type"],
+                    "source_fqns": sorted(source_scopes.get(record["source_type"], [])),
+                }
+                if hasattr(candidate, "rms_norm_cast_order"):
+                    record["construction"]["arguments"] = {
+                        "cast_order": candidate.rms_norm_cast_order, "fp32_weight": candidate.fp32_weight,
+                    }
+                applications.append(record)
+        return result
+
+    replacement_api._prepare_replacement_target = _observe_prepare  # pylint: disable=protected-access
+    replacement_api._install_module_candidates = _observe_install  # pylint: disable=protected-access
     try:
         yield applications
     finally:
-        replacement_api._install_replacement_target = original_install  # pylint: disable=protected-access
-
-
-def _symbol_path(symbol: Any) -> str:
-    """Return a stable import path for an observed runtime type."""
-    return f"{symbol.__module__}:{symbol.__qualname__}"
+        replacement_api._prepare_replacement_target = original_prepare  # pylint: disable=protected-access
+        replacement_api._install_module_candidates = original_install  # pylint: disable=protected-access
 
 
 def _observe_plan(
@@ -193,9 +217,10 @@ def _observe_plan(
     if mesh.device_mesh is None:
         session.mark_not_required("device_mesh_unavailable")
         return
-    if is_hf_model and not model_sharding_requested:
+    if (is_hf_model and not model_sharding_requested
+            and not model_builder._has_module_owned_layouts(model)):  # pylint: disable=protected-access
         if session.has_replacement_applications:
-            _record_replacement_only_plan(mesh, session)
+            session.observe_plan(None, None, mesh)
         else:
             session.mark_not_required("pure_data_parallel")
         return
@@ -211,32 +236,6 @@ def _observe_plan(
     active_mesh = _get_active_mesh(mesh.device_mesh, plan.mesh_dim_names)
     _preflight_compute_injection(plan, active_mesh, model=model)
     session.observe_plan(plan, model, mesh)
-
-
-def _record_replacement_only_plan(
-    mesh: Any,
-    session: CodegenBuildSession,
-) -> None:
-    """Derive an emitter snapshot when replacement is the only source patch."""
-    session.record_plan({
-        "param_plan": {},
-        "boundary_classes": {},
-        "boundary_types": {},
-        "nested_components": [],
-        "mesh_dim_names": [],
-        "injections": [],
-        "parallel_dims": {
-            "dp_size": getattr(mesh, "dp_size", 1) if mesh is not None else 1,
-            "tp_size": getattr(mesh, "tp_size", 1) if mesh is not None else 1,
-            "cp_size": getattr(mesh, "cp_size", 1) if mesh is not None else 1,
-            "pp_size": getattr(mesh, "pp_size", 1) if mesh is not None else 1,
-            "ep_size": getattr(mesh, "ep_size", 1) if mesh is not None else 1,
-            "sequence_parallel": bool(
-                getattr(mesh, "sequence_parallel", False)
-            ),
-            "loss_parallel": bool(getattr(mesh, "loss_parallel", False)),
-        },
-    })
 
 
 def _publish_session(
@@ -259,7 +258,10 @@ def _publish_session(
     return session.finish(_publish)
 
 
-def _codegen_build_model(session: CodegenBuildSession, artifact_dir: Optional[str], result: CodegenModelBuildResult):
+def _codegen_build_model(
+    session: CodegenBuildSession, artifact_dir: Optional[str], result: CodegenModelBuildResult,
+    on_observed: Optional[Callable[[Any], None]] = None,
+):
     """Create the classmethod used only while the CLI constructs a meta model."""
     def _build_model(
         cls,
@@ -281,10 +283,6 @@ def _codegen_build_model(session: CodegenBuildSession, artifact_dir: Optional[st
         compile_config=None,
         freeze_config=None,
         activation_checkpoint=None,
-        activation_checkpoint_selection=None,
-        swap_inputs=False,
-        allow_cache_entry_mutation=False,
-        activation_swap="none",
         model_init_dtype=None,
         **kwargs,
     ) -> Any:
@@ -294,11 +292,9 @@ def _codegen_build_model(session: CodegenBuildSession, artifact_dir: Optional[st
             validate_placement,
             compile_config,
             activation_checkpoint,
-            activation_checkpoint_selection,
-            swap_inputs,
-            allow_cache_entry_mutation,
-            activation_swap,
-            model_init_dtype,
+        )
+        factory, context = auto_model._resolve_module_construction(  # pylint: disable=protected-access
+            kwargs, hf_config, distributed_setup, model_init_dtype or torch_dtype,
         )
         init_kwargs = auto_model._model_init_kwargs(  # pylint: disable=protected-access
             dict(kwargs),
@@ -306,18 +302,18 @@ def _codegen_build_model(session: CodegenBuildSession, artifact_dir: Optional[st
         )
         if "trust_remote_code" in kwargs:
             init_kwargs["trust_remote_code"] = kwargs["trust_remote_code"]
-        _prepare_model_source_compat(hf_config)
+        _prepare_model_source_compat(context["model_spec"])
         with _codegen_model_init_context():
-            _, model = auto_model._init_model(  # pylint: disable=protected-access
-                cls,
-                None,
-                hf_config,
-                attn_implementation,
-                torch_dtype,
-                is_hf_model,
-                *model_args,
-                **init_kwargs,
-            )
+            if factory is not None:
+                if model_args:
+                    raise ValueError("model_factory uses config and context, not additional positional model arguments")
+                model = auto_model.construct_family_model(factory, hf_config, context=context)
+            else:
+                _, model = auto_model._init_model(  # pylint: disable=protected-access
+                    cls, None, hf_config, attn_implementation, torch_dtype, is_hf_model,
+                    *model_args, **init_kwargs,
+                )
+                auto_model.attach_build_context(model, context)
         _record_source(
             session,
             model,
@@ -337,25 +333,22 @@ def _codegen_build_model(session: CodegenBuildSession, artifact_dir: Optional[st
             load_base_model,
             session,
         )
+        model_builder._tie_model_weights_before_parallelism(model)  # pylint: disable=protected-access
         if freeze_config is not None:
             model_builder._apply_parameter_freezing(  # pylint: disable=protected-access
                 model,
                 freeze_config,
             )
-        method_context = model_builder._build_replacement_context(  # pylint: disable=protected-access
-            distributed_setup,
-            getattr(distributed_setup, "low_precision_config", None),
-        )
-        method_context["mesh_context"] = getattr(distributed_setup, "mesh_context", None)
-        model_builder.apply_method_replacements(
-            model,
-            getattr(distributed_setup, "method_replacements", None) or (),
-            context=method_context,
+        model_builder._apply_model_method_replacements(  # pylint: disable=protected-access
+            model, distributed_setup, getattr(distributed_setup, "low_precision_config", None),
         )
         _observe_plan(model, mesh, sharding_planner, is_hf_model, session)
-        snapshot = _publish_session(session, artifact_dir, result)
-        result.snapshot = snapshot
-        model._hp_codegen_snapshot = snapshot  # pylint: disable=protected-access
+        if on_observed is not None:
+            on_observed(model)
+        else:
+            snapshot = _publish_session(session, artifact_dir, result)
+            result.snapshot = snapshot
+            model._hp_codegen_snapshot = snapshot  # pylint: disable=protected-access
         model.train()
         return model
 
@@ -366,18 +359,44 @@ def _codegen_build_model(session: CodegenBuildSession, artifact_dir: Optional[st
 def use_codegen_model_build_overlay(
     session: CodegenBuildSession,
     artifact_dir: Optional[str] = None,
+    *,
+    defer_publish: bool = False,
 ) -> Iterator[CodegenModelBuildResult]:
-    """Temporarily replace AutoModel's final build step for offline codegen."""
+    """Temporarily replace AutoModel's final build step for offline codegen.
+
+    Args:
+        session: Build session receiving native observations and emitted artifacts.
+        artifact_dir: Optional output directory for generated sources.
+        defer_publish: Observe and publish after the configured outer factory returns.
+    """
     model_class = auto_model._BaseHyperAutoModelClass  # pylint: disable=protected-access
     original = model_class.__dict__["_build_model"]
+    original_device = auto_model._current_device  # pylint: disable=protected-access
     result = CodegenModelBuildResult()
+    pending = []
+
+    def _defer(model: Any) -> None:
+        """Keep live references only inside this factory observation scope."""
+        result.model = model
+        pending.append((model, {fqn: module.forward for fqn, module in model.named_modules()}))
+
     model_class._build_model = classmethod(  # pylint: disable=protected-access
-        _codegen_build_model(session, artifact_dir, result)
+        _codegen_build_model(session, artifact_dir, result, _defer if defer_publish else None)
     )
+    auto_model._current_device = _codegen_current_device  # pylint: disable=protected-access
     try:
         yield result
+        if pending:
+            model, originals = pending.pop()
+            if result.model is not model:
+                raise RuntimeError("codegen outer factory returned a different model root")
+            session.observe_final_forwards(model, originals)
+            result.snapshot = _publish_session(session, artifact_dir, result)
     finally:
+        pending.clear()
+        result.model = None
         model_class._build_model = original  # pylint: disable=protected-access
+        auto_model._current_device = original_device  # pylint: disable=protected-access
 
 
 __all__ = ["CodegenModelBuildResult", "use_codegen_model_build_overlay"]

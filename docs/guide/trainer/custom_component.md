@@ -52,7 +52,7 @@ YAML parsing produces `list[PlanOverride]`. The Trainer normalizes this into rep
 2. `replace.implementation` points to a replacement factory importable in the training environment. Supply static arguments with a `{_target_: path, ...}` mapping.
 3. Decorate the factory with `@module_replacement`, declare `module`, `module_fqn`, and `context` parameters, and return a `torch.nn.Module`.
 
-See [`RMSNorm`](../../../hyper_parallel/components/modules/rms_norm.py#L31-L82) for a complete implementation.
+See [`RMSNorm`](../../../hyper_parallel/components/modules/common/rms_norm.py#L269) for a complete implementation.
 
 Model-family adapters are organized by responsibility: module/weight conversion in `adapter/conversion/`; data encoding, processors,
 transforms, and runtime inputs in `adapter/data/`; model forward contracts in `adapter/runtime/`; CP/EP
@@ -163,7 +163,7 @@ See [`AdamW`](../../../hyper_parallel/components/optim/builders.py#L37-L107) for
 
 | Configuration field | Construction site | Runtime arguments supplied by the Trainer |
 |---|---|---|
-| `model` | [`BaseTrainer._build_model()`](../../../hyper_parallel/trainer/base.py#L285-L314) | `distributed_setup`, `peft_config`, `activation_checkpoint`, `activation_swap`, `compile_config` |
+| `model` | [`BaseTrainer._build_model()`](../../../hyper_parallel/trainer/base.py#L285-L314) | `distributed_setup`, `peft_config`, `activation_checkpoint`, `compile_config` |
 | `dataset` | [`BaseTrainer._build_dataset()`](../../../hyper_parallel/trainer/base.py#L334-L349) | `transform`, `tokenizer`, `mesh_context`, `training_config` |
 | `dataloader` | [`BaseTrainer._build_dataloader()`](../../../hyper_parallel/trainer/base.py#L354-L370) → [`build_dataloader()`](../../../hyper_parallel/data/batching/build_dataloader.py#L171-L269) | `dataset`, constructed `collate_fn`, `batch_sampler`, `batch_size`, `dp_world_size`, `max_seq_len`, `seed` |
 | `optimizer` | [`BaseTrainer._build_optimizer()`](../../../hyper_parallel/trainer/base.py#L405-L414) | `model` |

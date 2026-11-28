@@ -94,6 +94,7 @@ class ParameterGradientComparison:
         self.output.mkdir(parents=True, exist_ok=True)
 
     def _full(self, value: torch.Tensor) -> torch.Tensor:
+        """Reconstruct a logical tensor and verify its digest on every rank."""
         # Match weight publication: stage offloaded shards on the collective device.
         staged = value.detach().to(device=self.device)
         tensor = staged.full_tensor() if hasattr(staged, 'full_tensor') else staged
@@ -118,6 +119,7 @@ class ParameterGradientComparison:
             torch.set_num_threads(threads)
 
     def _evaluate(self, index: int, phase: str, value: torch.Tensor) -> dict:
+        """Save a reference tensor or compare the corresponding parameter phase."""
         print(f'CP parameter check: phase={phase} index={index} name={self.parameters[index][0]}', flush=True)
         path = f'{index:04d}-{phase}.pt'
         if self.reference is None:
@@ -212,6 +214,7 @@ class ParameterGradientComparison:
         self._check('updated')
 
     def _check(self, phase: str) -> None:
+        """Publish rank zero's parameter report and propagate failure to every rank."""
         passed = True
         if self.rank == 0:
             passed = all(row[phase].get('passed', row[phase]['finite']) for row in self.rows)

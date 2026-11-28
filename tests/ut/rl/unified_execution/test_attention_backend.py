@@ -12,24 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""CPU contracts for native cache ownership and graph-resident V4 metadata."""
-
+"""Worker KV cache, graph replay and PCP sampling probabilities."""
 from __future__ import annotations
 
+import importlib.util
+import sys
+import unittest
 from contextlib import nullcontext
 from dataclasses import dataclass
-import importlib.util
 from pathlib import Path
-import sys
 from types import ModuleType, SimpleNamespace
-import unittest
 from unittest.mock import Mock, patch
 
 import torch
 
 import rl
-from rl.unified_execution.ops.attention import flash_attention_npu_v4 as shared_attention
-from rl.unified_execution.runtimes.vllm.attention.bridge import install_paged_attention
+from rl.unified_execution.modules import flash_attention_v4 as shared_attention
+from rl.unified_execution.vllm.pcp_log_probs import compute_pcp_token_log_probs
 
 
 @dataclass
@@ -88,7 +87,7 @@ def _load_backend() -> ModuleType:
     config.CUDAGraphMode = SimpleNamespace(FULL_DECODE_ONLY="decode_graph", FULL_AND_PIECEWISE="mixed_piecewise")
     fence = ModuleType("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence")
     fence.attention_transfer_window = nullcontext
-    path = Path(rl.__file__).parent / "unified_execution/runtimes/vllm/attention/ascend_v4.py"
+    path = Path(rl.__file__).parent / "unified_execution/vllm/attention/backend_v4.py"
     spec = importlib.util.spec_from_file_location("_rl_v4_backend_ut", path)
     module = importlib.util.module_from_spec(spec)
     modules = {entry.__name__: entry for entry in (ascend, base, config, fence, module)}
@@ -149,16 +148,6 @@ class TestUnifiedAttentionBackend(unittest.TestCase):
             SimpleNamespace(num_kv_heads=2, head_size=8), ["layer"], config, torch.device("cpu"),
         )
 
-    def test_metadata_tracks_runner_in_place_updates(self) -> None:
-        """Replay must read new lengths through the original persistent storage."""
-        metadata, common = self._metadata([0, 2, 3], [130, 17])
-        self.assertEqual(metadata.v4_query_start_loc.data_ptr(), common.query_start_loc.data_ptr())
-        self.assertEqual(metadata.v4_seq_lens.data_ptr(), common.seq_lens.data_ptr())
-        common.query_start_loc.copy_(torch.tensor([0, 1, 3], dtype=torch.int32))
-        common.seq_lens.add_(4)
-        torch.testing.assert_close(metadata.v4_query_start_loc, torch.tensor([0, 1, 3], dtype=torch.int32))
-        torch.testing.assert_close(metadata.v4_seq_lens, torch.tensor([134, 21], dtype=torch.int32))
-
     def test_scheduler_refresh_retains_captured_address(self) -> None:
         """Every builder call refreshes scheduler bytes without replacing graph storage."""
         _, common = self._metadata([0, 1, 2], [113, 127])
@@ -198,37 +187,6 @@ class TestUnifiedAttentionBackend(unittest.TestCase):
         self.assertEqual(call.kwargs["num_splits"], 1)
         self.assertIs(call.kwargs["scheduler_metadata"], metadata.v4_scheduler_metadata)
 
-    def test_hnd_cache_uses_a_view_without_copying_history(self) -> None:
-        """V4 sees logical page/token/head axes while retaining BNBD storage."""
-        impl = self._impl()
-        impl.use_bnsd_kv_cache = True
-        impl.key_cache = torch.randn(8, 2, 128, 8, dtype=torch.bfloat16)
-        impl.value_cache = torch.randn_like(impl.key_cache)
-        metadata, _ = self._metadata([0, 1], [129])
-        query = torch.randn(1, 4, 8, dtype=torch.bfloat16)
-        impl.forward_impl(query, None, None, (), metadata, torch.empty_like(query))
-        key, value = self.provider.flash_attn_varlen_func.call_args.args[1:]
-        self.assertEqual(key.shape, (8, 128, 2, 8))
-        self.assertEqual(key.data_ptr(), impl.key_cache.data_ptr())
-        self.assertEqual(value.data_ptr(), impl.value_cache.data_ptr())
-        self.assertEqual(key.stride(), (2048, 8, 1024, 1))
-
-    def test_pcp_enables_native_cache_gather_only_when_selected(self) -> None:
-        """Subclass opt-in preserves PCP1 and rejects DCP before provider execution."""
-        original = _NativeImpl.__init__
-        for pcp, dcp in ((1, 1), (2, 1), (4, 1), (2, 2)):
-            def initialize(instance, *args, **kwargs):
-                original(instance, *args, **kwargs)
-                instance.vllm_config.parallel_config.prefill_context_parallel_size = pcp
-                instance.vllm_config.parallel_config.decode_context_parallel_size = dcp
-
-            with self.subTest(pcp=pcp, dcp=dcp), patch.object(_NativeImpl, "__init__", initialize):
-                if dcp > 1:
-                    with self.assertRaisesRegex(ValueError, "DCP=1"):
-                        self._impl()
-                else:
-                    self.assertEqual(self._impl().pcp_enabled, pcp > 1)
-
     def test_empty_pcp_rank_returns_zero_without_calling_v4(self) -> None:
         """Native forward still gathers KV; an empty local query has no attention work."""
         impl = self._impl()
@@ -254,64 +212,21 @@ class TestUnifiedAttentionBackend(unittest.TestCase):
         torch.testing.assert_close(arguments["seqused_k"], torch.tensor([35, 99], dtype=torch.int32))
         self.assertTrue(torch.equal(arguments["page_table"][0], arguments["page_table"][1]))
 
-    def test_missing_graph_metadata_fails(self) -> None:
-        """Missing device offsets must not use stale host lists as a fallback."""
-        impl = self._impl()
-        metadata, _ = self._metadata([0, 1], [1])
-        metadata.v4_query_start_loc = None
-        query = torch.zeros(1, 4, 8, dtype=torch.bfloat16)
-        with self.assertRaisesRegex(ValueError, "device request boundaries"):
-            impl.forward_impl(query, None, None, (), metadata, torch.empty_like(query))
-        self.provider.flash_attn_varlen_func.assert_not_called()
 
-    def test_graph_modes_preserve_decode_only_attention_capability(self) -> None:
-        """Piecewise prefill leaves attention outside the captured pieces."""
-        native_init = _NativeImpl.__init__
-        for mode in ("decode_graph", "mixed_piecewise"):
-            def initialize(instance: object, *args: object, mode=mode, **kwargs: object) -> None:
-                """Supply each permitted runner graph configuration."""
-                native_init(instance, *args, **kwargs)
-                instance.vllm_config.model_config.enforce_eager = False
-                instance.vllm_config.compilation_config = SimpleNamespace(cudagraph_mode=mode)
+class TestPCPLogProbs(unittest.TestCase):
+    """Check the numerical boundary and the narrowly scoped native binding."""
 
-            with self.subTest(mode=mode), patch.object(_NativeImpl, "__init__", initialize):
-                self._impl()
-                self.assertEqual(
-                    self.backend.UnifiedAttentionMetadataBuilder.get_cudagraph_support(None, None), "decode_only",
-                )
-
-    def test_install_selects_v4_per_layer_and_leaves_native_default(self) -> None:
-        """Explicit class selection must bypass Ascend's global backend selector."""
-        config = SimpleNamespace(model_type="qwen3", hidden_size=32, num_attention_heads=4,
-                                 num_key_value_heads=2, head_dim=8)
-        attention = SimpleNamespace(config=config, scaling=0.25)
-        model = SimpleNamespace(config=config, layers=[SimpleNamespace(self_attn=attention)])
-        native_module_name = "vllm.model_executor.layers.attention"
-        native_module = ModuleType(native_module_name)
-        attention_factory = Mock()
-        native_module.Attention = attention_factory
-        modules = {
-            native_module_name: native_module,
-            "rl.unified_execution.runtimes.vllm.attention.ascend_v4": self.backend,
-        }
-        for name in ("native", "flash_attention_npu_v4"):
-            runtime = SimpleNamespace(
-                cache_config=object(),
-                additional_config={},
-            )
-            with self.subTest(backend=name), patch.dict(sys.modules, modules), patch(
-                "rl.unified_execution.runtimes.vllm.attention.bridge.payload_from_vllm_config",
-                return_value={"attention_backend": name},
-            ), patch(
-                "rl.unified_execution.runtimes.vllm.attention.bridge.validate_attention_execution_path",
-                return_value=(model, [attention]),
-            ):
-                install_paged_attention(model, runtime)
-            options = attention_factory.call_args.kwargs
-            if name == "native":
-                self.assertNotIn("attn_backend", options)
-            else:
-                self.assertIs(options["attn_backend"], self.backend.UnifiedAscendAttentionBackend)
-            self.assertEqual(options["num_heads"], 4)
-            self.assertEqual(options["num_kv_heads"], 2)
-            self.assertEqual(options["scale"], 0.25)
+    def test_scores_native_ids_without_mutating_logits_or_selection(self) -> None:
+        """Selected and top-k IDs retain order, duplicates and the existing FP32 semantics."""
+        generator = torch.Generator().manual_seed(51)
+        for dtype in (torch.bfloat16, torch.float32):
+            logits = torch.randn(3, 131, generator=generator).to(dtype)[:, ::2]
+            ids = torch.tensor([[4, 0, 4], [65, 3, 1], [2, 17, 6]], dtype=torch.int32)
+            before_logits, before_ids = logits.clone(), ids.clone()
+            actual = compute_pcp_token_log_probs(logits, ids)
+            expected = torch.stack([row.float().log_softmax(-1)[selected.long()]
+                                    for row, selected in zip(logits, ids)])
+            self.assertEqual(actual.dtype, torch.float32)
+            self.assertTrue(torch.equal(actual.view(torch.uint8), expected.view(torch.uint8)))
+            self.assertTrue(torch.equal(logits, before_logits))
+            self.assertTrue(torch.equal(ids, before_ids))

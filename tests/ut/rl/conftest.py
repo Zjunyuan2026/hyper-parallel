@@ -23,7 +23,6 @@ import sys
 
 import pytest
 
-
 # ``rl`` is an independent source root rather than an installed subpackage.
 # CI deploys the wheel separately from the test archive. Resolve the active package.
 _RL_SOURCE_ROOT = Path(find_spec("hyper_parallel").origin).parent / "rl"

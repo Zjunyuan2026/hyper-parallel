@@ -38,7 +38,6 @@ Registries:
 - ``SPECIAL_HANDLERS``: {handler_name: callable(module, param_name, mesh)} —
   lives in ``_builder/special_handlers.py``.
 """
-# pylint: disable=forbidden-backend-import
 
 import copy
 import logging
@@ -47,6 +46,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from torch import nn
 
+from hyper_parallel.components.modules.module_family import FamilyShardingContext, _family_parameter_shapes
+from hyper_parallel.distributed._builder.family_layout import collect_owned_layouts, validate_owned_layouts
+from hyper_parallel.models.registry import resolve_model_adapter
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.placement_types import (
     Partial,
@@ -230,6 +232,7 @@ class ShardingPlanner:
         mesh: DeviceMesh,
         model: Any,
         param_ndims: Dict[str, int],
+        boundary_types: Optional[Dict[str, str]] = None,
     ) -> None:
         """Materialize template-derived boundary specs into a plan."""
         if not self._derive:
@@ -239,7 +242,7 @@ class ShardingPlanner:
             )
             return
         for boundary_fqn, group in boundary_groups.items():
-            boundary_type = self._infer_boundary_type(boundary_fqn, group)
+            boundary_type = (boundary_types or {}).get(boundary_fqn) or self._infer_boundary_type(boundary_fqn, group)
             if self._templates.get(boundary_type) is None:
                 logger.warning("No template for boundary_type=%s at %s", boundary_type, boundary_fqn)
                 continue
@@ -252,6 +255,7 @@ class ShardingPlanner:
                 loss_parallel,
                 mesh_dim_names,
                 param_ndims=param_ndims,
+                ep_size=ep_extend or 1,
             )
             if spec is None:
                 continue
@@ -291,21 +295,64 @@ class ShardingPlanner:
         """Find subtrees whose activation layout is owned by a separate runtime."""
         from hyper_parallel.models.registry import get_model_adapter  # pylint: disable=C0415
 
-        adapter = get_model_adapter(arch)
+        adapter = (model._hp_model_adapter_spec if hasattr(model, "_hp_model_adapter_spec")  # pylint: disable=protected-access
+                   else get_model_adapter(arch))
         if adapter is None or adapter.encoder_parallel is None:
             return ()
         spec = adapter.encoder_parallel()
         names = {name for name, _ in model.named_modules()}
         return tuple(root for root in spec.isolated_subtrees if root in names)
 
-    def _classify_boundary_groups(self, model: Any, arch: str, isolated_roots=()):
-        """Classify model parameters and group them into candidate boundaries."""
-        param_roles = self._classify_all_params(model, arch)
-        regular_roles = {
-            name: role for name, role in param_roles.items()
-            if not any(name.startswith(root + ".") for root in isolated_roots)
-        }
-        return param_roles, self._group_by_boundary(regular_roles)
+    @staticmethod
+    def _manages_expert_transport(spec, protocol) -> bool:
+        """Recognize complete matrices and stage-owned transport from existing declarations."""
+        if spec.is_boundary or any((spec.in_src, spec.in_dst, spec.out_src, spec.out_dst)):
+            return False
+        for axes in spec.params.values():
+            for axis, placement in axes.items():
+                if placement == Replicate():
+                    continue
+                if axis != EP or placement != Shard(0):
+                    return False
+                if protocol is None or protocol.binding_kind not in ("ep", "mesh"):
+                    return False
+        return True
+
+    def _routed_moe_boundaries(self, roles, owned) -> dict[str, str]:
+        """Select parent templates before expert ownership hides the MoE structure."""
+        managed = set()
+        for fqn, spec in owned.specs.items():
+            if self._manages_expert_transport(spec, owned.parallel.get(fqn)):
+                managed.update(f"{fqn}.{name}" if fqn else name for name in spec.params)
+        if not managed:
+            return {}
+        result = {}
+        for fqn, group in self._group_by_boundary(roles).items():
+            experts = {name for name, role in group if role == ParamRole.MOE_EXPERT}
+            if (fqn not in owned.specs and experts and experts <= managed
+                    and self._infer_boundary_type(fqn, group) == "moe_mlp"):
+                result[fqn] = "moe_mlp_routed"
+        return result
+
+    def _classify_boundary_groups(self, model: Any, arch: str, isolated_roots=(), *, owned):
+        """Keep MoE structure visible while assigning each parameter to one layout owner."""
+        all_roles = self._classify_all_params(model, arch)
+        isolated_prefixes = tuple(root + "." for root in isolated_roots)
+        regular_roles = {name: role for name, role in all_roles.items() if not name.startswith(isolated_prefixes)}
+        boundary_types = self._routed_moe_boundaries(regular_roles, owned)
+        routed_prefixes = tuple(root + "." for root in boundary_types)
+        param_roles = {name: role for name, role in all_roles.items() if name not in owned.owned_names}
+        remaining = {name: role for name, role in param_roles.items()
+                     if not name.startswith(isolated_prefixes + routed_prefixes)}
+        groups = self._group_by_boundary(remaining)
+        for root in boundary_types:
+            groups[root] = [(name, role) for name, role in regular_roles.items()
+                            if name.startswith(root + ".") and name not in owned.owned_names]
+            # The parent template owns complete replicated math, including otherwise-special parameters.
+            for name, role in groups[root]:
+                if role == ParamRole.SPECIAL:
+                    param_roles[name] = ParamRole.REPLICATED
+        return param_roles, groups, boundary_types
 
     def plan(
         self,
@@ -376,6 +423,7 @@ class ShardingPlanner:
             mesh_dim_names,
             arch,
             tp_size=tp_size,
+            cp_size=cp_size,
             ep_size=ep_size,
             sequence_parallel=sequence_parallel,
             loss_parallel=loss_parallel,
@@ -404,6 +452,7 @@ class ShardingPlanner:
         arch: str,
         *,
         tp_size: int,
+        cp_size: int,
         ep_size: int,
         sequence_parallel: bool,
         loss_parallel: bool,
@@ -417,15 +466,23 @@ class ShardingPlanner:
         # MoE (pre-stacked EP-aware modules use their own dispatcher and
         # are not subject to this constraint)
         # Phase 1: parameter role classification
+        layout_context = FamilyShardingContext(
+            mesh_dim_names, {"tp": tp_size, "cp": cp_size, "ep": ep_size},
+            _family_parameter_shapes(model),
+            sequence_parallel, loss_parallel,
+        )
+        owned = collect_owned_layouts(model, layout_context, resolve_model_adapter(model))
         isolated_roots = self._resolve_isolated_roots(model, arch) if self._derive else ()
-        param_roles, boundary_groups = self._classify_boundary_groups(model, arch, isolated_roots)
+        param_roles, boundary_groups, boundary_types = self._classify_boundary_groups(
+            model, arch, isolated_roots, owned=owned,
+        )
 
         # Phase 3+4: semantic inference + template-fills I/O
         # F4a/F4b: full shapes + requires_grad for the plan-time lints
         # (meta tensors carry shapes too — the zero-memory path is unaffected)
         param_metadata = (
             {name: p.ndim for name, p in model.named_parameters()},
-            {name: tuple(p.shape) for name, p in model.named_parameters()},
+            dict(layout_context.parameter_shapes),
         )
         plan = ShardingPlan(
             mesh_dim_names=mesh_dim_names,
@@ -443,6 +500,7 @@ class ShardingPlanner:
             mesh=mesh,
             model=model,
             param_ndims=param_metadata[0],
+            boundary_types=boundary_types,
         )
 
         for root in isolated_roots:
@@ -450,6 +508,12 @@ class ShardingPlanner:
             params = {name: {TP: Replicate()} for name, parameter in module.named_parameters()
                       if parameter.requires_grad}
             plan.modules[root] = ModuleShardingSpec(params=params, in_src={}, in_dst={}, is_boundary=False)
+
+        plan.modules.update(owned.specs)
+        plan.parallel_modules.update(owned.parallel)
+        plan.owned_parameter_names.update(owned.owned_names)
+        plan.tied_pairs.extend(owned.aliases)
+        plan.parameter_aliases.extend(owned.aliases)
 
         # Phase 4.5: merge derived matches and expand fully declared globs
         # against the final model tree to insert new boundaries.
@@ -461,6 +525,7 @@ class ShardingPlanner:
             mesh=mesh,
             mesh_dim_names=mesh_dim_names,
         )
+        validate_owned_layouts(model, plan, owned, layout_context)
         return plan, param_roles, param_metadata
 
     def _finalize_plan(
@@ -502,7 +567,7 @@ class ShardingPlanner:
         self._warn_uncovered_function_modules(model, plan)
 
         # tied-weight detection (embed <-> lm_head sharing storage)
-        plan.tied_pairs = self._detect_tied_pairs(model)
+        plan.tied_pairs = list(dict.fromkeys([*plan.tied_pairs, *self._detect_tied_pairs(model)]))
         return plan
 
     # ── Architecture detection ──────────────────────────────────────────
@@ -652,7 +717,8 @@ class ShardingPlanner:
         from hyper_parallel.models.registry import (  # pylint: disable=import-outside-toplevel
             get_model_adapter,
         )
-        spec = get_model_adapter(arch)
+        spec = (model._hp_model_adapter_spec if hasattr(model, "_hp_model_adapter_spec")  # pylint: disable=protected-access
+                else get_model_adapter(arch))
         rules = []
         if spec is not None and spec.sharding_rules is not None:
             rules = list(spec.sharding_rules())
@@ -1476,6 +1542,7 @@ class ShardingPlanner:
         if not self._derive:
             return
         covered = self._declared_parameter_names(plan)
+        covered.update(plan.owned_parameter_names)
         uncovered = [
             name for name, p in model.named_parameters()
             if p.requires_grad and name not in covered

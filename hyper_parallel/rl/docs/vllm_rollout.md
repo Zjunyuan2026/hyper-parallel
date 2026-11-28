@@ -23,7 +23,6 @@ Receivers retain independent tensors to prevent dangling references after bucket
 ### MoE R3 Router Replay
 
 `train.router_replay.mode: R3` enables expert capture and Actor replay; the default is `disabled`.
-Existing eager/raw-logprob/topology restrictions remain; Agent budgets and sleep levels are unchanged.
 See the [MoE guide](moe_code_agent.md#moe-r3) for detailed scope.
 
 ## Ownership

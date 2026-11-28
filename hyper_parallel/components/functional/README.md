@@ -1,6 +1,6 @@
 # High-performance functions
 
-`hyper_parallel.components.functional` provides reusable high-performance functions for Ascend NPU.
+`hyper_parallel.components.functional` provides reusable high-performance functions for Ascend NPU and optional CUDA backends.
 Some interfaces also expose an explicit `eager` reference backend; fused calls do not automatically fall back.
 
 ```python
@@ -40,8 +40,11 @@ expert_outputs = experts(permuted_tokens, tokens_per_expert, routing_weights)
 output = moe_token_unpermute(expert_outputs, sorted_indices, routing_probs)
 ```
 
-In this example, `experts` is an instance of `hyper_parallel.components.modules.GroupedExperts`. It contains only local expert
-weights and computation; routing, expert-parallel communication, and shared experts remain outside the module.
+In this example, `experts` is an instance of the legacy
+`hyper_parallel.components.modules.grouped_experts.GroupedExperts`. It contains only local expert weights and computation;
+routing, expert-parallel communication, and shared experts remain outside the module.
+The public [GroupedExperts family](../modules/moe/grouped_experts/README.md) accepts token-level top-k routes and owns
+permutation, expert computation and local/EP transport.
 `hyper_parallel.components.modules.SharedExpert` provides the parameter-owning dense MLP used as a shared expert.
 
 ## Auxiliary-loss functions
@@ -57,6 +60,15 @@ the fused `torch_npu.npu_{sparse,dense}_lightning_indexer_grad_kl_loss` APIs;
 teacher probabilities and scalar loss are computed inside CANN. Dense indexer
 LSE returns the native max/sum pair. Indexer and sparse-attention backward use
 `cann_ops_transformer`; attention forward uses `torch_npu.npu_sparse_flash_attention`.
+
+## MHC functions
+
+The MHC interfaces are `mhc_pre` and `mhc_post`. The CANN backend targets
+CANN 9.2.0 and requires its matching `cann_ops_transformer` extension and
+native operators: `mhc_pre` calls the fused `mhc_pre_sinkhorn` operator (RMS
+norm, projection and Sinkhorn in one kernel); `mhc_post` calls the
+differentiable `mhc_post` operator with its native backward.
+`backend="omni"` selects the deprecated `omni_training_custom_ops` operators.
 
 ## DeepSeek V4.1 fused operators
 
@@ -105,7 +117,7 @@ plan_overrides:
       source_type: hyper_parallel.models.deepseek_v41.modeling_deepseek_v41.DeepseekV41Attention
       implementation:
         _target_: >-
-          hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention
+          hyper_parallel.components.modules.CompressedSparseAttention2
         use_fused_ops: true
 ```
 
@@ -248,3 +260,97 @@ These protocols share the same local KDA stages and can be combined with Ulysses
 Forward exchanges use S/M, while backward produces fresh G/N instead of caching M.
 See [KDA context parallelism](../../../docs/guide/kda_context_parallel.md)
 for configurations, supported shapes and the state-buffer lifetime contract.
+
+## Gram Newton-Schulz for Muon
+
+`make_gram_newton_schulz` adapts the optional
+[Dao-AILab Gram Newton-Schulz package](https://github.com/Dao-AILab/gram-newton-schulz)
+to Muon's existing `zeropower_fn(tensor, steps=...)` contract.
+For automatic callback construction, set `muon_ns_backend` in `get_hyper_optimizer`.
+
+- `"gram"` uses upstream Torch operations on CPU and CUDA (`use_kernels=False`).
+- `"gram_quack"` enables automatic device selection (`use_kernels=None`). It uses
+  Quack on Hopper/Blackwell CUDA for eligible matrices and the `"gram"` path on
+  CPU and other CUDA devices.
+
+Both options read the effective group coefficients, step counts and epsilon; compatible
+coefficient prefixes and one epsilon are required across groups. The native
+default preserves manual callbacks; explicitly selecting Gram together with a
+manual `zeropower_fn` is an error. The manual factory below exposes advanced
+restart/kernel/compilation options. Importing HyperParallel
+or this factory does not load the optional package; creating the callback does.
+Install CUDA-enabled PyTorch first, then install the package separately:
+
+```bash
+pip install gram-newton-schulz==0.1.6 --no-build-isolation
+```
+
+Upstream 0.1.6 declares PyTorch 2.7.1+, `quack-kernels==0.5.0`, and
+`nvidia-cutlass-dsl==4.5.2` as installation dependencies. The Quack runtime
+requires CUDA 12.9+ and targets NVIDIA Hopper and Blackwell datacenter GPUs
+(SM 9.x/10.x). Use an isolated environment when other packages need different
+Quack/CUTLASS versions. Both Gram options accept CPU and CUDA inputs and reject
+NPU inputs.
+
+```python
+from hyper_parallel.components.functional import make_gram_newton_schulz
+from hyper_parallel.core.optimizer import Muon
+
+# Existing Muon asym5 schedule, shared explicitly by the callback and optimizer.
+coefficients = (
+    (4.0848, -6.8946, 2.9270),
+    (3.9505, -6.3029, 2.6377),
+    (3.7418, -5.5913, 2.3037),
+    (2.8769, -3.1427, 1.2046),
+    (2.8366, -3.0525, 1.2012),
+)
+epsilon = 1e-10
+zeropower = make_gram_newton_schulz(
+    coefficients, epsilon=epsilon, reset_iterations=(2,), use_kernels=None,
+    compile_kwargs=None,
+)
+optimizer = Muon(
+    params, ns_steps=5, ns_variant="custom", ns_coefficients=coefficients,
+    ns_epsilon=epsilon, zeropower_fn=zeropower,
+)
+```
+
+The callback takes local `[M,N]` or `[B,M,N]` tensors and preserves shape,
+dtype and device. It owns an immutable schedule and epsilon: Muon only passes
+`steps`, so all groups must share that schedule and epsilon. Different groups
+may use different positive step counts up to the schedule length. Restart counts
+at or beyond the requested step count are ignored. Epsilon must be positive so
+zero inputs remain finite. Upstream chooses standard NS for square matrices and
+may use Torch operations for small matrices even with custom kernels enabled.
+
+`use_kernels=None` (default) selects kernels by the input device: supported
+Hopper/Blackwell CUDA inputs use custom kernels, while CPU and other CUDA inputs
+use upstream Torch operations. The decision is cached per device and step count;
+creating the factory does not probe the current/default GPU. `use_kernels=True`
+requires supported CUDA hardware and raises otherwise; `False` forces Torch
+operations on CPU/CUDA. NPU is not qualified. The optional package is required in
+all modes. Dependency loading, compilation, and execution failures propagate,
+including when Quack is selected automatically. `compile_kwargs=None` disables
+compilation. A mapping such as `{"fullgraph": True, "mode": "reduce-overhead"}`
+enables it.
+Instances are cached per device and step count. No input tensors are retained by
+the adapter. Missing packages raise an informative import error; device checks,
+compilation and execution failures never silently select the default Muon backend.
+
+Upstream normalizes in FP32, iterates in FP16 and casts back to the input dtype.
+Current Muon generally computes NS in BF16, so numerical differences are expected.
+A speedup is shape-dependent and must be measured, including peak memory. When
+resuming, recreate the callback with the same backend and NS settings
+before loading optimizer state; its bound configuration and compiled caches are
+not part of `optimizer.state_dict()`. Loading group coefficients/epsilon does not
+rebind the callback.
+
+Run the GPU integration tests with:
+
+```bash
+pytest -vs tests/torch/optimizer/test_muon_gram_ns.py
+```
+
+The current SwapMuon runtime is NPU-specific; these CUDA tests do not qualify GPU optimizer-state swap.
+
+Run these inside a GPU allocation (the complete test file needs two GPUs).

@@ -112,68 +112,16 @@ train:
       kind: module
       source_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention
       implementation:
-        _target_: rl.unified_execution.models.bindings.replace_attention_with_pik
+        _target_: rl.unified_execution.modules.grouped_query_attention.build_grouped_query_attention
         num_leaves: auto
         leaf_layout: strided
         fill_uninitialized_memory: false
-  - match: '*.self_attn'
-    region_dispatch: false
   - match: '*.mlp.experts'
     replace:
       kind: module
       source_type: transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeExperts
       implementation:
-        _target_: hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement.replace_qwen3_moe_grouped_experts
-  - match: '*.mlp.forward'
-    when: ep
-    replace:
-      kind: method
-      implementation:
-        _target_: rl.unified_execution.runtimes.hyper_parallel.moe.unified_ep_compute_fn
-  - match: '*.self_attn.o_proj.forward'
-    replace:
-      kind: method
-      implementation:
-        _target_: rl.unified_execution.models.bindings.pik_row_compute_fn
-        sequence_parallel: false
-    params: {}
-    in_src:
-      input: {tp: shard(2)}
-    in_dst:
-      input: {tp: shard(2)}
-    out_src:
-      output: {tp: replicate}
-    out_dst:
-      output: {tp: replicate}
-  - match: '*.self_attn.o_proj.forward'
-    when: sequence_parallel
-    replace:
-      kind: method
-      implementation:
-        _target_: rl.unified_execution.models.bindings.pik_row_compute_fn
-        sequence_parallel: true
-    params: {}
-    in_src:
-      input: {tp: shard(2)}
-    in_dst:
-      input: {tp: shard(2)}
-    out_src:
-      output: {tp: shard(1)}
-    out_dst:
-      output: {tp: shard(1)}
-  - match: '*.self_attn'
-    region_dispatch: false
-    out_src:
-      output: {tp: replicate, cp: shard(1)}
-    out_dst:
-      output: {tp: replicate, cp: shard(1)}
-  - match: '*.self_attn'
-    when: sequence_parallel
-    region_dispatch: false
-    out_src:
-      output: {tp: shard(1), cp: shard(1)}
-    out_dst:
-      output: {tp: shard(1), cp: shard(1)}
+        _target_: hyper_parallel.components.modules.GroupedExperts
   token_log_probs_mode: dense
   model_init_cpu_threads: null
   max_steps: 2

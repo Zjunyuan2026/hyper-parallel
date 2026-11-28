@@ -16,15 +16,19 @@
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
 import torch.distributed.nn.functional as dist_func
 import torch_npu
 
-from rl.unified_execution.models.bindings import PikLinear
-from rl.unified_execution.ops.pik import PikPlan, pik_linear, prepare_pik
-from rl.unified_execution.ops.pik.reduction import fixed_tree
+from hyper_parallel.components.parallelism_invariant.row_parallel_linear import (
+    PikPlan, pik_linear, pik_linear_inference, prepare_pik,
+)
+from hyper_parallel.components.parallelism_invariant.row_parallel_linear.reduction import fixed_tree
+
+from rl.unified_execution.modules.row_parallel_linear import build_pik_linear
 
 
 def reference(x: torch.Tensor, weight: torch.Tensor, leaves: int,
@@ -69,8 +73,9 @@ def _run_case(shape, n, leaves, layout, transport, sp, axis, rank, world):
         if sp:
             expected = expected.chunk(world, axis)[rank]
         # The rollout two-leaf collective has the same last rounding and SP slice.
-        _assert_bits(pik_linear(x, weight, bias, context=ctx, rollout=True), expected)
-    actual = pik_linear(x, weight, bias, context=ctx)
+        _assert_bits(pik_linear_inference(x, weight, bias, context=ctx), expected)
+    # With autograd enabled the inference entry uses the standard distributed backward.
+    actual = pik_linear_inference(x, weight, bias, context=ctx)
     _assert_bits(actual, expected)
     torch.manual_seed(31)
     dy = torch.randn(*shape[:-1], n, device="npu", dtype=torch.bfloat16)
@@ -122,8 +127,9 @@ def _row_adapter_backward(rank: int, world: int) -> None:
         torch.manual_seed(901)
         module = torch.nn.Linear(512, 64, bias=False, device="npu", dtype=torch.bfloat16)
         module.weight = torch.nn.Parameter(module.weight[:, rank * (512 // world):(rank + 1) * (512 // world)])
-        row = PikLinear(module, PikPlan(8), parallel=True, fill_uninitialized_memory=False)
-        row.bind_pik(dist.group.WORLD, sequence_parallel=sp)
+        mesh = SimpleNamespace(device_mesh={"tp": SimpleNamespace(get_group=lambda: dist.group.WORLD)})
+        row = build_pik_linear(module=module, module_fqn="o_proj", num_leaves=8,
+                                 context={"tp": world > 1, "mesh": mesh, "sequence_parallel": sp})
         inputs = torch.randn(1, world * 3, 512 // world, device="npu", dtype=torch.bfloat16, requires_grad=True)
         dy = torch.randn(1, world * 3, 64, device="npu", dtype=torch.bfloat16)
         reference_inputs = inputs.detach().clone().requires_grad_()

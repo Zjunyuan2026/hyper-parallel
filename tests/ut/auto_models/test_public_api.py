@@ -105,6 +105,9 @@ class TestShardingConfigContracts(unittest.TestCase):
                 ("special_handlers", "<factory> {}"),
                 ("mesh_dim_names", "()"),
                 ("tied_pairs", "<factory> []"),
+                ("parallel_modules", "<factory> {}"),
+                ("owned_parameter_names", "<factory> set()"),
+                ("parameter_aliases", "<factory> []"),
             ],
         )
 
@@ -198,6 +201,8 @@ class TestTrainerConfigContracts(unittest.TestCase):
                 ("fsdp_allgather_prefetch", "True"),
                 ("fsdp_overlap_grad_reduce", "True"),
                 ("max_in_flight_gb", "0.25"),
+                ("offload_budget_gb", "64.0"),
+                ("offload_prefetch_n_layers", "1"),
             ],
         )
 
@@ -231,7 +236,11 @@ class TestTrainerConfigContracts(unittest.TestCase):
             [
                 "AcceleratorConfig",
                 "ActivationCheckpointConfig",
-                "ActivationCheckpointSelection",
+                "FullCheckpointConfig",
+                "FullExcludeRegionConfig",
+                "ModelModuleSpec",
+                "ModuleRegionSpec",
+                "SelectiveCheckpointConfig",
                 "CompileConfig",
                 "DataLoaderConfig",
                 "DatasetConfig",

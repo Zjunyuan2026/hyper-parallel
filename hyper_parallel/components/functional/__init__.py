@@ -25,7 +25,10 @@ single submodule (e.g. ``functional.npu_grouped_swiglu``).
 # pylint: disable=invalid-name,undefined-all-variable
 
 import importlib
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from hyper_parallel.components.functional.swiglu import swiglu
 
 _EXPORT_TO_MODULE = {
     "aggregate_hidden": "aggregate_hidden",
@@ -47,7 +50,7 @@ _EXPORT_TO_MODULE = {
     "grouped_matmul": "grouped_matmul",
     "chunk_gated_delta_rule": "gated_delta_net",
     "fused_chunk_kda": "kimi_delta_attention",
-    "fused_chunk_kda_p2p": "kimi_delta_attention",
+    "make_gram_newton_schulz": "gram_newton_schulz",
     "mhc_post": "mhc_post",
     "mhc_pre": "mhc_pre",
     "moe_token_permute": "moe_token_permute",
@@ -99,7 +102,7 @@ __all__ = [
     "grouped_matmul",
     "chunk_gated_delta_rule",
     "fused_chunk_kda",
-    "fused_chunk_kda_p2p",
+    "make_gram_newton_schulz",
     "mhc_post",
     "mhc_pre",
     "moe_token_permute",

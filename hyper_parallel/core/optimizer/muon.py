@@ -22,9 +22,10 @@ from dataclasses import dataclass
 import logging
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-import torch  # pylint: disable=forbidden-backend-import
-import torch.distributed as dist  # pylint: disable=forbidden-backend-import
+import torch
+import torch.distributed as dist
 
+from hyper_parallel.high_availability.group_registry import is_recovery_bootstrapping
 from hyper_parallel.core.optimizer.optimizer import AsyncReplicateBroadcaster, BaseDistributedOptimizer
 from hyper_parallel.core.optimizer.dtensor_compat import to_local_if_dtensor
 from hyper_parallel.core.optimizer.sharding_category import (
@@ -116,6 +117,27 @@ def _resolve_muon_advanced_options(options: Dict[str, Any]) -> _MuonAdvancedOpti
 _TransformNSState = Dict[str, Any]
 
 
+def _resolve_ns_coefficients(
+        steps: int,
+        ns_variant: str = "asym5",
+        ns_coefficients: Optional[Sequence[Tuple[float, float, float]]] = None,
+) -> Tuple[Tuple[float, float, float], ...]:
+    """Resolve the coefficient prefix shared by native NS and backend construction."""
+    if ns_variant == "legacy":
+        return (_NS_LEGACY_COEFFS,) * steps
+    if ns_variant == "asym5":
+        return _NS_ASYM5_COEFFS[:steps]
+    if ns_variant == "custom":
+        if ns_coefficients is None:
+            raise ValueError("ns_coefficients must be provided when ns_variant='custom'")
+        if steps > len(ns_coefficients):
+            raise ValueError(
+                f"ns_steps={steps} exceeds the {len(ns_coefficients)} provided coefficient groups"
+            )
+        return tuple(tuple(row) for row in ns_coefficients[:steps])
+    raise ValueError(f"ns_variant must be 'legacy', 'asym5', or 'custom', got {ns_variant!r}")
+
+
 def zeropower_via_newtonschulz5(
         ns_inputs: torch.Tensor,
         steps: int,
@@ -123,7 +145,18 @@ def zeropower_via_newtonschulz5(
         epsilon: float = 1e-10,
         ns_coefficients: Optional[Sequence[Tuple[float, float, float]]] = None,
 ) -> torch.Tensor:
-    """Newton-Schulz orthogonalization with preallocated matmul buffers."""
+    """Newton-Schulz orthogonalization with preallocated matmul buffers.
+
+    Args:
+        ns_inputs: Matrix or matrix batch to orthogonalize.
+        steps: Requested iteration count; asym5 uses at most five iterations.
+        ns_variant: Built-in legacy/asym5 schedule or an explicit custom schedule.
+        epsilon: Normalization epsilon added to the input norm.
+        ns_coefficients: Coefficient triples required by the custom variant.
+
+    Returns:
+        Orthogonalized updates with the input shape, dtype and device.
+    """
     mat_x = ns_inputs
     transposed = ns_inputs.size(-2) > ns_inputs.size(-1)
     if transposed:
@@ -137,22 +170,7 @@ def zeropower_via_newtonschulz5(
     buf_b = torch.empty_like(buf_a)
     buf_c = torch.empty(mat_x.shape, dtype=mat_x.dtype, device=mat_x.device)
 
-    if ns_variant == "legacy":
-        step_coeffs = [_NS_LEGACY_COEFFS] * steps
-    elif ns_variant == "asym5":
-        step_coeffs = _NS_ASYM5_COEFFS[:steps]
-    elif ns_variant == "custom":
-        if ns_coefficients is None:
-            raise ValueError("ns_coefficients must be provided when ns_variant='custom'")
-        if steps > len(ns_coefficients):
-            raise ValueError(
-                f"ns_steps={steps} exceeds the {len(ns_coefficients)} provided coefficient groups"
-            )
-        step_coeffs = tuple(ns_coefficients[:steps])
-    else:
-        raise ValueError(
-            f"ns_variant must be 'legacy', 'asym5', or 'custom', got {ns_variant!r}"
-        )
+    step_coeffs = _resolve_ns_coefficients(steps, ns_variant, ns_coefficients)
 
     for coeff_a, coeff_b, coeff_c in step_coeffs:
         torch.matmul(mat_x, mat_x.mT, out=buf_a)
@@ -208,6 +226,7 @@ class Muon(BaseDistributedOptimizer):
             ns_steps: int = 5,
             ns_variant: str = "asym5",
             hsdp_replica_count: Optional[Union[int, Tuple[int, ...]]] = None,
+            momentum_mode: str = "legacy",
             **advanced_options: Any,
     ) -> None:
         """Initialize Muon and build parameter-identity runtime caches.
@@ -223,7 +242,11 @@ class Muon(BaseDistributedOptimizer):
             ns_variant: Newton-Schulz coefficient variant.
             ns_coefficients: Optional custom Newton-Schulz coefficients.
             ns_epsilon: Numerical stability term used during normalization.
-            zeropower_fn: Optional Newton-Schulz implementation override.
+            zeropower_fn: Optional ``fn(local_tensor, steps=ns_steps)`` override.
+                Return a writable tensor with the same shape, dtype and device.
+                The callback owns its coefficient schedule and epsilon; these
+                group options are not forwarded. Recreate matching callback
+                configuration when restoring an optimizer checkpoint.
             momentum_update_fn: Optional momentum update implementation override.
             reshape_fn: Optional logical-matrix reshape function.
             ns_transform_fn: Optional Newton-Schulz input transformation.
@@ -231,8 +254,14 @@ class Muon(BaseDistributedOptimizer):
             zero_rms_scale_mode: Scaling behavior when matched AdamW RMS is zero.
             apply_lr_in_update: Whether the update callback applies the learning rate.
             hsdp_replica_count: Optional optimizer-state replica group size.
+            momentum_mode: Momentum formula, either "legacy" or "vanilla".
+                Both modes support distinct update and buffer coefficients.
         """
         advanced = _resolve_muon_advanced_options(advanced_options)
+        if momentum_mode not in ("legacy", "vanilla"):
+            raise ValueError(
+                f"momentum_mode must be 'legacy' or 'vanilla', got {momentum_mode!r}"
+            )
         if ns_variant not in ("legacy", "asym5", "custom"):
             raise ValueError(
                 f"ns_variant must be 'legacy', 'asym5', or 'custom', got {ns_variant!r}"
@@ -268,6 +297,7 @@ class Muon(BaseDistributedOptimizer):
         self.reshape_fn = advanced.reshape_fn
         self.zeropower_fn = advanced.zeropower_fn
         self.momentum_update_fn = advanced.momentum_update_fn
+        self._update_muon_momentum_mode = momentum_mode
         self.ns_transform_fn = advanced.ns_transform_fn
         self.post_update_fn = advanced.post_update_fn
         self.reset_optimizer_parameters()
@@ -275,16 +305,22 @@ class Muon(BaseDistributedOptimizer):
     def reset_optimizer_parameters(self) -> None:
         """Rebuild all parameter-identity caches from current param groups."""
         self._group_dtensor_by_mesh()
-        self._build_param_shard_metadata()
-        deduced_count = self._auto_deduce_replica_count()
-        if deduced_count is None:
-            self.hsdp_replica_count = None
-        elif self.hsdp_replica_count is None:
-            self.hsdp_replica_count = deduced_count
+        if is_recovery_bootstrapping():
+            # Peers are parked until communication rebuild. Shape collectives
+            # must run on all workers from rebuild_recovery_state instead.
+            self._param_shard_metadata = {}
+        else:
+            self._build_param_shard_metadata()
+        if self.hsdp_replica_count is None:
+            self.hsdp_replica_count = self._auto_deduce_replica_count()
         self._split_replicate_groups()
         self._build_hsdp_batch()
         self._build_param_broadcast_info()
         self._classify_parameters_for_step()
+
+    def rebuild_recovery_state(self) -> None:
+        """Refresh shard shapes on every rank after existing groups are reinitialized."""
+        self._build_param_shard_metadata()
 
     @staticmethod
     def _validate_ns_coefficients(
@@ -530,18 +566,33 @@ class Muon(BaseDistributedOptimizer):
             param_updates = dict(zip(valid_params, custom_updates))
             return param_updates
 
-        # Match muon_update_core():
-        # m_for_update = grad + momentum1 * m_old
-        # m_new = grad + momentum2 * m_old
-        # pylint: disable=protected-access
-        local_us = torch._foreach_add(grads, bufs, alpha=momentum1)
+        if self._update_muon_momentum_mode == "vanilla":
+            # Match vanilla implementation in Muon paper & PyTorch implementation:
+            # m_for_update = (1 - momentum1) * grad + momentum1 * m_old
+            # m_new = (1 - momentum2) * grad + momentum2 * m_old
+            # Fold the Nesterov interpolation into one lerp with momentum1 squared.
+            # pylint: disable=protected-access
+            update_momentum = momentum1 ** 2 if group["nesterov"] else momentum1
+            local_us = torch._foreach_lerp(grads, bufs, weight=update_momentum)
+            torch._foreach_lerp_(bufs, grads, weight=1 - momentum2)
+        elif self._update_muon_momentum_mode == "legacy":
+            # Match muon_update_core():
+            # m_for_update = grad + momentum1 * m_old
+            # m_new = grad + momentum2 * m_old
+            # pylint: disable=protected-access
+            local_us = torch._foreach_add(grads, bufs, alpha=momentum1)
 
-        torch._foreach_mul_(bufs, momentum2)
-        torch._foreach_add_(bufs, grads)
+            torch._foreach_mul_(bufs, momentum2)
+            torch._foreach_add_(bufs, grads)
 
-        if group["nesterov"]:
-            torch._foreach_mul_(local_us, momentum1)
-            torch._foreach_add_(local_us, grads)
+            if group["nesterov"]:
+                torch._foreach_mul_(local_us, momentum1)
+                torch._foreach_add_(local_us, grads)
+        else:
+            raise ValueError(
+                "Muon._update_muon_momentum_mode must be 'vanilla' or 'legacy', "
+                f"got {self._update_muon_momentum_mode!r}"
+            )
 
         if local_us[0].dtype != torch.bfloat16:
             local_us = [update.to(torch.bfloat16) for update in local_us]

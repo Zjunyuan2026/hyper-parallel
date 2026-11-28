@@ -26,8 +26,8 @@ import torch.distributed as dist
 import torch_npu
 import yaml
 
-from rl.unified_execution.runtimes.vllm.parallel import build_parallel_context
-from rl.unified_execution.runtimes.vllm.weights import LogicalWeightLoader
+from rl.unified_execution.vllm.parallel_context import build_parallel_context
+from rl.unified_execution.vllm.weight_loader import LogicalWeightLoader
 from hyper_parallel.core.dtensor.dtensor import distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import Replicate, Shard
 

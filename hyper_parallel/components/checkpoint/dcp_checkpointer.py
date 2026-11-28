@@ -27,8 +27,8 @@ import os
 from functools import partial
 from typing import Any, Dict, List, Optional
 
-import torch  # pylint: disable=forbidden-backend-import
-import torch.distributed as dist  # pylint: disable=forbidden-backend-import
+import torch
+import torch.distributed as dist
 
 from hyper_parallel import SkipDTensorDispatch
 from hyper_parallel.components.optim.mixed_precision_optimizer import (
@@ -532,6 +532,17 @@ class DistributedCheckpointer(CheckpointerBase):
             raise
         finally:
             self._async_save_response = None
+
+    def abort_async_save(self) -> None:
+        """Discard an in-flight checkpoint before process recovery.
+
+        Completed checkpoints remain published. The attempted save-step marker
+        belongs to the callback and is retained even when persistence is dropped.
+        """
+        if self._async_save_response is None:
+            return
+        self._async_save_response.abort()
+        self._async_save_response = None
 
     def raise_for_failed_async_save(self) -> None:
         """Re-raise an in-flight async save's failure as soon as it is known.

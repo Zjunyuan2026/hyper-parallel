@@ -62,6 +62,8 @@ class InnerWrapperPatch:
     request: Any
     target_type: Optional[type] = None
     secondary_requests: tuple[Any, ...] = ()
+    observed_definition: Optional[str] = None
+    factory_kwargs: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
 
 
 @dataclass(frozen=True)
@@ -74,7 +76,11 @@ class EmissionPatchSet:
 
 
 def emission_patches_from_meta(meta: Any) -> Optional[EmissionPatchSet]:
-    """Rehydrate emitter views from plain snapshot data."""
+    """Rehydrate emitter views from plain snapshot data.
+
+    Args:
+        meta: Snapshot metadata containing serialized emission records.
+    """
     data = getattr(meta, "emission_patches", None)
     if not data:
         return None
@@ -83,6 +89,8 @@ def emission_patches_from_meta(meta: Any) -> Optional[EmissionPatchSet]:
             module_fqn=item["module_fqn"],
             source_type=_resolve_symbol(item["source_type"]),
             replacement_type=_resolve_symbol(item["replacement_type"]),
+            factory=_resolve_symbol(item["factory"]) if item.get("factory") else None,
+            factory_kwargs=MappingProxyType(item.get("factory_kwargs", {})),
         )
         for item in data.get("module_replacements", ())
     )
@@ -103,9 +111,11 @@ def emission_patches_from_meta(meta: Any) -> Optional[EmissionPatchSet]:
         InnerWrapperPatch(
             module_fqn=item["module_fqn"],
             target_fqn=item["target_fqn"],
-            wrapper=_resolve_symbol(item["wrapper"]),
+            wrapper=_resolve_symbol(item["wrapper"]) if item.get("wrapper") else None,
             request=SimpleNamespace(target=None),
             target_type=_resolve_symbol(item["target_type"]),
+            observed_definition=item.get("observed_definition"),
+            factory_kwargs=MappingProxyType(item.get("factory_kwargs", {})),
         )
         for item in data.get("inner_wrappers", ())
     )
@@ -113,7 +123,11 @@ def emission_patches_from_meta(meta: Any) -> Optional[EmissionPatchSet]:
 
 
 def local_compute_binding_name(target: Any) -> str:
-    """Return the explicit instance attribute used for one compute factory."""
+    """Return the explicit instance attribute used for one compute factory.
+
+    Args:
+        target: Compute factory whose declared binding name is required.
+    """
     if isinstance(target, Mapping):
         target = target.get("_target_") or target.get("target") or target.get("name")
     else:

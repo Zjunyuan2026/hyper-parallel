@@ -16,20 +16,28 @@
 
 import json
 import os
+from itertools import accumulate
 from pathlib import Path
-from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
 import torch_npu
+from transformers import Qwen3Config
 
-from rl.unified_execution.core.batch_invariant import initialize_batch_invariant
-from rl.unified_execution.ops.attention.flash_attention_npu_v4 import dense_attention
-from rl.unified_execution.runtimes.hyper_parallel.attention import prepare_cp_attention_metadata, run_training_attention
 from hyper_parallel import init_device_mesh
+from hyper_parallel.components.modules.attention.grouped_query_attention.cp_grouped_query_attention import (
+    CPGQAPreparedInputs, CPGroupedQueryAttentionModule,
+)
+from hyper_parallel.distributed.context_parallel.cp_context import CPContext
+from hyper_parallel.distributed.module_binding import ParallelBinding
+
+from rl.unified_execution.batch_invariant import initialize_batch_invariant
+from rl.unified_execution.modules.flash_attention_v4 import dense_attention
+from rl.unified_execution.training.grouped_query_attention import prepare_v4_batch, gqa_v4_forward
 
 
 def _reference(states, mask, documents):
+    """Evaluate valid token rows independently for each batch and packed document."""
     outputs = []
     for batch in range(mask.shape[0]):
         row = states[0][batch].transpose(0, 1) * 0
@@ -67,9 +75,18 @@ def check_case(mesh, length, *, packed=False, empty=False):
     torch.npu.synchronize()
     dist.barrier()
     local = [state.chunk(size, dim=2)[rank].contiguous().detach().requires_grad_() for state in states]
-    metadata = prepare_cp_attention_metadata(masks, batch, total // size, local[0].device, mesh, documents)
-    output, _ = run_training_attention(SimpleNamespace(unified_cp_mesh=mesh), *local, None,
-                                       unified_attention_metadata=metadata)
+    batch_layout = prepare_v4_batch(masks, batch, total // size, local[0].device, mesh)
+    attention = CPGroupedQueryAttentionModule(config=Qwen3Config(
+        hidden_size=1024, num_attention_heads=8, num_key_value_heads=1, head_dim=128), ulysses_degree=1)
+    attention.bind_parallel(ParallelBinding(mesh_binding=None, cp_context=CPContext(mesh)))
+    attention.attention_interface = gqa_v4_forward
+    prepared = CPGQAPreparedInputs(
+        *(state.transpose(1, 2) for state in local), None, None, None, None,
+        tuple(accumulate(documents)) if documents else None, {"v4_batch": batch_layout}, None,
+    )
+    inputs = attention.exchange_attention(prepared)
+    output, _ = attention.run_attention(inputs)
+    output, _ = attention.restore_attention(output, inputs.output_state)
     expected = reference.chunk(size, dim=1)[rank]
     valid = masks.chunk(size, dim=1)[rank].cpu()
     bits = torch.equal(output.detach().cpu()[valid].contiguous().view(torch.uint8),

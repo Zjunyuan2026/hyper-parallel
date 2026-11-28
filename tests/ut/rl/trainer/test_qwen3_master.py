@@ -13,8 +13,9 @@
 # limitations under the License.
 # ============================================================================
 """Numerical and build-contract tests for the shared Qwen3 RL integration."""
-# pylint: disable=forbidden-backend-import,protected-access
+# pylint: disable=protected-access
 
+import importlib
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -52,10 +53,9 @@ from hyper_parallel.trainer.config.resolver import resolve_component
 from tests.ut.auto_models.distributed.conftest import FakeDeviceMesh
 
 
-
 def declared_setup() -> DistributedSetup:
     """Exercise the shipped RL YAML through the actual HP normalization path."""
-    recipe = Path(rl.__file__).resolve().parents[1] / "examples/gsm8k/configs/qwen3_4b_gsm8k_base.yaml"
+    recipe = Path(rl.__file__).resolve().parents[1] / "examples/gsm8k/configs/qwen3_4b_gsm8k_native_50step.yaml"
     raw = yaml.safe_load(recipe.read_text())["train"]["plan_overrides"]
     rules = resolve_component(raw, annotation=list[PlanOverride], path="train.plan_overrides")
     setup = DistributedSetup()
@@ -76,19 +76,24 @@ def tiny_config() -> Qwen3Config:
 @pytest.fixture(name="cpu_kernels")
 def _cpu_kernels(monkeypatch):
     """Use independent CPU mathematical oracles for only the NPU primitives."""
-    def rms(x: torch.Tensor, weight: torch.Tensor, epsilon: float) -> tuple[torch.Tensor]:
-        """Compute a CPU RMS reference."""
+    def rms(x: torch.Tensor, weight: torch.Tensor, epsilon: float, cast_order: str) -> torch.Tensor:
+        """Compute a CPU RMS reference with the family-specific rounding order."""
         normalized = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + epsilon)
-        return (normalized.to(x.dtype) * weight,)
+        if cast_order == "before_weight":
+            return normalized.to(x.dtype) * weight
+        return (normalized * weight.float()).to(x.dtype)
 
     def rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, **_kwargs: Any) -> torch.Tensor:
         """Compute the independent CPU rotary reference."""
         first, second = x.chunk(2, dim=-1)
         return x * cos + torch.cat((-second, first), dim=-1) * sin
 
-    def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, atten_mask: Any,
-                  sparse_mode: int, keep_prob: float, scale: float, **_kwargs: Any) -> tuple[torch.Tensor]:
+    def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, head_num: int, input_layout: str,
+                  *, atten_mask: Any, sparse_mode: int, keep_prob: float, scale: float,
+                  **_kwargs: Any) -> tuple[torch.Tensor]:
         """Use CPU SDPA as the NPU primitive reference."""
+        assert input_layout == "BNSD"
+        assert head_num == q.shape[1]
         allowed = None if sparse_mode == 2 else ~atten_mask
         ratio = q.shape[1] // k.shape[1]
         out = torch.nn.functional.scaled_dot_product_attention(
@@ -98,7 +103,9 @@ def _cpu_kernels(monkeypatch):
         )
         return (out,)
 
-    monkeypatch.setattr(torch_npu, "npu_rms_norm", rms)
+    # CPU oracles replace the family NPU boundary, including its device precondition.
+    norm_module = importlib.import_module("hyper_parallel.components.modules.common.rms_norm")
+    monkeypatch.setattr(norm_module, "_npu_rms_norm", rms)
     monkeypatch.setattr(torch_npu, "npu_rotary_mul", rotary)
     monkeypatch.setattr(torch_npu, "npu_fusion_attention", attention)
 
@@ -123,7 +130,8 @@ def test_shared_loader_preserves_checkpoint_logits_and_gradients(tmp_path, monke
     ).eval()
     assert isinstance(model.model.layers[0].mlp, Qwen3MLP)
     assert setup.module_replacements
-    assert setup.plan_overrides
+    # Attention now owns its execution layout; the recipe needs no legacy region override.
+    assert not setup.plan_overrides
     assert model.lm_head.weight is model.model.embed_tokens.weight
     tokens = torch.tensor([[1, 2, 3, 4, 5], [5, 4, 3, 0, 0]])
     mask = tokens.ne(0)

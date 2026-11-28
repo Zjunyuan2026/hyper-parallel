@@ -21,7 +21,6 @@ plan/apply sharding -> activation checkpoint/swap -> FSDP2 ->
 materialize/load -> compile. This module consumes only normalized
 AutoModels objects and never imports trainer config (05 §15.2.6).
 """
-# pylint: disable=forbidden-backend-import
 
 import fnmatch
 import logging
@@ -30,12 +29,12 @@ from typing import Any, Dict, Literal, Optional, Union
 import torch
 from torch import nn
 from hyper_parallel import DTensor
+from hyper_parallel.core.activation_memory import ActivationWrapper
 from hyper_parallel.core.fully_shard.hsdp_utils import get_hsdp_state
+from hyper_parallel.high_availability.group_registry import is_recovery_bootstrapping
+from hyper_parallel.components.modules.megakernel_utils import prepare_module_runtimes
 from hyper_parallel.components.checkpoint.huggingface_checkpointer import (
     HuggingFaceCheckpointer,
-)
-from hyper_parallel.components.checkpoint.weight_conversion import (
-    get_model_conversion_mapping,
 )
 
 from hyper_parallel.models._transformers.checkpoint_loader import (
@@ -49,10 +48,6 @@ from hyper_parallel.models.materialization import (
 from hyper_parallel.distributed.activation_checkpoint import (
     _apply_activation_checkpointing,
 )
-from hyper_parallel.distributed.attention_swap import (
-    apply_attention_swap,
-    validate_attention_swap,
-)
 from hyper_parallel.distributed.compile import (
     _resolve_compile_config,
     apply_compile,
@@ -64,17 +59,19 @@ from hyper_parallel.distributed._builder.fsdp_adapter import (
 )
 from hyper_parallel.distributed.mesh import DistributedSetup, MeshContext
 from hyper_parallel.distributed.apply import apply_sharding_plan
+from hyper_parallel.distributed.module_binding import validate_materialized_modules
 from hyper_parallel.distributed._builder.planner import ShardingPlanner
-from hyper_parallel.models.registry import _resolve_custom_model_cls, get_model_adapter
+from hyper_parallel.components.modules.module_family import collect_family_modules
+from hyper_parallel.models.module_build import (
+    attach_build_context, build_module_context, prepare_model_components, resolve_effective_model_spec,
+)
+from hyper_parallel.models.registry import _resolve_custom_model_cls, resolve_model_adapter
 from hyper_parallel.models.external_state import (
     ExternalBuildContext,
     ExternalLoadContext,
     get_model_external_state,
 )
-from hyper_parallel.models.replacement import (
-    _apply_module_replacement_actions,
-    apply_method_replacements,
-)
+from hyper_parallel.models.replacement import apply_method_replacements
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +238,14 @@ def _init_model(
     return True, model
 
 
+def _has_module_owned_layouts(model):
+    """Family/native declarations remain active even for a size-one job."""
+    spec = resolve_model_adapter(model)
+    if spec is not None and (spec.sharding is not None or spec.native_parallel is not None):
+        return True
+    return any(boundary.info.resolved.sharding is not None for boundary in collect_family_modules(model))
+
+
 def _plan_and_apply_sharding(
     model: nn.Module,
     mesh,
@@ -256,7 +261,7 @@ def _plan_and_apply_sharding(
     if (
         sharding_planner is None
         or mesh is None
-        or (is_hf_model and not model_sharding_requested)
+        or (is_hf_model and not model_sharding_requested and not _has_module_owned_layouts(model))
     ):
         return model, None
     if mesh.device_mesh is None:
@@ -304,8 +309,38 @@ def _move_model_to_device(
         logger.info("Model moved to %s", device)
         return model
 
-    model.to_empty(device=device)
+    _to_empty_preserving_nonpersistent_buffers(model, device)
     return model
+
+
+def _to_empty_preserving_nonpersistent_buffers(model: nn.Module, device: torch.device) -> None:
+    """Materialize parameters without discarding config-derived buffers."""
+    snapshots = []
+    for module in model.modules():
+        for name in module._non_persistent_buffers_set:  # pylint: disable=W0212
+            buffer = module._buffers.get(name)  # pylint: disable=W0212
+            if buffer is None:
+                continue
+            if isinstance(buffer, DTensor):
+                logger.warning(
+                    "Non-persistent DTensor buffer %s on %s cannot be preserved across materialization",
+                    name,
+                    type(module).__name__,
+                )
+                continue
+            if buffer.is_meta:
+                logger.warning(
+                    "Non-persistent buffer %s on %s is on meta and cannot be preserved across materialization",
+                    name,
+                    type(module).__name__,
+                )
+                continue
+            snapshots.append((module, name, buffer.detach().clone()))
+
+    model.to_empty(device=device)
+    for module, name, buffer in snapshots:
+        current = module._buffers[name]  # pylint: disable=W0212
+        module._buffers[name] = buffer.to(device=current.device)  # pylint: disable=W0212
 
 
 def _initialize_model_weights(model: nn.Module) -> None:
@@ -334,6 +369,8 @@ def _initialize_model_weights(model: nn.Module) -> None:
                     reset_parameters()
     if native_initialization:
         for module in model.modules():
+            if isinstance(module, ActivationWrapper):
+                continue
             if not getattr(module, "_hp_reset_after_materialization", False):
                 continue
             reset_parameters = getattr(module, "reset_parameters", None)
@@ -342,29 +379,18 @@ def _initialize_model_weights(model: nn.Module) -> None:
     logger.info("Initialized model state with model-native random initialization")
 
 
-def _build_replacement_context(
-    distributed_setup: Any,
-    low_precision_config: Any,
-) -> dict[str, Any]:
-    """Build the replacement-factory context from the resolved setup."""
-    if low_precision_config is None:
-        low_precision_config = getattr(
-            distributed_setup,
-            "low_precision_config",
-            None,
+def _apply_model_method_replacements(model: nn.Module, distributed_setup: Any, low_precision_config: Any) -> None:
+    """Apply configured methods using the prepared model's logical context."""
+    rules = getattr(distributed_setup, "method_replacements", None) or ()
+    if not rules:
+        return
+    context = getattr(model, "_hp_module_build_context", None)
+    if context is None:
+        context = build_module_context(
+            distributed_setup, low_precision_config=low_precision_config, config=getattr(model, "config", None),
         )
-    low_precision_enabled = bool(
-        getattr(low_precision_config, "enabled", False)
-    )
-    mesh_context = getattr(distributed_setup, "mesh_context", None)
-    return {
-        "low_precision": low_precision_config if low_precision_enabled else None,
-        "tp": getattr(mesh_context, "tp_size", 1) > 1,
-        "cp": getattr(mesh_context, "cp_size", 1) > 1,
-        "ep": getattr(mesh_context, "ep_size", 1) > 1,
-        "pp": getattr(mesh_context, "pp_size", 1) > 1,
-        "sequence_parallel": bool(getattr(mesh_context, "sequence_parallel", False)),
-    }
+    context = {**context, "mesh_context": getattr(distributed_setup, "mesh_context", None)}
+    apply_method_replacements(model, rules, context=context)
 
 
 def _apply_pre_sharding_features(
@@ -429,16 +455,7 @@ def _apply_parameter_freezing(model: nn.Module, freeze_config: Any) -> None:
 
 def _apply_materialization_adapter(model: nn.Module) -> None:
     """Let a family adapter declare derived state on native or custom models."""
-    config = getattr(model, "config", None)
-    identities = [getattr(config, "model_type", None)]
-    identities.extend(getattr(config, "architectures", None) or ())
-    adapter_spec = None
-    for identity in identities:
-        if not identity:
-            continue
-        adapter_spec = get_model_adapter(identity)
-        if adapter_spec is not None:
-            break
+    adapter_spec = resolve_model_adapter(model)
     provider = getattr(adapter_spec, "materialization", None)
     if provider is None:
         return
@@ -451,38 +468,28 @@ def _apply_materialization_adapter(model: nn.Module) -> None:
 
 def _apply_activation_features(
     model: nn.Module,
-    activation_checkpoint: Optional[str],
-    activation_swap: str,
+    activation_checkpoint: Optional[Any],
     compile_for_execution: bool,
-    mesh: Optional[MeshContext],
-    swap_inputs: bool = False,
-    selection: Optional[Any] = None,
-    allow_cache_entry_mutation: bool = False,
-    apply_checkpoint: bool = True,
 ) -> nn.Module:
-    """Apply activation checkpointing and attention swap in execution order.
-
-    ``apply_checkpoint`` is False in graph mode: the joint-graph
-    ``ActivationCheckpointPass`` owns recompute, so the live model must stay
-    unwrapped. The requested mode is still passed to the attention-swap
-    validation so incompatible combinations keep failing.
-    """
-    if apply_checkpoint and activation_checkpoint not in (None, "off"):
+    """Apply the unified activation-checkpoint configuration."""
+    activation_checkpoint_mode = getattr(activation_checkpoint, "mode", None)
+    if activation_checkpoint is not None and activation_checkpoint_mode != "off":
         model = _apply_activation_checkpointing(
             model,
             activation_checkpoint,
             enable_compile=compile_for_execution,
-            swap_inputs=swap_inputs,
-            selection=selection,
-            allow_cache_entry_mutation=allow_cache_entry_mutation,
         )
-    validate_attention_swap(
-        activation_swap,
-        activation_checkpoint=activation_checkpoint,
-        enable_compile=compile_for_execution,
-        pp_size=getattr(mesh, "pp_size", 1),
-    )
-    return apply_attention_swap(model, activation_swap) if activation_swap != "none" else model
+        adapter_spec = resolve_model_adapter(model)
+        provider = getattr(adapter_spec, "activation_checkpointing", None)
+        if provider is not None:
+            if not callable(provider):
+                raise TypeError("ModelAdapterSpec.activation_checkpointing must be callable")
+            result = provider(model)
+            if result is not None:
+                raise TypeError(
+                    "ModelAdapterSpec.activation_checkpointing must mutate the model and return None"
+                )
+    return model
 
 
 def _materialize_and_load_model(
@@ -496,6 +503,13 @@ def _materialize_and_load_model(
 ) -> nn.Module:
     """Materialize model storage and load or initialize meta-device weights."""
     model = _move_model_to_device(model, is_meta_device, device)
+    if is_recovery_bootstrapping():
+        # Peers are parked in MindIO. Only allocate persistent local shards;
+        # repair installs their values before the first model collective.
+        external = get_model_external_state(model)
+        if external is not None:
+            external.materialize_for_recovery()
+        return model
     if not is_meta_device:
         return model
     external = get_model_external_state(model)
@@ -575,14 +589,7 @@ def _create_external_state(model: nn.Module, mesh: Optional[MeshContext],
                            validate_placement: bool, compile_for_execution: bool,
                            distributed_setup: Any, fsdp2_manager: Optional[FSDP2Manager]) -> Any:
     """Create and validate the model-owned external state after sharding."""
-    config = getattr(model, "config", None)
-    identities = (getattr(config, "model_type", None), *(getattr(config, "architectures", None) or ()))
-    adapter_spec = None
-    for identity in identities:
-        if identity:
-            adapter_spec = get_model_adapter(identity)
-            if adapter_spec is not None:
-                break
+    adapter_spec = resolve_model_adapter(model)
     provider = getattr(adapter_spec, "external_state", None)
     if provider is None:
         return None
@@ -604,16 +611,17 @@ def _maybe_apply_module_replacements(
     distributed_setup: Optional[Any],
     low_precision_config: Optional[Any],
     load_base_model: bool,
-    weights_mapping: Any,
 ) -> tuple:
-    """Apply native structure-preserving replacements."""
-    return _apply_module_replacement_actions(
-        model,
-        getattr(distributed_setup, "module_replacements", None),
-        weights_mapping=weights_mapping,
-        context=_build_replacement_context(distributed_setup, low_precision_config),
-        capture_checkpoint_metadata=load_base_model,
-    )
+    """Prepare source and directly composed components through the same entry point."""
+    context = getattr(model, "_hp_module_build_context", None)
+    if context is None:
+        spec = resolve_effective_model_spec(getattr(model, "config", None))
+        context = build_module_context(
+            distributed_setup, low_precision_config=low_precision_config, model_spec=spec,
+            config=getattr(model, "config", None),
+        )
+        attach_build_context(model, context)
+    return prepare_model_components(model, context, capture_checkpoint_metadata=load_base_model)
 
 
 def _tie_model_weights_before_parallelism(model: nn.Module) -> None:
@@ -667,6 +675,17 @@ def _apply_fsdp2_with_external(
     return model
 
 
+def _finalize_materialized_model(model: nn.Module, model_init_dtype: Optional[str], external: Any) -> None:
+    """Prepare materialized modules and their runtimes before compilation."""
+    # Final dtype conversion belongs to the atomic build (05 stage-5 item
+    # 5): the Trainer never patches model dtype after construction.
+    apply_model_init_dtype(model, model_init_dtype)
+    validate_materialized_modules(model)
+    prepare_module_runtimes(model)
+    if external is not None:
+        external.check_identities()
+
+
 def apply_model_infrastructure(
     model: nn.Module,
     mesh: Optional[MeshContext] = None,
@@ -677,11 +696,7 @@ def apply_model_infrastructure(
     fp8_config: Optional[Any] = None,
     freeze_config: Optional[Any] = None,
     compile_config: Optional[Union[CompileConfig, dict]] = None,
-    activation_checkpoint: Optional[str] = None,
-    activation_checkpoint_selection: Optional[Any] = None,
-    activation_swap: str = "none",
-    swap_inputs: bool = False,
-    allow_cache_entry_mutation: bool = False,
+    activation_checkpoint: Optional[Any] = None,
     is_meta_device: bool = False,
     is_hf_model: bool = False,
     device: Optional[torch.device] = None,
@@ -698,21 +713,51 @@ def apply_model_infrastructure(
     materialization/loading -> model_init_dtype conversion -> per-layer compile.
     Placement validation keeps the DTensor placement path and skips compile;
     FSDP2 consumes DTensor parameter layouts in both modes.
+
+    Args:
+        model: Final or source model tree for this build.
+        mesh: Job mesh carrying the logical parallel axes.
+        sharding_planner: Planner used to derive and apply logical layouts.
+        fsdp2_manager: Main-repository FSDP2 lifecycle manager, when configured.
+        peft_config: Optional parameter-efficient adaptation settings.
+        qat_config: Optional quantization-aware training settings.
+        fp8_config: Optional model precision settings.
+        freeze_config: Model subtrees whose parameters are frozen before planning.
+        compile_config: Optional compilation settings.
+        activation_checkpoint: Unified activation-checkpoint configuration.
+        is_meta_device: Whether parameters need storage materialization.
+        is_hf_model: Whether the source follows the HF model contract.
+        device: Target device for initialization and loading.
+        load_base_model: Whether to load a pretrained checkpoint after layout.
+        pretrained_path: Source checkpoint directory or identifier.
+        validate_placement: Whether to validate runtime tensor placements.
+        low_precision_config: Normalized online precision policy.
+        model_init_dtype: Model initialization dtype override.
+
     """
+
+    unsupported_activation_options = sorted(
+        set(kwargs) & {
+            "activation_swap",
+            "activation_checkpoint_selection",
+            "allow_cache_entry_mutation",
+            "swap_inputs",
+        }
+    )
+    if unsupported_activation_options:
+        raise ValueError(
+            "unsupported legacy activation options: "
+            f"{unsupported_activation_options}"
+        )
 
     distributed_setup = kwargs.get("distributed_setup")
     compile_config, compile_for_execution = _resolve_compile_config(
         compile_config, validate_placement, fsdp2_manager
     )
-    graph_mode_requested = bool(
-        compile_config is not None and compile_config.selects_graph_compiler()
-    )
     _apply_pre_sharding_features(peft_config, qat_config, fp8_config)
 
-    weights_mapping = get_model_conversion_mapping(model)
     model, weights_mapping = _maybe_apply_module_replacements(
-        model, distributed_setup, low_precision_config,
-        load_base_model, weights_mapping,
+        model, distributed_setup, low_precision_config, load_base_model,
     )
     if is_meta_device:
         _apply_materialization_adapter(model)
@@ -722,27 +767,17 @@ def apply_model_infrastructure(
     if freeze_config is not None:
         _apply_parameter_freezing(model, freeze_config)
 
-    method_context = _build_replacement_context(distributed_setup, low_precision_config)
-    method_context["mesh_context"] = getattr(distributed_setup, "mesh_context", None)
-    apply_method_replacements(
-        model,
-        getattr(distributed_setup, "method_replacements", None) or (),
-        context=method_context,
-    )
+    _apply_model_method_replacements(model, distributed_setup, low_precision_config)
 
     # Steps 7-8: plan and apply parameter/activation layouts.
     model, source_shard_info = _plan_and_apply_sharding(
-        model,
-        mesh,
-        sharding_planner,
-        is_hf_model,
-        validate_placement,
+        model, mesh, sharding_planner, is_hf_model, validate_placement,
     )
 
     model = _apply_activation_features(
-        model, activation_checkpoint, activation_swap, compile_for_execution, mesh,
-        swap_inputs=swap_inputs, selection=activation_checkpoint_selection,
-        allow_cache_entry_mutation=allow_cache_entry_mutation, apply_checkpoint=not graph_mode_requested,
+        model,
+        activation_checkpoint,
+        compile_for_execution,
     )
     external = _create_external_state(
         model, mesh, source_shard_info, device, is_meta_device, model_init_dtype,
@@ -751,19 +786,11 @@ def apply_model_infrastructure(
     model = _apply_fsdp2_with_external(model, fsdp2_manager, source_shard_info, external)
 
     model = _materialize_and_load_model(
-        model,
-        is_meta_device=is_meta_device,
-        device=device,
-        load_base_model=load_base_model,
-        pretrained_path=pretrained_path,
-        weights_mapping=weights_mapping,
+        model, is_meta_device=is_meta_device, device=device,
+        load_base_model=load_base_model, pretrained_path=pretrained_path, weights_mapping=weights_mapping,
     )
 
-    # Final dtype conversion belongs to the atomic build (05 stage-5 item
-    # 5): the Trainer never patches model dtype after construction.
-    apply_model_init_dtype(model, model_init_dtype)
-    if external is not None:
-        external.check_identities()
+    _finalize_materialized_model(model, model_init_dtype, external)
 
     if compile_for_execution:
         model = apply_compile(model, compile_config)
@@ -846,16 +873,18 @@ def _validate_model_state_dtype(
     external = get_model_external_state(model)
     external_ids = {id(parameter) for parameter in external.parameters.values()} if external is not None else set()
     fp32_ids = _model_fp32_parameter_ids(model)
+    preserved_buffers = _nonpersistent_buffer_names(model)
     mismatched = [
         name
-        for name, tensor in model.named_parameters(remove_duplicate=False)
-        if id(tensor) not in external_ids and (tensor.is_floating_point() or id(tensor) in fp32_ids)
+        for name, tensor in (
+            list(model.named_parameters(remove_duplicate=False))
+            + list(model.named_buffers(remove_duplicate=False))
+        )
+        if id(tensor) not in external_ids
+        and (tensor.is_floating_point() or id(tensor) in fp32_ids)
         and tensor.dtype != (torch.float32 if id(tensor) in fp32_ids else target_dtype)
+        and name not in preserved_buffers
     ]
-    mismatched.extend(
-        name for name, tensor in model.named_buffers(remove_duplicate=False)
-        if tensor.is_floating_point() and tensor.dtype != target_dtype
-    )
     if mismatched:
         raise RuntimeError(
             "Model initialization dtype validation failed for: "
@@ -884,6 +913,39 @@ def validate_model_init_dtype(
     _validate_model_state_dtype(model, target_dtype)
 
 
+def _snapshot_nonpersistent_buffers(model: nn.Module) -> list[tuple[nn.Module, str, torch.Tensor]]:
+    """Clone config-derived buffers before global dtype conversion."""
+    snapshots = []
+    for module in model.modules():
+        for name in module._non_persistent_buffers_set:  # pylint: disable=W0212
+            buffer = module._buffers.get(name)  # pylint: disable=W0212
+            if buffer is None or isinstance(buffer, DTensor) or buffer.is_meta:
+                continue
+            snapshots.append((module, name, buffer.detach().clone()))
+    return snapshots
+
+
+def _restore_nonpersistent_buffers(
+        snapshots: list[tuple[nn.Module, str, torch.Tensor]],
+) -> None:
+    """Restore non-persistent buffers with their original values and dtypes."""
+    for module, name, buffer in snapshots:
+        current = module._buffers.get(name)  # pylint: disable=W0212
+        device = buffer.device if current is None or current.is_meta else current.device
+        module._buffers[name] = buffer.to(device=device)  # pylint: disable=W0212
+
+
+def _nonpersistent_buffer_names(model: nn.Module) -> set[str]:
+    """Return fully qualified names of non-persistent buffers."""
+    names = set()
+    for module_name, module in model.named_modules(remove_duplicate=False):
+        for tensor_name in module._non_persistent_buffers_set:  # pylint: disable=W0212
+            if module._buffers.get(tensor_name) is None:  # pylint: disable=W0212
+                continue
+            names.add(f"{module_name}.{tensor_name}" if module_name else tensor_name)
+    return names
+
+
 def apply_model_init_dtype(
         model: nn.Module,
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]],
@@ -904,12 +966,14 @@ def apply_model_init_dtype(
 
     identities_before = _model_tensor_identities(model)
     layouts_before = _dtensor_layouts(model)
+    nonpersistent_buffers = _snapshot_nonpersistent_buffers(model)
     swap_on_conversion = torch.__future__.get_swap_module_params_on_conversion()
     torch.__future__.set_swap_module_params_on_conversion(True)
     try:
         model.to(dtype=target_dtype)
     finally:
         torch.__future__.set_swap_module_params_on_conversion(swap_on_conversion)
+    _restore_nonpersistent_buffers(nonpersistent_buffers)
 
     if _model_tensor_identities(model) != identities_before:
         raise RuntimeError(

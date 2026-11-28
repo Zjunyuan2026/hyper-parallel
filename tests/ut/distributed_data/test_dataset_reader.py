@@ -17,10 +17,10 @@
 import unittest
 from unittest.mock import patch
 
-import torch  # pylint: disable=forbidden-backend-import
+import torch
 
-from hyper_parallel.distributed_data.metadata import PlannedSampleLoader
-from hyper_parallel.distributed_data.schema import SampleKey
+from hyper_parallel.data.distributed.metadata import PlannedSampleLoader
+from hyper_parallel.data.distributed.schema import SampleKey
 
 
 class _PinnablePayload:

@@ -27,7 +27,7 @@ QWEN3_MODELS = (
             "rotary": "transformers.models.qwen3.modeling_qwen3.Qwen3RotaryEmbedding",
         },
         "builder_target": "rl.workers.adapters.qwen3.Qwen3AutoModel",
-        "attention_factory": (
+        "gqa_factory": (
             "hyper_parallel.models.qwen3.adapter.conversion.module_replacement.replace_qwen3_flash_attention"
         ),
         "row_projections": ("*.self_attn.o_proj", "*.mlp.down_proj"),
@@ -45,10 +45,9 @@ QWEN3_MODELS = (
             "moe_block": "transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeSparseMoeBlock",
         },
         "builder_target": "rl.workers.adapters.qwen3.Qwen3AutoModel",
-        "attention_factory": (
+        "gqa_factory": (
             "hyper_parallel.models.qwen3_moe.adapter.conversion.module_replacement.replace_qwen3_moe_flash_attention"
         ),
         "row_projections": ("*.self_attn.o_proj",),
-        "router_adapter": "qwen3moe",
     },
 )

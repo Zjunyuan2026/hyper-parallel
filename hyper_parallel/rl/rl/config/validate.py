@@ -27,10 +27,11 @@ from rl.data.prompts import validate_chat_template_kwargs, validate_row_adapter_
 from rl.workers.engine.model import ModelRegistration, resolve_model, resolve_vllm_model
 from rl.reward_model.scoring import load_reward_function
 from rl.rollout.registry import ROLLOUT_ENGINES
+from rl.rollout.router_capture import uses_v2_router_capture
 from rl.rollout.topology import model_parallel_size
 from rl.weight_sync.config import resolve_weight_sync_config
-from rl.unified_execution.core.contract import validate_unified_config
-from rl.unified_execution.core.execution_plan import pik_row_options
+from rl.unified_execution.contract import validate_unified_config
+from rl.unified_execution.execution_plan import pik_row_options
 from rl.config.schema import (
     AsyncTrainingConfig, ColocateAsyncConfig, _EXPECTED_TOP_LEVEL, _HCCL_MAX_PORT, _HCCL_MIN_PORT,
     _async_integer, _normalize_dtype_name, _optimizer_fp32_main_params, _positive_integer,
@@ -216,22 +217,12 @@ def _validate_colocated_vllm(
             "Colocated rollout derives its physical NPUs from the Trainer; "
             "remove rollout.vllm.visible_devices"
         )
-    local_world = vllm.get("node_local_world_size", trainer_world_size)
-    if (isinstance(local_world, bool) or not isinstance(local_world, int) or local_world < 1
-            or trainer_world_size % local_world):
-        raise ValueError("rollout.vllm.node_local_world_size must be a positive divisor of the Trainer world")
-    if vllm.get("node_local_world_size") is not None:
-        if int(os.environ.get("LOCAL_WORLD_SIZE", local_world)) != local_world:
-            raise ValueError("node_local_world_size differs from torchrun LOCAL_WORLD_SIZE")
-        if local_world % (int(accelerator.get("tp", 1)) * int(accelerator.get("cp", 1))):
-            raise ValueError("Trainer TP x CP groups must fit within each rollout node")
-    if rollout_dp * model_parallel_size(vllm) != local_world:
+    if rollout_dp * model_parallel_size(vllm) != trainer_world_size:
         raise ValueError(
-            "Colocated rollout devices must match the Trainer rollout domain: "
+            "Colocated rollout devices must match the Trainer world: "
             f"data_parallel_size={rollout_dp}, tensor_parallel_size={rollout_tp}, "
             f"pipeline_parallel_size={vllm.get('pipeline_parallel_size', 1)}, "
-            f"context_parallel_size={vllm.get('context_parallel_size', 1)}, "
-            f"trainer_world_size={trainer_world_size}, node_local_world_size={local_world}"
+            f"context_parallel_size={vllm.get('context_parallel_size', 1)}, trainer_world_size={trainer_world_size}"
         )
 
 
@@ -395,13 +386,11 @@ def _validate_router_replay(config: Mapping[str, Any], model: ModelRegistration)
     agentic = required_mapping(config, "agentic")
     if agentic.get("runner", "internal") not in ("internal", "codex"):
         raise ValueError("R3 currently supports only internal and Codex runners")
-    if vllm.get("data_parallel_size", 1) != 1:
-        raise ValueError(
-            "R3 requires rollout.vllm.data_parallel_size=1: router capture in fixed "
-            "vLLM 0.23.0/vLLM-Ascend 0.23.0.post1 does not support DP padding"
-        )
-    if vllm.get("enforce_eager", True) is not True:
-        raise ValueError("R3 currently requires rollout.vllm.enforce_eager=true")
+    if not uses_v2_router_capture():
+        if vllm.get("data_parallel_size", 1) != 1:
+            raise ValueError("Legacy R3 requires rollout.vllm.data_parallel_size=1 due to DP padding")
+        if vllm.get("enforce_eager", True) is not True:
+            raise ValueError("Legacy R3 requires rollout.vllm.enforce_eager=true")
     if vllm.get("logprobs_mode") != "raw_logprobs":
         raise ValueError("R3 requires rollout.vllm.logprobs_mode=raw_logprobs")
 
@@ -477,25 +466,11 @@ def _validate_vllm(
     vllm = optional_mapping(rollout, "vllm")
     deployment, rollout_dp, rollout_tp = _validate_vllm_basics(vllm)
     trainer_world_size = _trainer_world_size(accelerator)
-    if vllm.get("node_local_world_size") is not None and (
-        deployment != "colocated" or model_registration.family != "qwen3_moe"
-        or vllm.get("model_implementation", "native") not in ("native", "unified")
-    ):
-        raise ValueError("Node-local rollout requires colocated native or unified Qwen3 MoE")
     if deployment == "colocated":
-        resident_moe = (model_registration.family == "qwen3_moe" and (
-            vllm.get("model_implementation", "native") == "unified" or (
-                vllm.get("model_implementation", "native") == "native"
-                and vllm.get("node_local_world_size") is not None
-                and vllm.get("enable_expert_parallel", False)
-            )
-        ))
-        if not accelerator.get("cpu_offload", False) and (
-            model_registration.family != "qwen3" or int(accelerator.get("tp", 1)) != 1
-        ) and not resident_moe:
-            raise ValueError("Colocated device-resident training requires dense TP1, "
-                             "unified MoE or node-local native EP MoE")
-        _validate_colocated_vllm(vllm, accelerator, trainer_world_size, rollout_dp, rollout_tp)
+        local_world = int(os.environ.get("LOCAL_WORLD_SIZE", trainer_world_size))
+        if local_world <= 0 or trainer_world_size % local_world:
+            raise ValueError("LOCAL_WORLD_SIZE must divide the global training world")
+        _validate_colocated_vllm(vllm, accelerator, local_world, rollout_dp, rollout_tp)
     else:
         _validate_disjoint_vllm(vllm, trainer_world_size, rollout_dp)
     _validate_vllm_limits(vllm)
@@ -718,7 +693,7 @@ def _validate_checkpoint(checkpoint: Mapping[str, Any]) -> None:
     verify_reload = bool(checkpoint.get("verify_reload", False))
     save_steps = int(checkpoint.get("save_steps", 0))
     if checkpoint.get("save_final_model_only", False) and (not save_final or verify_reload or save_steps != 0):
-        raise ValueError("checkpoint.save_final_model_only requires save_final=true, save_steps=0, verify_reload=false")
+        raise ValueError("Final-model-only export requires save_final, no periodic saves and no reload verification")
     if verify_reload and not save_final:
         raise ValueError("checkpoint.verify_reload requires checkpoint.save_final=true")
     if save_steps < 0:
@@ -823,7 +798,18 @@ def _validate_training_residency(config: Mapping[str, Any], algorithm: RLAlgorit
         raise ValueError("train.gradient_sync_each_micro_batch must be a boolean")
     if uses_colocated_vllm(config) and not accelerator.get("cpu_offload", False):
         if algorithm.name != "grpo":
-            raise ValueError("Colocated device-resident training currently requires GRPO with consistency off")
+            raise ValueError("Colocated device-resident training requires GRPO")
+
+    reference_offload = accelerator.get("reference_cpu_offload", accelerator.get("cpu_offload", False))
+    if reference_offload != accelerator.get("cpu_offload", False) and algorithm.name != "grpo":
+        raise ValueError("Independent Reference offload requires GRPO")
+    if accelerator.get("offload_during_rollout", False) and (
+        not uses_colocated_vllm(config) or algorithm.name != "grpo"
+        or parse_distillation_config(config.get("distillation")).enabled or "reward_model" in config
+    ):
+        raise ValueError(
+            "offload_during_rollout requires colocated GRPO without distillation or a reward model"
+        )
 
 
 def _validate_training_optimizer(train: Mapping[str, Any], rollout: Mapping[str, Any],
@@ -843,22 +829,6 @@ def _validate_training_optimizer(train: Mapping[str, Any], rollout: Mapping[str,
         critic_optimizer = {**optimizer, **optional_mapping(optional_mapping(train, "critic"), "optimizer")}
         if _optimizer_fp32_main_params(critic_optimizer) != main_params:
             raise ValueError("Actor and Critic must use the same fp32_main_params policy")
-
-
-def _validate_rollout_offload(config: Mapping[str, Any], model_registration: ModelRegistration,
-                              algorithm: RLAlgorithm) -> None:
-    """Restrict phase offload to model and rollout combinations that support it."""
-    accelerator = required_mapping(required_mapping(config, "train"), "accelerator")
-    if accelerator.get("offload_during_rollout", False) and (
-        not uses_colocated_vllm(config) or model_registration.family != "qwen3"
-        or int(accelerator.get("tp", 1)) != 1 or algorithm.name != "grpo"
-
-        or parse_distillation_config(config.get("distillation")).enabled or "reward_model" in config
-    ):
-        raise ValueError(
-            "offload_during_rollout requires colocated Qwen3 dense TP1 GRPO with consistency off, "
-            "no distillation or reward model"
-        )
 
 
 def _validate_dynamic_batching(config: Mapping[str, Any], model_registration: ModelRegistration,
@@ -931,21 +901,9 @@ def validate_config(config: Mapping[str, Any], algorithm: RLAlgorithm) -> None:
     _validate_accelerator_options(train, accelerator, config, algorithm)
     _validate_training_optimizer(train, rollout, model, algorithm)
     model_registration = build_model_registration(config)
-    if optional_mapping(rollout, "vllm").get("node_local_world_size") is not None and (
-        algorithm.name != "grpo" or agentic.get("runner", "internal") != "internal"
-        or "async_training" in config or "colocate_async" in config
-    ):
-        raise ValueError("Node-local rollout currently requires synchronous internal GRPO")
-    _validate_rollout_offload(config, model_registration, algorithm)
     _validate_model_scope(config, model_registration)
     _validate_token_log_probs(config, model_registration, algorithm)
     _validate_dynamic_batching(config, model_registration, algorithm)
-    reference_offload = accelerator.get("reference_cpu_offload", accelerator.get("cpu_offload", False))
-    if reference_offload != accelerator.get("cpu_offload", False) and (
-        model_registration.family != "qwen3" or int(accelerator.get("tp", 1)) != 1
-        or algorithm.name != "grpo"
-    ):
-        raise ValueError("Independent Reference offload requires Qwen3 dense TP1 GRPO with consistency off")
     _validate_model_and_data_paths(model, data, evaluation)
     _validate_training_sizes(train, rollout, data, algorithm, agentic)
     _validate_evaluation(evaluation)

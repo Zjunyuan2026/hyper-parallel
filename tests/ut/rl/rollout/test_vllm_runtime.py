@@ -15,7 +15,7 @@
 """CPU unit tests for the primary shared-vLLM runtime contracts."""
 # Tests intentionally exercise stable internal HTTP and ownership seams.
 # Local test doubles are not public APIs; the suite intentionally uses Torch CPU tensors.
-# pylint: disable=forbidden-backend-import,missing-public-docstring,protected-access,no-member,unnecessary-lambda
+# pylint: disable=missing-public-docstring,protected-access,no-member,unnecessary-lambda
 
 import asyncio
 import json
@@ -480,9 +480,6 @@ def test_shared_server_builds_command_and_isolated_environment(
     )
     engine = vllm_module.build_vllm_engine({"vllm": vllm_config}, _model())
     monkeypatch.setenv("RANK", "9")
-    monkeypatch.setenv("NNODES", "4")
-    monkeypatch.setenv("NODE_RANK", "2")
-    monkeypatch.setenv("NODE_ADDR", "192.0.2.3")
     monkeypatch.setenv("TASK_QUEUE_ENABLE", "1")
     command = engine._server_command("127.0.0.1", 8100)
     environment = engine._server_environment("0,1,2,3")
@@ -505,7 +502,6 @@ def test_shared_server_builds_command_and_isolated_environment(
     assert environment["HCCL_IF_BASE_PORT"] == "65000"
     assert "HYPER_RL_CONSISTENCY_PROFILE" not in environment
     assert "RANK" not in environment
-    assert not {"NNODES", "NODE_RANK", "NODE_ADDR"} & environment.keys()
 
 
 def test_server_cpu_threads_are_isolated_from_training(monkeypatch: pytest.MonkeyPatch) -> None:

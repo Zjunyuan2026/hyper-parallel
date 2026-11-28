@@ -21,7 +21,7 @@ providers* plus the frozen plan, never from a family-name dispatch table:
 * a YAML ``replace_module._target_`` names the family's own
   ``@module_replacement`` factory; inspecting that factory's source reveals
   which generic component it constructs (``RMSNorm`` / ``GroupedExperts`` /
-  ``GQAAttention``) and, for fused attention, the kernel entry it hands over;
+  ``GroupedQueryAttention``) and, for fused attention, the kernel entry it hands over;
 * a YAML ``replace_module._target_`` that names a generic component class
   directly (under ``hyper_parallel.components.``) resolves through that
   component's own wrap-style constructor -- the same declaration the native
@@ -45,10 +45,16 @@ may rely on object identity across calls).
 
 from __future__ import annotations
 
+import ast
 import importlib
+from functools import lru_cache
 import inspect
+import textwrap
 from typing import Any, Callable, cast
 
+from hyper_parallel.components.modules.family import get_module_family
+
+from hyper_parallel.codegen.inline.component_source import render_component_source
 from hyper_parallel.codegen.inline.ir import (
     ImportPatch,
     ModuleSnippetPatch,
@@ -73,7 +79,11 @@ return self._forward_impl(__hp_forward_args__)
 
 
 def cp_dispatch_shell_body(helper_name: str) -> str:
-    """Render CP dispatch around the extracted original forward."""
+    """Render CP dispatch around the extracted original forward.
+
+    Args:
+        helper_name: Generated helper that implements the selected CP forward.
+    """
     return _CP_DISPATCH_SHELL.format(helper_name=helper_name)
 
 #: The framework CP attention strategy kind (structure-keyed, not family-named).
@@ -181,8 +191,8 @@ def _component_replacement_target(component: type) -> ReplacementTarget | None:
     )
 
 
-def _component_class(target: ReplacementTarget) -> type:
-    """Import the component class one factory constructs.
+def _replacement_component(target: ReplacementTarget) -> Callable[..., Any]:
+    """Import the component class or registered family a factory constructs.
 
     Lazy by construction: the component's own module is imported only when a
     rule that constructs it is actually present (``components.modules``
@@ -190,16 +200,16 @@ def _component_class(target: ReplacementTarget) -> type:
     """
     module = importlib.import_module(target.module)
     component = getattr(module, target.component, None)
-    if not isinstance(component, type):
+    if not isinstance(component, type) and get_module_family(component) is None:
         raise RuntimeError(
-            f"codegen: {target.module!r} does not export the class "
+            f"codegen: {target.module!r} does not export the component "
             f"{target.component!r} the replacement factory constructs"
         )
     return component
 
 
 def _render_arguments(
-    target: ReplacementTarget, component: type
+    target: ReplacementTarget, component: Callable[..., Any]
 ) -> tuple[str, ...] | None:
     """Render the constructor keywords the generated call passes.
 
@@ -247,10 +257,18 @@ def _build_replacement_spec(
     (visible in the artifact) instead of merely imported. ``None`` means the
     construction is not one codegen can sink into the generated ``__init__``.
     """
-    component = _component_class(target)
+    component = _replacement_component(target)
     keyword_args = _render_arguments(target, component)
     if keyword_args is None:
         return None
+    if get_module_family(component) is not None:
+        # A thin source-model adapter may delegate to a registered family.
+        # Preserve that request so later TP/CP promotion does not freeze the local class.
+        return ReplacementSpec(
+            old_ctor=old_ctor, new_ctor=target.component,
+            imports=(ImportPatch(target.module, (target.component,)),),
+            mode="wrap_source", keyword_args=keyword_args, remove_class=False, defer_to_fqns=True,
+        )
     # A component that receives a family interface is rendered into the artifact,
     # so its class is defined there -- importing it as well would be dead weight
     # the rendered definition shadows.
@@ -293,7 +311,7 @@ def _build_replacement_spec(
 #: repeated lookup returns the same object (callers may compare identity) and
 #: the expensive fused-attention render runs once.
 _REPLACEMENT_CACHE: dict[tuple[str | None, Any, str | None], ReplacementSpec | None] = {}
-_STRATEGY_CACHE: dict[tuple[str | None, str | None, bool], StrategySpec | None] = {}
+_STRATEGY_CACHE: dict[tuple[str | None, str | None, bool, tuple[str, ...]], StrategySpec | None] = {}
 
 
 def replacement_spec_for(
@@ -307,9 +325,20 @@ def replacement_spec_for(
     ``module_type`` is the matched source module's dotted type path from the
     YAML rule; the source class name (``old_ctor``) is its class name — a
     property of the matched source module, never a hand-written literal.
+
+    Args:
+        target: Import path of the replacement factory or component.
+        model_type: Optional source model type.
+        module_type: Observed source module type used to match construction sites.
     """
     if target is None:
         return None
+    # Builder observations serialize callables as module:attribute, while YAML
+    # commonly uses module.attribute. Both identify the same replacement.
+    target = target.replace(":", ".", 1)
+    family_spec = _module_family_replacement_spec(target, module_type)
+    if family_spec is not None:
+        return family_spec
     if _direct_component_class(target) is not None:
         return _component_replacement_spec(target, model_type, module_type=module_type)
     if not adapter_path_parts(target):
@@ -327,6 +356,25 @@ def replacement_spec_for(
     spec = _resolve_replacement_spec(factory, model_type, module_type, target)
     _REPLACEMENT_CACHE[key] = spec
     return spec
+
+
+
+def _module_family_replacement_spec(target: str, module_type: str | None) -> ReplacementSpec | None:
+    """Retain registered module-family construction instead of freezing its concrete class."""
+    module_name, _, name = target.replace(":", ".", 1).rpartition(".")
+    if not module_name or not name:
+        return None
+    try:
+        factory = getattr(importlib.import_module(module_name), name, None)
+    except ImportError:
+        return None
+    if get_module_family(factory) is None or not class_name_of(module_type):
+        return None
+    return ReplacementSpec(
+        old_ctor=class_name_of(module_type), new_ctor=name,
+        imports=(ImportPatch(module_name, (name,)),), mode="wrap_source",
+        keyword_args=("module_fqn=''",), remove_class=False, defer_to_fqns=True,
+    )
 
 
 def _resolve_replacement_spec(
@@ -386,6 +434,7 @@ def strategy_spec_for(
     model_type: str | None = None,
     *,
     inner_wrapper: bool = False,
+    construction_kwargs: tuple[str, ...] = (),
 ) -> StrategySpec | None:
     """Resolve a strategy target from structure.
 
@@ -393,25 +442,33 @@ def strategy_spec_for(
     framework CP attention strategy (imports only). EP mutations come from the
     builder recorder instead of secondary structural inference. Anything else
     is unresolvable and yields ``None`` — recognition never guesses a strategy.
+
+    Args:
+        target: Import path of the selected strategy.
+        model_type: Optional source model type.
+        inner_wrapper: Whether the strategy wraps the existing forward boundary.
+        construction_kwargs: Literal arguments already recorded for the selected wrapper.
     """
     if target is None:
         return None
     model_type = _family_key(model_type, target)
-    key = (target, model_type, inner_wrapper)
+    key = (target, model_type, inner_wrapper, construction_kwargs)
     if key in _STRATEGY_CACHE:
         return _STRATEGY_CACHE[key]
-    spec = _resolve_strategy_spec(target, inner_wrapper)
+    spec = _resolve_strategy_spec(target, inner_wrapper, construction_kwargs)
     _STRATEGY_CACHE[key] = spec
     return spec
 
 
-def _resolve_strategy_spec(target: str, inner_wrapper: bool) -> StrategySpec | None:
+def _resolve_strategy_spec(
+    target: str, inner_wrapper: bool, construction_kwargs: tuple[str, ...],
+) -> StrategySpec | None:
     if inner_wrapper:
-        return _cp_strategy_spec(target)
+        return _cp_strategy_spec(target, construction_kwargs=construction_kwargs)
     return None
 
 
-def _cp_strategy_spec(target: str) -> StrategySpec:
+def _cp_strategy_spec(target: str, *, construction_kwargs: tuple[str, ...] = ()) -> StrategySpec:
     """Build the CP strategy spec: an in-place dispatch shell plus imports.
 
     A recognizable inner forward rewrite participates in inline CP: the
@@ -421,28 +478,29 @@ def _cp_strategy_spec(target: str) -> StrategySpec:
     active. The helper is the same kernel the runtime CP wrapper delegates
     to (trainer and codegen share one CP implementation), and the import is
     derived from the wrapper factory source, so this module never hardcodes a
-    family helper and
-    stays free of torch imports at resolution time.  ``subclass_state_attr``
-    carries the family kernel's companion attribute so the runtime binding
-    satisfies the identical contract the native wrapper installs.
+    family helper and stays free of torch imports at resolution time.
 
-    Families without an inline helper keep the original framework CP
-    strategy (imports only), preserving the runtime wrapper path.
+    Unrecognized wrappers carry no source body; artifact verification must
+    reject a declared patch that was not materialized.
     """
-    resolved = inner_wrapper_target(target)
+    resolved = inner_wrapper_target(target, construction_kwargs=construction_kwargs)
     if resolved is None:
         return StrategySpec(kind=CP_ATTENTION_KIND, imports=())
+    imports = tuple(ImportPatch(module, (name,)) for module, name in resolved.extra_imports)
+    if resolved.helper_module and resolved.helper_name:
+        imports = (ImportPatch(resolved.helper_module, (resolved.helper_name,)), *imports)
     if resolved.inline_body is not None:
         return StrategySpec(
             kind=CP_ATTENTION_KIND,
             subclass_shell=resolved.inline_body,
-            imports=(),
+            imports=imports,
+            definition=resolved.definition,
+            snippets=tuple(ModuleSnippetPatch(source) for source in resolved.bindings),
         )
     return StrategySpec(
         kind=CP_ATTENTION_KIND,
         subclass_shell=cp_dispatch_shell_body(resolved.helper_name),
-        subclass_state_attr=resolved.state_attr,
-        imports=(ImportPatch(resolved.helper_module, (resolved.helper_name,)),),
+        imports=imports,
     )
 
 
@@ -452,3 +510,73 @@ __all__ = [
     "replacement_spec_for",
     "strategy_spec_for",
 ]
+
+
+def observed_constructor_spec(rule: Any) -> ReplacementSpec | None:
+    """Use the native-selected class and its existing construction contracts."""
+    module_name, name = rule.construction["implementation"].replace(":", ".", 1).rsplit(".", 1)
+    component = getattr(importlib.import_module(module_name), name)
+    parameters = inspect.signature(component.__init__).parameters
+    values = dict(item.split("=", 1) for item in rule.construction_kwargs)
+    values.update({name: repr(value) for name, value in rule.construction.get("arguments", {}).items()})
+    arguments = []
+    ignored = _ignored_constructor_parameters(component)
+    for key, value in values.items():
+        if key in parameters and key not in ignored and key != "module_fqn" and value != "None":
+            arguments.append(f"{key}={value}")
+    mode = _observed_constructor_mode(component, parameters)
+    if mode == "wrap_source" and "module" not in parameters:
+        return replacement_spec_for(rule.replace_target, module_type=rule.module_type)
+    imports, snippets = _observed_component_source(component)
+    return ReplacementSpec(
+        old_ctor=class_name_of(rule.module_type), new_ctor=name,
+        imports=imports, mode=mode,
+        keyword_args=tuple(arguments), remove_class=False, snippets=snippets,
+    )
+
+
+def _observed_constructor_mode(component: type, parameters: Any) -> str:
+    """Require the source argument before considering a member's direct construction interface."""
+    module = parameters.get("module")
+    if module is not None and module.default is inspect.Parameter.empty:
+        return "wrap_source"
+    if {"hidden_size", "eps"} <= parameters.keys():
+        return "construct"
+    if ("config" in parameters and callable(getattr(component, "_initialize_source", None))
+            and callable(getattr(component, "_initialize_config", None))):
+        return "config"
+    return "wrap_source"
+
+
+def _observed_component_source(component: type) -> tuple[tuple[ImportPatch, ...], tuple[ModuleSnippetPatch, ...]]:
+    """Expose native member stages absent from the legacy injection records."""
+    if not callable(getattr(component, "parallel_module_spec", None)):
+        return (ImportPatch(component.__module__, (component.__name__,)),), ()
+    expanded = render_component_source(component)
+    imports = tuple(ImportPatch(module="", names=(), raw=line) for line in expanded.imports)
+    snippets = tuple(ModuleSnippetPatch(ast.unparse(node)) for node in ast.parse(expanded.source).body)
+    return imports, snippets
+
+
+@lru_cache(maxsize=None)
+def _ignored_constructor_parameters(component: type) -> frozenset[str]:
+    """Read unused native arguments, following only explicit super keyword forwarding."""
+    owner = next(base for base in component.__mro__ if "__init__" in base.__dict__)
+    try:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(owner.__init__)))
+    except (OSError, TypeError):
+        return frozenset()
+    inherited = _ignored_constructor_parameters(owner.__mro__[1]) if len(owner.__mro__) > 1 else frozenset()
+    _discard_unused_super_keywords(tree, inherited)
+    loaded = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
+    return frozenset(inspect.signature(owner.__init__).parameters) - loaded - {"self"}
+
+
+def _discard_unused_super_keywords(tree: ast.AST, inherited: frozenset[str]) -> None:
+    """Exclude forwarding reads only when the native parent ignores the argument."""
+    for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
+        if (isinstance(call.func, ast.Attribute) and call.func.attr == "__init__"
+                and isinstance(call.func.value, ast.Call) and isinstance(call.func.value.func, ast.Name)
+                and call.func.value.func.id == "super"):
+            call.keywords = [kw for kw in call.keywords
+                             if not (kw.arg in inherited and isinstance(kw.value, ast.Name))]

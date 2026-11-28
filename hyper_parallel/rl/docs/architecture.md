@@ -113,9 +113,6 @@ Failure at any stage prevents committing a new version or resuming sampling; tra
 
 The new format uses `schema=2` and is incompatible with historical checkpoints. Missing or mismatched versions fail before model loading.
 HP DCP saves the model and rank-local optimizer, scheduler, dataloader, and RNG; the completion marker is committed last.
-For inference-only final artifacts, `train.checkpoint.save_final_model_only=true` exports only HF weights and tokenizer
-under `output_dir/step_<last>/hf/`. It requires `save_final=true`, `save_steps=0`, and `verify_reload=false`.
-This export has no resumable optimizer/RNG state or DCP completion marker; the default full recovery format is unchanged.
 Recovery preserves FP32 master-parameter precision, parallel topology, Critic ownership, and Teacher/RM identity checks; RNG is restored after other state.
 Asynchronous completion markers bind sample-state checksums and configuration fingerprints. Samples use versioned fields without storing Python import paths for RL classes.
 Recovery requires a drained producer, with no in-flight or selected uncommitted groups; corrupt or incompatible snapshots must not be silently accepted.

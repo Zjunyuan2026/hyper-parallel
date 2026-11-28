@@ -26,6 +26,8 @@
 /hyper_parallel/core/shard/ @yangzhenzhang02
 /hyper_parallel/core/shard/ops/ @davidhe91
 
+# The maintainers of hyper_parallel/high_availability.
+/hyper_parallel/high_availability/ @zhangbuxue @xiaoyuxing-010818
 
 # The maintainers of hyper_parallel/compile.
 /hyper_parallel/compile/ @kisnwangg @yu-chen-code
@@ -52,8 +54,6 @@
 /requirements.txt  @yangzhenzhang02
 /setup.py  @yangzhenzhang02
 
-/hyper_parallel/core/multicore/ @davidhe91 @Probiotics5333
-/tests/ut/core/multicore/ @davidhe91 @Probiotics5333
 /tests/torch/multicore/ @davidhe91 @Probiotics5333
 
 # Hyper-RL code and Qwen3 adapters.
@@ -63,7 +63,7 @@
 # Hyper-RL tests.
 /tests/ut/rl/ @liuchongming74 @kisnwangg
 /hyper_parallel/rl/tests/ @yangzhenzhang02 @kisnwangg
-/tests/common/rl_st_cases.py @liuchongming74 @kisnwangg
+/hyper_parallel/rl/tests/st/st_cases.py @liuchongming74 @kisnwangg
 
 # Hyper-RL documentation and development rules.
 /docs/rl-*.md @yangzhenzhang02 @gemini524 @kisnwangg

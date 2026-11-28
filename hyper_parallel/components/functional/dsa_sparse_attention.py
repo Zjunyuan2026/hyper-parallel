@@ -16,8 +16,8 @@
 
 from typing import Any, Tuple
 
-import torch  # pylint: disable=forbidden-backend-import
-import torch.nn.functional as F  # pylint: disable=forbidden-backend-import
+import torch
+import torch.nn.functional as F
 from einops import rearrange
 
 from hyper_parallel.tools.logging import get_logger
@@ -77,10 +77,11 @@ def _sparse_attention_backward(
     layout: str,
     grad_op: Any,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-    """Let CANN GradV2 merge gradients for the shared K/V tensor."""
+    """Pass shared K/V explicitly and merge their gradients for the shared input."""
     key = key.contiguous()
     result = grad_op(
-        query.contiguous(), key, None, indices.contiguous(), grad_output.contiguous(),
+        query.contiguous(), key, key,
+        indices.contiguous(), grad_output.contiguous(),
         output.contiguous(), maximum.contiguous(), total.contiguous(), None, scale, 1,
         query_rope=None if query_rope is None else query_rope.contiguous(),
         key_rope=None if key_rope is None else key_rope.contiguous(),
@@ -90,10 +91,11 @@ def _sparse_attention_backward(
         sparse_mode=3,
         attention_mode=2,
     )
-    grad_query, grad_key, _, grad_query_rope, grad_key_rope, _ = result
+    grad_query, grad_key, grad_value, grad_query_rope, grad_key_rope, _ = result
+    shared_key_gradient = grad_key + grad_value
     return (
         grad_query,
-        grad_key,
+        shared_key_gradient,
         None if query_rope is None else grad_query_rope,
         None if key_rope is None else grad_key_rope,
     )
@@ -212,7 +214,7 @@ def dsa_sparse_attention(
     # Load only the selected optional backend so either can be used independently.
     # pylint: disable=import-outside-toplevel
     if backend == "cann":
-        import torch_npu  # pylint: disable=forbidden-backend-import
+        import torch_npu
 
         output, softmax_max, softmax_sum = _cann_sparse_attention(
             query_tnd,

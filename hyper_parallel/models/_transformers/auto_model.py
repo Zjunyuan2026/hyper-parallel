@@ -17,7 +17,9 @@
 Following design doc 01_hf_compatibility_layer.md §6.
 Stub — provides from_pretrained/from_config as entry points.
 """
+# pylint: disable=forbidden-backend-import
 
+import importlib
 import logging
 from typing import Any, Literal, Optional, Union
 
@@ -38,6 +40,9 @@ from hyper_parallel.models._transformers.model_builder import (
     instantiate_infrastructure,
 )
 from hyper_parallel.models._transformers.config_resolver import get_hf_config, get_is_hf_model
+from hyper_parallel.models.module_build import (
+    attach_build_context, build_module_context, construct_family_model, resolve_effective_model_spec,
+)
 from hyper_parallel.distributed.mesh import DistributedSetup
 from hyper_parallel.models.build_options import (  # pylint: disable=syntax-error
     CompileConfig,
@@ -45,6 +50,7 @@ from hyper_parallel.models.build_options import (  # pylint: disable=syntax-erro
     get_device_type,
 )
 from hyper_parallel.components.checkpoint.quantized_hf_storage import supports_hf_dequantization
+from hyper_parallel.models.registry import get_model_adapter
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +76,15 @@ _CONFIG_ONLY_KWARGS = {
     "trust_remote_code",
     "use_auth_token",
 }
+
+
+def _reject_removed_activation_swap(kwargs: dict[str, Any]) -> None:
+    """Reject the removed standalone activation-swap build option."""
+    if "activation_swap" in kwargs:
+        raise ValueError(
+            "activation_swap has been removed; configure swap through "
+            "activation_checkpoint.full.exclude_region.swap or activation_checkpoint.selective.swap"
+        )
 
 
 def _model_init_kwargs(
@@ -131,9 +146,16 @@ def _load_pretrained_config(
         kwargs: dict[str, Any],
 ) -> PretrainedConfig:
     """Load the HF configuration with call-time overrides."""
-    config_kwargs = dict(kwargs)
+    config_kwargs = {name: value for name, value in kwargs.items()
+                     if name not in {"model_factory", "model_spec"}}
     config_kwargs.update(config_overrides or {})
-    return get_hf_config(pretrained_model_name_or_path, attn_implementation, torch_dtype, **config_kwargs)
+    config = get_hf_config(pretrained_model_name_or_path, attn_implementation, torch_dtype, **config_kwargs)
+    # HF applies kwargs only to attributes it already knows. Explicit adapter
+    # metadata must survive too, without replacing converted nested HF configs.
+    for name, value in (config_overrides or {}).items():
+        if not hasattr(config, name):
+            setattr(config, name, value)
+    return config
 
 
 def _validate_weight_check_options(verify_hf_weights: Optional[str], load_base_model: bool) -> None:
@@ -168,6 +190,16 @@ def _prepare_pretrained_build(
     is_hf_model = get_is_hf_model(hf_config, force_hf)
 
     return sharding_planner, fsdp2_manager, hf_config, is_hf_model
+
+
+def _resolve_module_construction(kwargs, hf_config, distributed_setup, dtype):
+    """Consume model construction arguments and create one shared build context."""
+    factory = kwargs.pop("model_factory", None)
+    spec = resolve_effective_model_spec(hf_config, kwargs.pop("model_spec", None))
+    context = build_module_context(
+        distributed_setup, device=_current_device(), dtype=dtype, model_spec=spec, config=hf_config,
+    )
+    return factory, context
 
 
 class _BaseHyperAutoModelClass:
@@ -215,10 +247,7 @@ class _BaseHyperAutoModelClass:
         fp8_config: Optional[Any] = None,
         compile_config: Optional[Union[CompileConfig, dict]] = None,
         freeze_config: Optional[Any] = None,
-        activation_checkpoint: Optional[str] = None,
-        swap_inputs: bool = False,
-        allow_cache_entry_mutation: bool = False,
-        activation_swap: str = "none",
+        activation_checkpoint: Optional[Any] = None,
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
         config_overrides: Optional[dict[str, Any]] = None,
         load_base_model: bool = True,
@@ -246,6 +275,7 @@ class _BaseHyperAutoModelClass:
         ④ get_is_hf_model → custom/HF path
         ⑤ _build_model → meta + shard + load
         """
+        _reject_removed_activation_swap(kwargs)
         _validate_weight_check_options(verify_hf_weights, load_base_model)
         if distributed_setup is None:
             distributed_setup = DistributedSetup()
@@ -281,9 +311,6 @@ class _BaseHyperAutoModelClass:
             compile_config=compile_config,
             freeze_config=freeze_config,
             activation_checkpoint=activation_checkpoint,
-            swap_inputs=swap_inputs,
-            allow_cache_entry_mutation=allow_cache_entry_mutation,
-            activation_swap=activation_swap,
             model_init_dtype=model_init_dtype,
             **kwargs,
         )
@@ -307,10 +334,7 @@ class _BaseHyperAutoModelClass:
         fp8_config: Optional[Any] = None,
         compile_config: Optional[Union[CompileConfig, dict]] = None,
         freeze_config: Optional[Any] = None,
-        activation_checkpoint: Optional[str] = None,
-        swap_inputs: bool = False,
-        allow_cache_entry_mutation: bool = False,
-        activation_swap: str = "none",
+        activation_checkpoint: Optional[Any] = None,
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
         **kwargs: Any,
     ) -> PreTrainedModel:
@@ -320,7 +344,31 @@ class _BaseHyperAutoModelClass:
 
         No checkpoint is loaded, so the from-config random initialization path
         is preserved.
+
+        Args:
+            config: Resolved HF model configuration.
+            *model_args: Positional arguments for the native model constructor.
+            distributed_setup: Resolved job parallel setup.
+            device_mesh: Optional existing device mesh.
+            peft_config: Optional adapter configuration.
+            torch_dtype: Model parameter dtype.
+            attn_implementation: Native attention backend selection.
+            validate_placement: Enable placement validation.
+            qat_config: Optional quantization-aware training configuration.
+            fp8_config: Optional FP8 configuration.
+            compile_config: Optional compilation settings.
+            freeze_config: Optional parameter-freezing rules.
+            activation_checkpoint: Activation checkpointing policy.
+            swap_inputs: Enable input swapping.
+            allow_cache_entry_mutation: Permit cache-entry mutation during replay.
+            activation_swap: Activation swapping policy.
+            model_init_dtype: Random initialization dtype before mixed precision.
+            **kwargs: Additional model or infrastructure construction arguments.
+
+        Returns:
+            Materialized model with the requested infrastructure applied.
         """
+        _reject_removed_activation_swap(kwargs)
         if distributed_setup is None:
             distributed_setup = DistributedSetup()
         mesh = distributed_setup.mesh_context
@@ -351,9 +399,6 @@ class _BaseHyperAutoModelClass:
             compile_config=compile_config,
             freeze_config=freeze_config,
             activation_checkpoint=activation_checkpoint,
-            swap_inputs=swap_inputs,
-            allow_cache_entry_mutation=allow_cache_entry_mutation,
-            activation_swap=activation_swap,
             model_init_dtype=model_init_dtype,
             **kwargs,
         )
@@ -378,11 +423,7 @@ class _BaseHyperAutoModelClass:
         fp8_config=None,
         compile_config=None,
         freeze_config=None,
-        activation_checkpoint: Optional[str] = None,
-        activation_checkpoint_selection: Optional[Any] = None,
-        swap_inputs: bool = False,
-        allow_cache_entry_mutation: bool = False,
-        activation_swap: str = "none",
+        activation_checkpoint: Optional[Any] = None,
         model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
         **kwargs,
     ) -> PreTrainedModel:
@@ -394,6 +435,7 @@ class _BaseHyperAutoModelClass:
         Step 3-12: apply_model_infrastructure (PEFT, QAT, ShardingPlan,
         activation checkpoint, FSDP2, load, layer compile)
         """
+        _reject_removed_activation_swap(kwargs)
         # Step 1: Determine meta device (inline world-size probe: auto_models
         # must not import the trainer runtime).
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
@@ -405,6 +447,9 @@ class _BaseHyperAutoModelClass:
             world_size > 1 or not is_hf_model or defer_hf_load
         ) and not quantized_init
 
+        model_factory, module_context = _resolve_module_construction(
+            kwargs, hf_config, distributed_setup, model_init_dtype or torch_dtype,
+        )
         init_ctx = _model_init_context(is_meta_device)
 
         # Step 2: Config-first construction defers pretrained I/O until after sharding.
@@ -416,16 +461,18 @@ class _BaseHyperAutoModelClass:
             load_base_model=init_pretrained_path is not None,
         )
         with init_ctx:
-            _, model = _init_model(
-                cls,
-                init_pretrained_path,
-                hf_config,
-                attn_implementation,
-                torch_dtype,
-                is_hf_model,
-                *model_args,
-                **init_kwargs,
-            )
+            if model_factory is not None:
+                if model_args:
+                    raise ValueError("model_factory uses config and context, not additional positional model arguments")
+                if quantized_init:
+                    raise ValueError("model_factory requires config-first floating-point initialization")
+                model = construct_family_model(model_factory, hf_config, context=module_context)
+            else:
+                _, model = _init_model(
+                    cls, init_pretrained_path, hf_config, attn_implementation,
+                    torch_dtype, is_hf_model, *model_args, **init_kwargs,
+                )
+                attach_build_context(model, module_context)
 
         # Step 3-12: Apply infrastructure
         model = apply_model_infrastructure(
@@ -446,10 +493,6 @@ class _BaseHyperAutoModelClass:
             validate_placement=validate_placement,
             distributed_setup=distributed_setup,
             activation_checkpoint=activation_checkpoint,
-            activation_checkpoint_selection=activation_checkpoint_selection,
-            swap_inputs=swap_inputs,
-            allow_cache_entry_mutation=allow_cache_entry_mutation,
-            activation_swap=activation_swap,
             model_init_dtype=model_init_dtype,
         )
 
@@ -470,3 +513,180 @@ class HyperAutoModelForImageTextToText(_BaseHyperAutoModelClass, AutoModelForIma
 
 class HyperAutoModelForSequenceClassification(_BaseHyperAutoModelClass, AutoModelForSequenceClassification):
     """Hyper-Parallel SequenceClassification."""
+
+
+def _resolve_dit_provider(provider: Any = None, model_type: Optional[str] = None) -> Any:
+    """Resolve a DiT provider from an explicit path or model-family spec."""
+    if provider is None:
+        if not model_type:
+            raise ValueError("DiT AutoModel requires model_type or model_provider")
+        adapter_spec = get_model_adapter(model_type)
+        if adapter_spec is None or adapter_spec.dit is None:
+            raise ValueError(f"No DiT provider registered for model_type={model_type!r}")
+        return adapter_spec.dit()
+    if isinstance(provider, str):
+        parts = provider.split(".")
+        for split_at in range(len(parts), 0, -1):
+            try:
+                value = importlib.import_module(".".join(parts[:split_at]))
+            except ModuleNotFoundError as exc:
+                if exc.name == ".".join(parts[:split_at]) or ".".join(parts[:split_at]).startswith(f"{exc.name}."):
+                    continue
+                raise
+            for attribute in parts[split_at:]:
+                value = getattr(value, attribute)
+            return value
+        raise ImportError(f"Unable to import DiT model provider {provider!r}")
+    return provider
+
+
+resolve_dit_provider = _resolve_dit_provider
+
+
+class HyperAutoModelForDiT(_BaseHyperAutoModelClass):
+    """Generic AutoModel facade for Diffusers-style DiT families.
+
+    A family-specific provider owns config/checkpoint format and model class;
+    this facade owns only the shared HyperParallel build lifecycle.
+    """
+
+    @classmethod
+    def from_pretrained(  # pylint: disable=arguments-differ
+        cls,
+        pretrained_model_name_or_path: Optional[str] = None,
+        *,
+        model_provider: Any = None,
+        model_type: Optional[str] = None,
+        distributed_setup: Optional[DistributedSetup] = None,
+        peft_config: Optional[Any] = None,
+        torch_dtype: Union[str, torch.dtype] = "bfloat16",
+        attn_implementation: str = "sdpa",
+        activation_checkpoint: Optional[str] = None,
+        swap_inputs: bool = False,
+        activation_swap: str = "none",
+        compile_config: Optional[Union[CompileConfig, dict]] = None,
+        model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
+        validate_placement: bool = False,
+        transformer_subfolder: Optional[str] = "transformer",
+        config_path: Optional[str] = None,
+        task: str = "t2v",
+        **kwargs: Any,
+    ) -> torch.nn.Module:
+        """Resolve a provider and run the common DiT construction pipeline."""
+        provider = _resolve_dit_provider(model_provider, model_type)
+        if distributed_setup is None:
+            raise ValueError("DiT AutoModel requires distributed_setup from BaseTrainer")
+        prepare = getattr(provider, "prepare", None)
+        if callable(prepare):
+            prepare(distributed_setup, peft_config=peft_config, **kwargs)
+        config, checkpoint_path = provider.resolve_pretrained(
+            pretrained_model_name_or_path,
+            transformer_subfolder=transformer_subfolder,
+            config_path=config_path,
+            task=task,
+            torch_dtype=torch_dtype,
+            attn_implementation=attn_implementation,
+            **kwargs,
+        )
+        planner, fsdp = instantiate_infrastructure(
+            distributed_setup=distributed_setup, device=_current_device()
+        )
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        is_meta_device = checkpoint_path is not None or world_size > 1
+        from contextlib import nullcontext  # pylint: disable=import-outside-toplevel
+        from transformers.modeling_utils import ContextManagers  # pylint: disable=import-outside-toplevel
+        try:
+            from transformers.modeling_utils import no_init_weights  # pylint: disable=import-outside-toplevel
+        except ImportError:
+            from transformers.initialization import no_init_weights  # pylint: disable=import-outside-toplevel
+        from hyper_parallel import init_empty_weights  # pylint: disable=import-outside-toplevel
+        init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
+        with init_ctx:
+            if checkpoint_path is not None:
+                model = provider.build_model(config)
+            else:
+                build_from_config = getattr(provider, "build_from_config", provider.build_model)
+                model = build_from_config(config)
+        model = apply_model_infrastructure(
+            model,
+            mesh=distributed_setup.mesh_context,
+            sharding_planner=planner,
+            fsdp2_manager=fsdp,
+            peft_config=peft_config,
+            compile_config=compile_config,
+            is_meta_device=is_meta_device,
+            is_hf_model=True,
+            device=_current_device(),
+            load_base_model=checkpoint_path is not None,
+            pretrained_path=checkpoint_path,
+            validate_placement=validate_placement,
+            distributed_setup=distributed_setup,
+            activation_checkpoint=activation_checkpoint,
+            swap_inputs=swap_inputs,
+            activation_swap=activation_swap,
+            model_init_dtype=model_init_dtype,
+        )
+        model.train()
+        return model
+
+    @classmethod
+    def from_config(  # pylint: disable=arguments-differ
+        cls,
+        config: Any,
+        *,
+        model_provider: Any = None,
+        model_type: Optional[str] = None,
+        distributed_setup: Optional[DistributedSetup] = None,
+        peft_config: Optional[Any] = None,
+        compile_config: Optional[Union[CompileConfig, dict]] = None,
+        activation_checkpoint: Optional[str] = None,
+        swap_inputs: bool = False,
+        activation_swap: str = "none",
+        model_init_dtype: Optional[Literal["float16", "bfloat16", "float32"]] = None,
+        validate_placement: bool = False,
+        **kwargs: Any,
+    ) -> torch.nn.Module:
+        """Build a DiT model from a provider-owned config."""
+        provider = _resolve_dit_provider(model_provider, model_type)
+        if distributed_setup is None:
+            raise ValueError("DiT AutoModel requires distributed_setup from BaseTrainer")
+        prepare = getattr(provider, "prepare", None)
+        if callable(prepare):
+            prepare(distributed_setup, peft_config=peft_config, **kwargs)
+        planner, fsdp = instantiate_infrastructure(
+            distributed_setup=distributed_setup, device=_current_device()
+        )
+        is_meta_device = (
+            torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        ) > 1
+        from contextlib import nullcontext  # pylint: disable=import-outside-toplevel
+        from transformers.modeling_utils import ContextManagers  # pylint: disable=import-outside-toplevel
+        try:
+            from transformers.modeling_utils import no_init_weights  # pylint: disable=import-outside-toplevel
+        except ImportError:
+            from transformers.initialization import no_init_weights  # pylint: disable=import-outside-toplevel
+        from hyper_parallel import init_empty_weights  # pylint: disable=import-outside-toplevel
+        init_ctx = ContextManagers([no_init_weights(), init_empty_weights()]) if is_meta_device else nullcontext()
+        with init_ctx:
+            build_from_config = getattr(provider, "build_from_config", provider.build_model)
+            model = build_from_config(config, **kwargs)
+        model = apply_model_infrastructure(
+            model,
+            mesh=distributed_setup.mesh_context,
+            sharding_planner=planner,
+            fsdp2_manager=fsdp,
+            peft_config=peft_config,
+            compile_config=compile_config,
+            is_meta_device=is_meta_device,
+            is_hf_model=True,
+            device=_current_device(),
+            load_base_model=False,
+            validate_placement=validate_placement,
+            distributed_setup=distributed_setup,
+            activation_checkpoint=activation_checkpoint,
+            swap_inputs=swap_inputs,
+            activation_swap=activation_swap,
+            model_init_dtype=model_init_dtype,
+        )
+        model.train()
+        return model

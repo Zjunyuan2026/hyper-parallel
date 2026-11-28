@@ -44,10 +44,11 @@ from hyper_parallel.models.build_options import (
 if TYPE_CHECKING:
     from hyper_parallel.models._transformers import (
         HyperAutoModelForCausalLM,
+        HyperAutoModelForDiT,
+        resolve_dit_provider,
         HyperAutoModelForImageTextToText,
         HyperAutoModelForSequenceClassification,
     )
-    from hyper_parallel.models.adapter_spec import RecomputePolicy
     from hyper_parallel.models.materialization import (
         MaterializationContext,
         MaterializationReason,
@@ -72,6 +73,8 @@ if TYPE_CHECKING:
 
 _LAZY_FACADE_EXPORTS = {
     "HyperAutoModelForCausalLM": "hyper_parallel.models._transformers",
+    "HyperAutoModelForDiT": "hyper_parallel.models._transformers",
+    "resolve_dit_provider": "hyper_parallel.models._transformers",
     "HyperAutoModelForImageTextToText": "hyper_parallel.models._transformers",
     "HyperAutoModelForSequenceClassification": "hyper_parallel.models._transformers",
 }
@@ -105,6 +108,8 @@ __all__ = [
     "FSDP2Config",
     "FSDP2MixedPrecisionConfig",
     "HyperAutoModelForCausalLM",
+    "HyperAutoModelForDiT",
+    "resolve_dit_provider",
     "HyperAutoModelForImageTextToText",
     "HyperAutoModelForSequenceClassification",
     "MaterializationContext",
@@ -117,7 +122,6 @@ __all__ = [
     "ObservationSpec",
     "ParameterProbeSpec",
     "RebuildableBufferSpec",
-    "RecomputePolicy",
     "SharedStateValidationSpec",
     "StateInvariantSpec",
     "TopologyConstraint",
@@ -149,8 +153,6 @@ def __getattr__(name):  # pylint: disable=invalid-name
         return value
     if name == "ModelAdapterSpec":
         return importlib.import_module(".adapter_spec", __name__).ModelAdapterSpec
-    if name == "RecomputePolicy":
-        return importlib.import_module(".adapter_spec", __name__).RecomputePolicy
     if name in ("get_model_adapter", "register_model_adapter"):
         return getattr(importlib.import_module(".registry", __name__), name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

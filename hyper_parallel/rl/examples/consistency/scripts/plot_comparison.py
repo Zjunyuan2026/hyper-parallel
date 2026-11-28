@@ -23,11 +23,9 @@ import numpy as np
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from matplotlib.ticker import PercentFormatter
-from plot_training import moving_average, number, read_evaluations, read_rows
+from plot_training import moving_average, number, read_evaluations, read_rows, topology_caption
 
 SERIES = (("Consistency", "#2563eb"), ("NO-Consistency", "#ea580c"))
-DISPLAY_ANNOTATION = ("Training: TP4 DP8 EP4 CP2 SP=True\n"
-                      "Rollout: TP2 DP8 EP16 PCP1 SP=False")
 TIMES = (("Run\ntotal", None), ("Rollout", "timing_s/gen"),
          ("Actor\nupdate", "timing_s/update_actor"),
          ("Weight\nsync", "timing_s/weight_sync"))
@@ -47,15 +45,16 @@ def load_run(root: Path, expected_steps: int) -> dict:
                   else [number(row, key) for row in rows])
         times.append(sum(values) if all(math.isfinite(v) and v >= 0 for v in values) else None)
     return {"root": str(root), "rows": rows, "evaluations": read_evaluations(directory, rows),
-            "seconds": times}
+            "seconds": times, "topology": topology_caption(directory),
+            "time_scope": summary.get("scope", "Legacy launcher wall time")}
 
 
-def new_plot(title: str, ylabel: str) -> tuple:
+def new_plot(title: str, ylabel: str, annotation: str) -> tuple:
     """Build an exportable 6:4 figure without a display server."""
     figure = Figure(figsize=(6, 4), layout="constrained")
     FigureCanvasAgg(figure)
     axis = figure.subplots()
-    figure.suptitle(f"Qwen3-30B-A3B on GSM8K:\n{title}\n{DISPLAY_ANNOTATION}", fontsize=9)
+    figure.suptitle(f"Qwen3-30B-A3B on GSM8K:\n{title}\n{annotation}", fontsize=9)
     axis.set_ylabel(ylabel)
     axis.grid(axis="y", alpha=0.2)
     return figure, axis
@@ -77,20 +76,23 @@ def render(consistency: Path | None, native: Path, output: Path, window: int = 5
     paths = (consistency, native) if consistency is not None else (native,)
     runs = [load_run(path, steps) for path in paths]
     series = SERIES if consistency is not None else SERIES[1:]
+    annotation = runs[0]["topology"]
+    if any(run["topology"] != annotation for run in runs):
+        annotation = "\n".join(f'{label}: {run["topology"]}' for (label, _), run in zip(series, runs))
     suffix = "-comparison" if consistency is not None else ""
     output.mkdir(parents=True, exist_ok=True)
     report = {"runs": {label: {"root": run["root"], "seconds": dict(zip(
         (label.replace("\n", " ") for label, _ in TIMES), run["seconds"]))}
         for (label, _), run in zip(series, runs)}, "smoothing_window": window,
-        "display_annotation": DISPLAY_ANNOTATION,
-        "display_annotation_source": "User-specified display text; not inferred from recorded run configurations",
+        "display_annotation": annotation,
+        "display_annotation_source": "Recorded config.yaml in each run",
         "reward_std_scope": "Per-step response reward population std; not uncertainty across repeated runs",
-        "time_scope": "All recorded steps including first. Run total is launch-to-collection wall time; "
-                      "includes startup/evaluation/final model export/plotting/cleanup. "
+        "run_total_scope": {label: run["time_scope"] for (label, _), run in zip(series, runs)},
+        "time_scope": "All recorded steps including first. Run total follows each run's recorded scope. "
                       "Component bars cover training steps only; "
                       "the displayed bars are not additive.", "missing_logp": []}
 
-    figure, axis = new_plot("Training Reward", "Reward")
+    figure, axis = new_plot("Training Reward", "Reward", annotation)
     for (label, color), run in zip(series, runs):
         x = [row["step"] for row in run["rows"]]
         for key, metric, style, marker in (("reward/mean", "mean", "-", "o"),
@@ -106,7 +108,7 @@ def render(consistency: Path | None, native: Path, output: Path, window: int = 5
     axis.legend(fontsize=6, ncol=2)
     save(figure, output, "reward" + suffix)
 
-    figure, axis = new_plot("Test Accuracy", "Accuracy (500 questions)")
+    figure, axis = new_plot("Test Accuracy", "Accuracy (500 questions)", annotation)
     for index, ((label, color), run) in enumerate(zip(series, runs)):
         evaluations = [row for row in run["evaluations"]
                        if (row["step"] % 10 == 0 or row["step"] == steps) and 0 <= row["step"] <= steps]
@@ -131,10 +133,10 @@ def render(consistency: Path | None, native: Path, output: Path, window: int = 5
     axis.legend(fontsize=8)
     save(figure, output, "test-accuracy" + suffix)
 
-    figure, axis = new_plot("Maximum Train–Rollout Log-Probability Difference",
-                            "Max |logp(train) - logp(rollout)|")
+    figure, axis = new_plot("Mean Train–Rollout Log-Probability Difference",
+                            "Mean |logp(train) - logp(rollout)|", annotation)
     for index, ((label, color), run) in enumerate(zip(series, runs)):
-        values = [number(row, "training/rollout_log_probs_diff_max")
+        values = [number(row, "training/rollout_log_probs_diff_mean")
                   if number(row, "training/rollout_probs_diff_valid") == 1
                   and number(row, "training/log_probs_valid_tokens") > 0 else math.nan for row in run["rows"]]
         missing = [row["step"] for row, value in zip(run["rows"], values) if not math.isfinite(value)]
@@ -148,9 +150,9 @@ def render(consistency: Path | None, native: Path, output: Path, window: int = 5
     axis.set_xlim(1, steps)
     if axis.lines:
         axis.legend(loc="lower right", fontsize=8)
-    save(figure, output, "logp-max" + suffix)
+    save(figure, output, "logp-mean" + suffix)
 
-    figure, axis = new_plot("Runtime Breakdown", "Minutes")
+    figure, axis = new_plot("Runtime Breakdown", "Minutes", annotation)
     x = np.arange(len(TIMES))
     for index, ((label, color), run) in enumerate(zip(series, runs)):
         values = [v / 60 if v is not None else math.nan for v in run["seconds"]]

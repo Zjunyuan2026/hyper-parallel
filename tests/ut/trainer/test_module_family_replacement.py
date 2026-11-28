@@ -17,6 +17,7 @@
 import copy
 import unittest
 from typing import Any, Callable, Mapping, Optional
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -26,8 +27,14 @@ from torch import nn
 from hyper_parallel.components.modules import family as registry
 from hyper_parallel.auto_parallel._layer_census import replacement_specs
 from hyper_parallel.components.modules.family import ModuleFamily, SelectorSpec, VariantRule, register_module_family
+from hyper_parallel.components.modules.mhc.mhc_family import MHCPost, PipelinedMhc
+from hyper_parallel.components.modules.mhc import MhcPostModule, PipelinedMhcModule
+from hyper_parallel.distributed.mesh import DistributedSetup
+from hyper_parallel.models.module_build import build_module_context, prepare_model_components
 from hyper_parallel.models.replacement import apply_module_replacements, compile_module_replacements, module_replacement
-from hyper_parallel.trainer.config.parallelism import ReplaceAction, entries_to_module_replacements
+from hyper_parallel.trainer.config.parallelism import (
+    ReplaceAction, entries_to_module_replacements, normalize_distributed_setup_overrides,
+)
 from hyper_parallel.trainer.config.resolver import ConfigResolutionError, replace_override_path, resolve_config
 from hyper_parallel.trainer.config.target import Target
 
@@ -116,6 +123,35 @@ def _install(model, config):
     return apply_module_replacements(model, plan, context={"test_context": 7})[0]
 
 
+class TestDeferredFamilyReplacement(unittest.TestCase):
+    """Deferred factories keep runtime resources outside serialized user requests."""
+
+    def test_factory_yaml_roundtrip_and_install(self):
+        """Resolve actual factories, preserve their requests, and install concrete members."""
+        for factory in (MHCPost, PipelinedMhc):
+            with self.subTest(factory=factory.__name__):
+                raw = _raw_config()
+                action = raw["plan_overrides"][0]["replace"]
+                action.pop("source_type")
+                action.pop("exact_type")
+                action["implementation"] = {"_target_": f"{factory.__module__}.{factory.__name__}"}
+                resolved = resolve_config(raw)
+                serialized = resolved.plan_overrides[0].replace.implementation.to_dict()
+                self.assertTrue({"module", "module_fqn", "context", "mesh"}.isdisjoint(serialized))
+                action["implementation"] = serialized
+                restored = resolve_config(yaml.safe_load(yaml.safe_dump(raw)))
+                concrete = MhcPostModule if factory is MHCPost else PipelinedMhcModule
+                source = concrete(config=SimpleNamespace(num_stream=4, hidden_size=16,
+                                                         sinkhorn_iters=3, hc_eps=1e-6, norm_eps=1e-6))
+                result = _install(nn.Sequential(source), restored)
+                self.assertIs(type(result[0]), type(source))
+                for name, parameter in source.named_parameters():
+                    self.assertIs(result[0].get_parameter(name), parameter)
+                action["implementation"]["context"] = {}
+                with self.assertRaises(ConfigResolutionError):
+                    resolve_config(raw)
+
+
 class TestFamilyReplacement(unittest.TestCase):
     """Use real configuration, real replacement, and CPU autograd."""
 
@@ -137,6 +173,22 @@ class TestFamilyReplacement(unittest.TestCase):
                 ),
             )
         )
+
+    def test_normalized_requests_reuse_existing_family_selector_resolution(self):
+        """Trainer normalization must select legacy family members through the shared resolver."""
+        for selectors, expected_type in (({}, ReferenceLinear), ({"algorithm": "matmul"}, MatmulLinear),
+                                         ({"algorithm": "matmul", "fused": True}, AddmmLinear)):
+            with self.subTest(selectors=selectors):
+                config = resolve_config(_raw_config(**selectors))
+                setup = DistributedSetup()
+                normalize_distributed_setup_overrides(setup, config)
+                source = nn.Linear(4, 3)
+                inputs = torch.randn(2, 4)
+                expected = source(inputs)
+                model, _ = prepare_model_components(nn.Sequential(source), build_module_context(setup))
+                self.assertIs(type(model[0]), expected_type)
+                self.assertIs(model[0].weight, source.weight)
+                torch.testing.assert_close(model(inputs), expected)
 
     def test_yaml_real_replacement_and_autograd(self) -> None:
         """

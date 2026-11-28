@@ -58,19 +58,12 @@ def _build_and_publish(config: Any, artifact_dir: Optional[str]) -> ArtifactLayo
     normalize_distributed_setup_overrides(distributed_setup, config)
 
     session = CodegenBuildSession()
-    with use_codegen_model_build_overlay(session, artifact_dir) as result, use_codegen_planner_overlay():
-        config.model.build(
+    with use_codegen_model_build_overlay(session, artifact_dir, defer_publish=True) as result, \
+            use_codegen_planner_overlay():
+        result.model = config.model.build(
             distributed_setup=distributed_setup,
             peft_config=config.peft,
-            activation_checkpoint=config.activation_checkpoint.mode,
-            activation_checkpoint_selection=config.activation_checkpoint.selection,
-            swap_inputs=getattr(config.activation_checkpoint, "swap_inputs", False),
-            allow_cache_entry_mutation=getattr(
-                config.activation_checkpoint,
-                "allow_cache_entry_mutation",
-                False,
-            ),
-            activation_swap=config.activation_swap,
+            activation_checkpoint=config.activation_checkpoint,
             compile_config=config.compile,
             model_init_dtype=config.model_init_dtype,
         )
@@ -86,7 +79,14 @@ def _build_and_publish(config: Any, artifact_dir: Optional[str]) -> ArtifactLayo
 
 
 def create_offline_distributed_setup(config: Any) -> DistributedSetup:
-    """Project YAML parallel settings into a process-group-free setup."""
+    """Project YAML parallel settings into a process-group-free setup.
+
+    Args:
+        config: Trainer configuration describing compute and FSDP parallel degrees.
+
+    Returns:
+        A setup with named logical dense and expert meshes, without communication groups.
+    """
     topology_spec = ParallelTopologySpec.from_config(config)
     layout = resolve_parallel_layout(
         topology_spec,
@@ -98,6 +98,11 @@ def create_offline_distributed_setup(config: Any) -> DistributedSetup:
     )
     mesh_context = MeshContext.from_layout(layout)
     mesh_context.device_mesh = topology
+    if topology_spec.ep_size > 1:
+        mesh_context.fsdp_moe_mesh = LogicalDeviceMesh(
+            mesh_dim_names=("edp", "ep"),
+            mesh_shape=(topology.size() // topology_spec.ep_size, topology_spec.ep_size),
+        )
     return DistributedSetup.from_config(
         config,
         mesh_context=mesh_context,

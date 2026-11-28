@@ -22,9 +22,11 @@ model:
   enable_candidate_pool: false
   indexer_loss_coeff: 0.001
   # Sequence auxiliary loss; 0 disables it.
-  router_aux_loss_coeff: 0.0001
+  moe_aux_loss_coeff: 0.0001
   # Modality load statistics and bias updates; 0 disables them.
-  router_bias_update_rate: 0.001
+  moe_router_bias_update_rate: 0.001
+  # Benchmark-only balanced destinations when using the new Gate family.
+  moe_router_force_load_balancing: false
   # Generic HyperAutoModel build options accepted by the builder.
   torch_dtype: bfloat16
   validate_placement: false
@@ -76,23 +78,16 @@ plan_overrides:
     replace:
       kind: module
       implementation:
-        _target_: hyper_parallel.models.deepseek_v41.adapter.engram.host_replacement.HostEngramModule
+        _target_: hyper_parallel.components.modules.engram.engram_family.Engram
+        engram_storage_backend: host
   - match: "model.layers.*.self_attn"
     replace:
       kind: module
       implementation:
         _target_: >-
-          hyper_parallel.components.modules.shared_compressed_dsa_attention.SharedCompressedDSAAttention
+          hyper_parallel.components.modules.attention.compressed_sparse_attention2.CompressedSparseAttention2
         # Fused CSA2 requires candidate pools to remain disabled and TP=1.
         use_fused_ops: true
-  - match: "*.self_attn"
-    tp_divide_attrs: [num_groups]
-  - match: "*.self_attn.forward"
-    replace:
-      kind: method
-      implementation:
-        _target_: >-
-          hyper_parallel.models.deepseek_v41.adapter.distributed.shared_attention_context_parallel.deepseek_v41_shared_attention_parallel_wrapper
   # Fully declared globs create the mHC/Engram boundaries from the final
   # model tree, independent of model depth and Engram layer IDs.
   - match: "model.layers.*.*_hc"
@@ -147,7 +142,6 @@ plan_overrides:
       implementation:
         _target_: >-
           hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel.deepseek_v41_megamoe_compute_fn
-        fix_router: false  # Benchmark-only balanced destinations; use false for normal training.
   # MegaMoe supports CP and TP+SP with EP>1 and PP=1; pair it with the compute target above.
   - match: "model.layers.*.mlp.experts"
     replace:
@@ -175,10 +169,21 @@ mixed_precision:
   enabled: false
 
 activation_checkpoint:
-  # Recompute full model regions to reduce activation memory.
-  mode: full
-
-activation_swap: none
+  # Recompute full early layers, selected late-layer routers, and model-level
+  # embedding/output modules.
+  mode: hybrid
+  full:
+    recompute_layer: [0-19]
+    exclude_region:
+      save:
+        # Full attention sources stay outside replay, matching the model's
+        # shared-state contract. Layer 20 is not checkpointed here.
+        self_attn: [2, 8, 14]
+  selective:
+    recompute:
+      - mlp.gate: [20-39]
+      - model.embed_tokens
+      - lm_head
 
 compile:
   enabled: false

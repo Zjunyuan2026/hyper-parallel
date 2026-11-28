@@ -23,6 +23,8 @@ from typing import Any, List, Literal, Optional
 
 from hyper_parallel.models.build_options import CompileConfig, FSDP2Config
 from hyper_parallel.components.checkpoint.config import CheckpointingConfig
+from hyper_parallel.high_availability.config import HighAvailabilityConfig
+from hyper_parallel.components.ops.catalog import builtin_registry
 
 from hyper_parallel.trainer.config.data import DataLoaderConfig, DatasetConfig
 from hyper_parallel.trainer.config.optimization import (
@@ -67,10 +69,7 @@ class TrainerConfig:
     mixed_precision: MixedPrecisionConfig = field(
         default_factory=MixedPrecisionConfig
     )
-    activation_checkpoint: ActivationCheckpointConfig = field(
-        default_factory=ActivationCheckpointConfig
-    )
-    activation_swap: Literal["none", "attention"] = "none"
+    activation_checkpoint: Optional[ActivationCheckpointConfig] = None
     compile: CompileConfig = field(default_factory=CompileConfig)
 
     # data
@@ -79,6 +78,7 @@ class TrainerConfig:
     packed_sequence: Optional[Any] = None
 
     checkpoint: CheckpointingConfig = field(default_factory=CheckpointingConfig)
+    high_availability: HighAvailabilityConfig = field(default_factory=HighAvailabilityConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
     model_integration: ModelIntegrationConfig = field(default_factory=ModelIntegrationConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
@@ -87,9 +87,20 @@ class TrainerConfig:
     stress_detect: StressDetectConfig = field(default_factory=StressDetectConfig)
     magi: Optional[Any] = None
     peft: Optional[Any] = None
+    ops: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Validate combinations that span multiple config sections."""
+        builtin_registry.validate_selections(self.ops)
+        if (
+            self.compile.enabled
+            and self.activation_checkpoint is not None
+            and self.activation_checkpoint.mode != "off"
+        ):
+            raise ValueError(
+                "compile.enabled=true is not supported with activation_checkpoint.mode="
+                f"{self.activation_checkpoint.mode}"
+            )
         if (
             self.compile.enabled
             and not self.compile.selects_graph_compiler()

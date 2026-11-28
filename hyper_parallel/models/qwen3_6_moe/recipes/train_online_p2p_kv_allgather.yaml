@@ -5,7 +5,8 @@ model:
   pretrained_model_name_or_path: /home/chaoran/models/Qwen3.6-35B-A3B
   ignore_mismatched_sizes: true
   torch_dtype: bfloat16
-  attn_implementation: sdpa
+  attn_implementation:
+    _target_: hyper_parallel.models._transformers.packed_attention.register_npu_packed_attention
   force_hf: true
 
 training:
@@ -56,7 +57,10 @@ plan_overrides:
       source_type: transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeGatedDeltaNet
       exact_type: true
       implementation:
-        _target_: hyper_parallel.components.modules.TritonGDN
+        _target_: hyper_parallel.components.modules.GatedDeltaNet
+        backend: triton
+        conv_backend: eager
+        ulysses_degree: 1
   - match: "*.mlp.experts"
     replace:
       kind: module
@@ -64,34 +68,20 @@ plan_overrides:
       exact_type: true
       implementation:
         _target_: hyper_parallel.components.modules.GroupedExperts
-  - match: "*.mlp.forward"
-    when: ep
+  - match: "*.self_attn"
     replace:
-      kind: method
+      kind: module
+      source_type: transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeAttention
+      exact_type: true
       implementation:
-        _target_: hyper_parallel.models.qwen3_5_moe.adapter.distributed.expert_parallel.qwen3_5_moe_ep_compute_fn
-        use_grouped_gemm: true
-  - match: "*.linear_attn.forward"
-    when: cp
-    replace:
-      kind: method
-      implementation:
-        _target_: hyper_parallel.models.qwen3_5.adapter.distributed.context_parallel.qwen3_5_gdn_p2p_cp_wrapper
-        backend: triton
-        chunk_size: 64
-  - match: "*.self_attn.forward"
-    when: cp
-    replace:
-      kind: method
-      implementation: hyper_parallel.distributed.context_parallel.wrappers.sdpa_hf_cp_wrapper
+        _target_: hyper_parallel.components.modules.GatedGroupedQueryAttention
+        ulysses_degree: 1
 
 mixed_precision:
   enabled: false
 
 activation_checkpoint:
-  mode: full
-
-activation_swap: none
+  mode: 'off'
 
 compile:
   enabled: false
@@ -136,9 +126,12 @@ dataloader:
     _target_: hyper_parallel.models.qwen3_5.cp_batch.GDNCPDataCollator
     chunk_size: 64
   get_batch:
-    _target_: hyper_parallel.models.qwen3_5.cp_batch.GDNCPParallelBatch
+    _target_: hyper_parallel.data.batching.TextParallelBatch
     source_type: online
-    attention_mode: dense
+    attention_mode: compressed
+    runtime_input_adapter:
+      _target_: hyper_parallel.models.qwen3_5.adapter.data.runtime.Qwen35PackedRuntime
+    # One conversation still comes from GDNCPDataCollator; lengths avoid an S*S mask.
   sampler_type: cyclic
   data_rearrange_map: null
   data_sharding: false

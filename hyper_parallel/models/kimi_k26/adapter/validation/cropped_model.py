@@ -86,11 +86,12 @@ def build_cropped_kimi_vlm(
         distributed_setup: DistributedSetup | None = None,
         peft_config: Any | None = None,
         compile_config: CompileConfig | dict[str, Any] | None = None,
-        activation_checkpoint: str | None = None,
-        activation_swap: str = "none",
-        swap_inputs: bool = False,
+        activation_checkpoint: Any | None = None,
         freeze_patterns: list[str] | None = None,
         load_pretrained: bool = False,
+        moe_router_force_load_balancing: bool = False,
+        moe_aux_loss_coeff: float = 0.0,
+        moe_router_bias_update_rate: float = 0.0,
 ) -> PreTrainedModel:
     """Create a Kimi-K2.5/K2.6 VLM with a cropped text tower.
 
@@ -98,15 +99,9 @@ def build_cropped_kimi_vlm(
     geometry); pass ``load_pretrained=True`` together with a checkpoint path to
     load the real weights instead.
 
-    Reads the top-level ``Kimi_K25Config`` natively (never the repo's
-    remote-code classes), crops only the nested text tower, keeps the 27-layer
-    vision tower and the multimodal projector untouched, and parallelizes the
-    whole ``KimiK25ForConditionalGeneration`` through the HyperParallel model
-    stack. The family's TP layout (MLA down-projections and the vision path
-    replicated, up-projections colwise) is provided by
-    ``hyper_parallel/models/kimi_k26/adapter/registration.py`` and resolved
-    through the shared adapter registry, so this builder carries no layout
-    knowledge of its own.
+    Read the native ``Kimi_K25Config`` and crop its text tower while preserving the
+    27-layer vision tower and projector. The adapter registry supplies the TP layout
+    for the full ``KimiK25ForConditionalGeneration``.
 
     Args:
         config_path: Local Hugging Face Kimi-K2.5/K2.6 model directory (config
@@ -128,12 +123,10 @@ def build_cropped_kimi_vlm(
         distributed_setup: Trainer-provided distributed topology.
         peft_config: Optional Trainer-provided PEFT configuration.
         compile_config: Optional Trainer-provided compile configuration.
-        activation_checkpoint: Activation checkpoint mode.
-        activation_swap: Activation swap mode.
-        swap_inputs: Offload each checkpointed block's boundary activation to
-            host memory during the forward pass. Independent of
-            ``activation_swap``; requires ``activation_checkpoint`` to be
-            ``"full"`` or ``"selective"``.
+        activation_checkpoint: Normalized activation checkpoint configuration.
+        moe_router_force_load_balancing: Enable deterministic destinations in the new Gate family.
+        moe_aux_loss_coeff: New Gate's sequence balancing coefficient; zero disables it.
+        moe_router_bias_update_rate: New Gate's correction-bias update rate; zero disables it.
         load_pretrained: Load the Hugging Face weights from ``model_dir`` instead
             of keeping the random initialization. ``config_path`` still selects
             the configuration, so a cropped geometry with full weights would be a
@@ -164,9 +157,12 @@ def build_cropped_kimi_vlm(
     model_dir = _resolve_cropped_model_dir(config_path, pretrained_model_name_or_path)
     config = _load_cropped_kimi_config(
         model_dir, local_files_only, num_hidden_layers, n_routed_experts, attn_implementation)
+    config.text_config.moe_router_force_load_balancing = moe_router_force_load_balancing
+    config.text_config.moe_aux_loss_coeff = moe_aux_loss_coeff
+    config.text_config.moe_router_bias_update_rate = moe_router_bias_update_rate
     model = _build_cropped_kimi_model(
         config, attn_implementation, distributed_setup, peft_config, torch_dtype, validate_placement,
-        compile_config, activation_checkpoint, activation_swap, swap_inputs, freeze_patterns)
+        compile_config, activation_checkpoint, freeze_patterns)
 
     _maybe_load_pretrained(model, model_dir, load_pretrained)
     _bind_kimi_context_parallel(model, distributed_setup)
@@ -241,9 +237,7 @@ def _build_cropped_kimi_model(
         torch_dtype: str,
         validate_placement: bool,
         compile_config: CompileConfig | dict[str, Any] | None,
-        activation_checkpoint: str | None,
-        activation_swap: str,
-        swap_inputs: bool,
+        activation_checkpoint: Any | None,
         freeze_patterns: list[str] | None,
 ) -> PreTrainedModel:
     """Instantiate the parallelized model under the vision-init monkey patch."""
@@ -276,8 +270,6 @@ def _build_cropped_kimi_model(
             validate_placement=validate_placement,
             compile_config=compile_config,
             activation_checkpoint=activation_checkpoint,
-            activation_swap=activation_swap,
-            swap_inputs=swap_inputs,
             freeze_config=freeze_patterns,
         )
     finally:

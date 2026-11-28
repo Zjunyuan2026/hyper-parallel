@@ -23,9 +23,9 @@ import torch
 import torch_npu  # pylint: disable=unused-import
 from transformers import Qwen3Config
 
-from rl.unified_execution.ops.attention.flash_attention_npu_v4 import dense_attention, varlen_attention
-from rl.unified_execution.runtimes.hyper_parallel.builder import normalized_compute_setup
-from rl.unified_execution.runtimes.hyper_parallel.attention import install_training_attention
+from rl.unified_execution.modules.flash_attention_v4 import dense_attention, varlen_attention
+from rl.unified_execution.vllm.model_builder import normalized_compute_setup
+from rl.unified_execution.training.grouped_query_attention import bind_gqa_v4_backend
 from rl.workers.adapters.qwen3 import Qwen3AutoModel
 
 
@@ -109,7 +109,7 @@ def _model_check(device: torch.device, replace_gqa: bool) -> dict[str, Any]:
         attn_implementation="eager", validate_placement=False,
     ).to(device).train()
     identities = [id(parameter) for parameter in model.parameters()]
-    install_training_attention(model)
+    bind_gqa_v4_backend(model)
     if identities != [id(parameter) for parameter in model.parameters()]:
         raise AssertionError("Training attention installation replaced model parameters")
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)

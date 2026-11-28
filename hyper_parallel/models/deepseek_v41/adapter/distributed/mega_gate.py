@@ -19,10 +19,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-import torch  # pylint: disable=forbidden-backend-import
-from torch import nn  # pylint: disable=forbidden-backend-import
+import torch
+from torch import nn
 
-from hyper_parallel.core.multicore.modules.mega_gate import MegaGate
+from hyper_multicore.modules.mega_gate import MegaGate
 from hyper_parallel.models.deepseek_v41.adapter.aux_loss import update_modality_bias
 from hyper_parallel.models.deepseek_v41.modeling_deepseek_v41 import (
     DeepseekV41TopKRouter,
@@ -36,6 +36,8 @@ from hyper_parallel.models.replacement import module_replacement
 @module_replacement
 class DeepseekV41MegaGate(MegaGate):
     """Adopt a DeepSeek V4.1 router's parameters without copying their storage."""
+
+    fp32_parameter_names: tuple[str, ...] = ("bias", "bias_vl")
 
     def __init__(
         self,
@@ -140,9 +142,7 @@ class DeepseekV41MegaGate(MegaGate):
         del num_recomputations
         if lr is None:
             lr = self.expert_bias_update_rate
-        update_modality_bias(self.bias, self.tokens_per_expert[0], lr)
-        if self.bias_vl is not None:
-            update_modality_bias(self.bias_vl, self.tokens_per_expert[1], lr)
+        update_modality_bias(self.bias, self.tokens_per_expert, lr, vision_bias=self.bias_vl)
         self.tokens_per_expert.zero_()
 
 

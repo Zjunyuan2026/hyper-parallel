@@ -26,10 +26,11 @@ from torch import nn
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4SparseMoeBlock
 
-from hyper_parallel.core.multicore import MegaMoeExperts
+from hyper_multicore import MegaMoeExperts, SwiGLUParameters
+
 from hyper_parallel.core.dtensor.placement_types import Shard
 from hyper_parallel.distributed import ShardingPlanner
-from hyper_parallel.models._transformers.model_builder import _build_replacement_context
+from hyper_parallel.models.module_build import build_module_context
 from hyper_parallel.models.deepseek_v41.adapter.distributed.megamoe import DeepseekV41MegaMoeExperts
 from hyper_parallel.models.deepseek_v41.adapter.distributed.moe_engram_expert_parallel import (
     deepseek_v41_megamoe_compute_fn,
@@ -81,11 +82,11 @@ class TestMegaMoeParallel(unittest.TestCase):
             setup = SimpleNamespace(mesh_context=SimpleNamespace(
                 tp_size=2, cp_size=2, ep_size=4, pp_size=1, sequence_parallel=enabled,
             ))
-            context = _build_replacement_context(setup, None)
+            context = build_module_context(setup)
             self.assertIs(context['sequence_parallel'], enabled)
             self.assertTrue(context['tp'])
             self.assertTrue(context['cp'])
-        context = _build_replacement_context(SimpleNamespace(), None)
+        context = build_module_context(SimpleNamespace())
         for axis in ('tp', 'cp', 'ep', 'pp', 'sequence_parallel'):
             self.assertFalse(context[axis])
 
@@ -132,7 +133,7 @@ class TestMegaMoeParallel(unittest.TestCase):
         module = SimpleNamespace(experts=experts, gate=gate, shared_experts=shared,
                                  is_hash=False, forward=signature)
         tp_rank = tp - 1
-        with patch('hyper_parallel.core.multicore.modules.mega_moe.module.shmem.root_members', return_value=(0, 1)):
+        with patch('hyper_multicore.modules.mega_moe.module.shmem.root_members', return_value=(0, 1)):
             compute = deepseek_v41_megamoe_compute_fn(
                 module=module, mesh=None, tp_mesh=_Mesh((tp,), ('tp',), tp_rank) if tp > 1 else None,
                 cp_mesh=_Mesh((cp,), ('cp',)) if cp > 1 else None, ep_mesh=_Mesh((2,), ('ep',)),
@@ -141,8 +142,10 @@ class TestMegaMoeParallel(unittest.TestCase):
         mask = (torch.arange(batch * count * tp).reshape(batch, count * tp) % 3 == 0) if vision else None
         expected_mask = mask[:, tp_rank * count:(tp_rank + 1) * count] if vision else None
         _, weights, indices = gate(hidden, image_mask=expected_mask)
-        expected = _native_reference(experts, hidden, indices, weights,
-                                     expert_weights=(experts.gate_up_proj, experts.down_proj)) + shared(hidden)
+        expected = _native_reference(
+            SimpleNamespace(activation=SwiGLUParameters(clamp_limit=experts.swiglu_limit)),
+            hidden, indices, weights, expert_weights=(experts.gate_up_proj, experts.down_proj),
+        ) + shared(hidden)
         kwargs = {'image_mask': mask} if vision else {}
         if vision:
             handle = gate.register_forward_pre_hook(

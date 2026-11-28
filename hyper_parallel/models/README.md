@@ -22,11 +22,11 @@ The current main Trainer path uses the following configuration sections in [`Tra
 | `accelerator` / `fsdp_config` | Parallel topology and FSDP/HSDP parameter sharding | — |
 | `mixed_precision` | Trainer mixed-precision switches | — |
 | `plan_overrides` | Replace model components or override parallel plans using module matching rules | — |
-| `activation_checkpoint` | Activation recomputation | [Activation Checkpoint](../../docs/guide/activation_checkpoint.md) |
-| `activation_swap` / `compile` | Activation swapping and model compilation | — |
+| `activation_checkpoint` | Activation recompute and swap | [Activation Checkpoint](../../docs/guide/activation_checkpoint.md) |
+| `compile` | Model compilation | — |
 | `dataset` / `dataloader` | Model assets, sample transformation, dataset reading, batch assembly, and model inputs | [Dataset / DataLoader](../data/README.md) |
 | `loss_fn` / `optimizer` / `lr_scheduler` | Loss computation, parameter groups, optimizers, and learning rate policies | — |
-| `checkpoint` | Save and restore models, optimizers, and training progress | [Distributed Checkpoint](../../docs/guide/distributed_checkpoint.md) |
+| `checkpoint` | Save and restore models, optimizers, and training progress | [Distributed Checkpoint](../../docs/guide/high_availability/distributed_checkpoint.md) |
 | `debug` / `profiler` / `wandb` | Data and numerical checks, profiling, and training metric reporting | — |
 
 See [YAML Trainer Configuration](../../docs/guide/trainer/yaml_config.md) for field parsing, `Target`, and CLI dotted override rules, and the [Extension Guide](../../docs/guide/trainer/custom_component.md) for integrating external components.
